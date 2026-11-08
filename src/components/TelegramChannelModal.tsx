@@ -2,9 +2,10 @@ import React, { useState, useEffect } from 'react';
 import { Book, TelegramConfigStatus, TelegramPdfItem } from '../types/library';
 import {
   fetchTelegramStatus,
-  fetchChannelPdfs,
+  fetchExploreChannelFeed,
   downloadAndImportTelegramPdf,
   normalizeChannelInput,
+  normalizeMultipleChannels,
   getStoredTelegramSession,
   setStoredTelegramSession,
 } from '../services/telegramSync';
@@ -21,6 +22,9 @@ import {
   Radio,
   Smartphone,
   LogOut,
+  Copy,
+  Check,
+  Server,
 } from 'lucide-react';
 
 interface TelegramChannelModalProps {
@@ -53,14 +57,14 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
   }));
   const [channelInput, setChannelInput] = useState(channel);
   const [pdfs, setPdfs] = useState<TelegramPdfItem[]>([]);
-  const [channelTitle, setChannelTitle] = useState('');
   const [isLoadingList, setIsLoadingList] = useState(false);
-  const [downloadingId, setDownloadingId] = useState<number | null>(null);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [isSyncingNewest, setIsSyncingNewest] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
+  const [copiedSession, setCopiedSession] = useState(false);
 
-  // Stateless Phone Login State (works on both Vercel Serverless & Express!)
+  // Stateless Phone Login State
   const [phoneNumber, setPhoneNumber] = useState('');
   const [phoneCode, setPhoneCode] = useState('');
   const [phoneCodeHash, setPhoneCodeHash] = useState('');
@@ -175,7 +179,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
       setNeedsPassword(false);
       setPhoneCode('');
       setTwoFaPassword('');
-      setSuccessBanner('Connected to Telegram! Now enter any channel below to sync PDFs.');
+      setSuccessBanner('Connected! You can now scan multiple channels or copy your session for Vercel.');
       refreshStatus();
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Failed to verify code.');
@@ -194,33 +198,38 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
 
   const handleScanChannel = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const normalized = normalizeChannelInput(channelInput);
-    if (!normalized) {
-      setErrorMessage('Enter a Telegram channel username (e.g. @BooksChannel or t.me/BooksChannel).');
+    const channels = normalizeMultipleChannels(channelInput);
+    if (channels.length === 0) {
+      setErrorMessage('Enter one or more Telegram channels separated by commas (e.g. @Channel1, @Channel2).');
       return;
     }
 
-    onChangeChannel(normalized);
+    const joined = channels.join(', ');
+    onChangeChannel(joined);
     setIsLoadingList(true);
     setErrorMessage(null);
     setSuccessBanner(null);
 
     try {
-      const result = await fetchChannelPdfs(normalized, 25);
-      setPdfs(result.pdfs);
-      setChannelTitle(result.channelTitle);
-      if (result.pdfs.length === 0) {
-        setErrorMessage(`Connected to ${result.channelTitle}, but no PDF files were found in the last 25 messages.`);
+      const feed = await fetchExploreChannelFeed(joined, true);
+      setPdfs(feed.allPdfs);
+      if (feed.allPdfs.length === 0) {
+        setErrorMessage(`Scanned ${channels.length} channel(s), but no PDF files were found in recent messages.`);
+      } else {
+        setSuccessBanner(
+          `Found ${feed.allPdfs.length} PDF books across ${feed.channels.length} channel(s)! They are now visible in Explore.`
+        );
       }
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Failed to read channel.');
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to read channels.');
     } finally {
       setIsLoadingList(false);
     }
   };
 
   const handleImportSinglePdf = async (item: TelegramPdfItem) => {
-    setDownloadingId(item.messageId);
+    const key = `${item.channelUsername}_${item.messageId}`;
+    setDownloadingId(key);
     setErrorMessage(null);
     setSuccessBanner(null);
 
@@ -236,38 +245,39 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
   };
 
   const handleSyncNewestPdfNow = async () => {
-    const normalized = normalizeChannelInput(channelInput);
-    if (!normalized) {
-      setErrorMessage('Please enter a Telegram channel username first.');
+    const channels = normalizeMultipleChannels(channelInput);
+    if (channels.length === 0) {
+      setErrorMessage('Please enter at least one Telegram channel username first.');
       return;
     }
 
-    onChangeChannel(normalized);
+    const joined = channels.join(', ');
+    onChangeChannel(joined);
     setIsSyncingNewest(true);
     setErrorMessage(null);
     setSuccessBanner(null);
 
     try {
-      const result = await fetchChannelPdfs(normalized, 25);
-      setPdfs(result.pdfs);
-      setChannelTitle(result.channelTitle);
+      const feed = await fetchExploreChannelFeed(joined, true);
+      setPdfs(feed.allPdfs);
 
-      if (result.pdfs.length === 0) {
-        setErrorMessage(`No PDF documents found in @${normalized}.`);
+      if (feed.allPdfs.length === 0) {
+        setErrorMessage('No PDF documents found in the specified channel(s).');
         return;
       }
 
-      const newestPdf = result.pdfs[0];
+      const newestPdf = feed.allPdfs[0];
       if (isBookAlreadyImported(newestPdf)) {
         setSuccessBanner(`Newest PDF ("${newestPdf.fileName}") is already in your Folio library!`);
         return;
       }
 
-      setDownloadingId(newestPdf.messageId);
+      const key = `${newestPdf.channelUsername}_${newestPdf.messageId}`;
+      setDownloadingId(key);
       const importedBook = await downloadAndImportTelegramPdf(newestPdf);
       onBookImported(importedBook);
       setSuccessBanner(
-        `Auto-downloaded newest PDF: "${importedBook.title}" by ${importedBook.author} (${importedBook.pageCount} pages)`
+        `Auto-downloaded newest PDF: "${importedBook.title}" (${importedBook.pageCount} pages)`
       );
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Failed to sync newest PDF.');
@@ -277,12 +287,22 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
     }
   };
 
+  const handleCopySessionForServer = () => {
+    const session = getStoredTelegramSession();
+    if (!session) return;
+    navigator.clipboard.writeText(session);
+    setCopiedSession(true);
+    setTimeout(() => setCopiedSession(false), 3000);
+  };
+
   const formatBytes = (bytes: number) => {
     if (!bytes || bytes <= 0) return 'PDF';
     const mb = bytes / (1024 * 1024);
     if (mb >= 1) return `${mb.toFixed(1)} MB`;
     return `${Math.round(bytes / 1024)} KB`;
   };
+
+  const localSessionString = getStoredTelegramSession();
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xs select-none">
@@ -295,13 +315,10 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
             </div>
             <div>
               <h2 className="text-sm font-bold tracking-tight flex items-center gap-2">
-                <span>Telegram Channel Auto-Sync</span>
-                <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded-full bg-[#1DB954]/20 text-[#1DB954]">
-                  No my.telegram.org Needed
-                </span>
+                <span>Multi-Channel Telegram Sync &amp; Explore Server</span>
               </h2>
               <p className="text-[11px] text-[#B3B3B3]">
-                Sign in with your phone number &amp; auto-import the newest PDF from any channel
+                Connect multiple book channels so all PDFs appear automatically in Explore for every user
               </p>
             </div>
           </div>
@@ -317,15 +334,15 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
 
         {/* Body */}
         <div className="p-5 overflow-y-auto space-y-4 flex-1">
-          {/* Step 1: In-App Phone Sign-In (always visible when not yet signed in) */}
+          {/* Step 1: In-App Phone Sign-In */}
           {!status.configured ? (
             <div className="p-4 rounded-xl bg-[#121212] border border-[#282828] space-y-3">
               <div className="flex items-center gap-2 text-xs font-semibold text-[#1DB954]">
                 <Smartphone className="w-4 h-4" />
-                <span>Step 1: Quick Telegram Sign-In</span>
+                <span>Step 1: Sign In with Your Server Telegram Account</span>
               </div>
               <p className="text-[11px] text-[#B3B3B3] leading-relaxed">
-                Enter your phone number to receive a 5-digit login code inside your Telegram app:
+                Sign in once with the Telegram account that has joined your book channels:
               </p>
 
               {!codeSent ? (
@@ -394,33 +411,61 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
               )}
             </div>
           ) : (
-            <div className="p-3 rounded-xl bg-[#1DB954]/10 border border-[#1DB954]/30 flex items-center justify-between">
-              <div className="flex items-center gap-2 text-xs">
-                <CheckCircle2 className="w-4 h-4 text-[#1DB954]" />
-                <span className="font-semibold">Telegram Account Connected</span>
+            <div className="p-3.5 rounded-xl bg-[#1DB954]/10 border border-[#1DB954]/30 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-xs">
+                  <CheckCircle2 className="w-4 h-4 text-[#1DB954]" />
+                  <span className="font-semibold">Telegram Account Connected</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="text-[11px] text-[#B3B3B3] hover:text-white flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 transition-colors"
+                >
+                  <LogOut className="w-3 h-3" />
+                  <span>Disconnect</span>
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={handleLogout}
-                className="text-[11px] text-[#B3B3B3] hover:text-white flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 transition-colors"
-              >
-                <LogOut className="w-3 h-3" />
-                <span>Disconnect</span>
-              </button>
+
+              {/* Server Owner Config Box: Lets owner make this global for ALL users on Vercel */}
+              {localSessionString && (
+                <div className="p-3 rounded-lg bg-[#121212] border border-[#282828] space-y-2 text-[11px]">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-white flex items-center gap-1.5">
+                      <Server className="w-3.5 h-3.5 text-[#1DB954]" />
+                      <span>Make Global for All New Users (Vercel Env Vars):</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleCopySessionForServer}
+                      className="px-2.5 py-1 rounded bg-[#1DB954] text-black font-semibold flex items-center gap-1 hover:bg-[#1ed760] transition-colors"
+                    >
+                      {copiedSession ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                      <span>{copiedSession ? 'Copied Session!' : 'Copy TELEGRAM_SESSION'}</span>
+                    </button>
+                  </div>
+                  <p className="text-[#B3B3B3] leading-relaxed">
+                    To let <strong>every visitor</strong> see your channels in <strong>Explore</strong> without logging in: paste this copied value as{' '}
+                    <code className="text-emerald-400">TELEGRAM_SESSION</code> and your channel list as{' '}
+                    <code className="text-emerald-400">TELEGRAM_CHANNELS</code> (e.g.{' '}
+                    <code className="text-white">@channel1,@channel2</code>) in your Vercel Project → Settings → Environment Variables.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
-          {/* Channel Input + Primary Sync Newest CTA */}
-          <form onSubmit={handleScanChannel} className="space-y-2.5">
+          {/* Multi-Channel Input */}
+          <form onSubmit={handleScanChannel} className="space-y-2">
             <label className="block text-xs font-semibold text-[#B3B3B3]">
-              Telegram Channel Username or Link
+              Telegram Book Channels (comma-separated for multiple channels)
             </label>
             <div className="flex gap-2">
               <input
                 type="text"
                 value={channelInput}
                 onChange={e => setChannelInput(e.target.value)}
-                placeholder="@BookChannel or https://t.me/BookChannel"
+                placeholder="@SciFiBooks, @HistoryPDFs, @PhilosophyClub"
                 className="flex-1 text-xs px-3.5 py-2.5 rounded-xl bg-[#121212] border border-[#333333] text-white placeholder-zinc-500 focus:outline-hidden focus:border-[#1DB954]"
               />
               <button
@@ -433,7 +478,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                 ) : (
                   <RefreshCw className="w-3.5 h-3.5" />
                 )}
-                <span>Scan Channel</span>
+                <span>Scan All</span>
               </button>
             </div>
           </form>
@@ -445,8 +490,8 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                 type="checkbox"
                 checked={autoSync}
                 onChange={e => {
-                  const normalized = normalizeChannelInput(channelInput);
-                  if (normalized) onChangeChannel(normalized);
+                  const channels = normalizeMultipleChannels(channelInput);
+                  if (channels.length > 0) onChangeChannel(channels.join(', '));
                   onToggleAutoSync(e.target.checked);
                 }}
                 className="sr-only peer"
@@ -458,7 +503,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                   <span>Auto-Download Newest PDF</span>
                 </div>
                 <p className="text-[11px] text-[#B3B3B3]">
-                  Checks channel every 60s and imports any newly posted PDF automatically
+                  Automatically pulls the newest PDF from all listed channels
                 </p>
               </div>
             </label>
@@ -493,24 +538,23 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
             </div>
           )}
 
-          {/* Channel PDF Feed */}
+          {/* Multi-Channel PDF Feed */}
           {pdfs.length > 0 && (
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs text-[#B3B3B3] px-1">
-                <span>
-                  Recent PDFs in <strong className="text-white">{channelTitle}</strong>
-                </span>
+                <span>Recent PDFs across connected channels</span>
                 <span className="font-mono text-[11px]">{pdfs.length} PDFs found</span>
               </div>
 
               <div className="space-y-1.5 max-h-60 overflow-y-auto pr-1">
                 {pdfs.map((item, idx) => {
                   const imported = isBookAlreadyImported(item);
-                  const isDownloading = downloadingId === item.messageId;
+                  const key = `${item.channelUsername}_${item.messageId}`;
+                  const isDownloading = downloadingId === key;
 
                   return (
                     <div
-                      key={item.messageId}
+                      key={key}
                       className="p-3 rounded-xl bg-[#121212] border border-[#242424] hover:border-[#333333] flex items-center justify-between gap-3 transition-colors"
                     >
                       <div className="flex items-center gap-3 min-w-0">
@@ -524,6 +568,9 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                                 Newest
                               </span>
                             )}
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-[#B3B3B3]">
+                              @{item.channelUsername}
+                            </span>
                             <p className="text-xs font-semibold truncate">{item.fileName}</p>
                           </div>
                           <p className="text-[11px] text-[#B3B3B3] truncate">

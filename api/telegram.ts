@@ -4,6 +4,21 @@ import { StringSession } from 'telegram/sessions/index.js';
 const DEFAULT_API_ID = 2040;
 const DEFAULT_API_HASH = 'b18441a1ff607e10a989891a5462e627';
 
+// 90-second in-memory cache for the public Explore multi-channel feed
+let exploreCache: {
+  timestamp: number;
+  key: string;
+  data: {
+    configured: boolean;
+    channels: Array<{
+      channel: string;
+      channelTitle: string;
+      pdfs: ReturnType<typeof extractPdfFromMessage>[];
+    }>;
+    allPdfs: ReturnType<typeof extractPdfFromMessage>[];
+  };
+} | null = null;
+
 function getApiCredentials(): { apiId: number; apiHash: string } {
   const envId = Number.parseInt((process.env.TELEGRAM_API_ID || '').trim(), 10);
   const envHash = (process.env.TELEGRAM_API_HASH || '').trim();
@@ -21,6 +36,24 @@ export function normalizeTelegramChannel(raw: string): string {
     return urlMatch[1];
   }
   return trimmed.replace(/^@/, '');
+}
+
+export function parseChannelList(raw: string): string[] {
+  if (!raw) return [];
+  const items = raw
+    .split(/[\n,;]+/)
+    .map(s => normalizeTelegramChannel(s))
+    .filter(Boolean);
+  return Array.from(new Set(items));
+}
+
+function getConfiguredServerChannels(extraQueryChannels = ''): string[] {
+  const combined = [
+    process.env.TELEGRAM_CHANNELS || '',
+    process.env.TELEGRAM_CHANNEL || '',
+    extraQueryChannels,
+  ].join(',');
+  return parseChannelList(combined);
 }
 
 function extractPdfFromMessage(
@@ -61,7 +94,7 @@ function extractPdfFromMessage(
   };
 }
 
-// Vercel Serverless Function Handler (Stateless MTProto support)
+// Vercel Serverless & Express Unified Handler
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export default async function handler(req: any, res: any) {
   const rawUrl = req.originalUrl || req.url || '/';
@@ -72,21 +105,112 @@ export default async function handler(req: any, res: any) {
   const headerSession = String(req.headers?.['x-telegram-session'] || '').trim();
   const querySession = String(req.query?.session || '').trim();
   const envSession = (process.env.TELEGRAM_SESSION || '').trim();
-  const activeSession = headerSession || querySession || envSession;
+  // Prefer server-level TELEGRAM_SESSION or fallback to user's header session
+  const activeSession = envSession || headerSession || querySession;
 
   const { apiId, apiHash } = getApiCredentials();
 
   try {
     // 1. GET /api/telegram/status
     if (pathname === 'status' || pathname === '') {
-      const defaultChannel = normalizeTelegramChannel(process.env.TELEGRAM_CHANNEL || '');
+      const serverChannels = getConfiguredServerChannels();
+      const defaultChannel = serverChannels[0] || '';
       return res.status(200).json({
         configured: Boolean(activeSession),
+        serverConfigured: Boolean(envSession),
         hasApiId: true,
         hasApiHash: true,
         hasSession: Boolean(activeSession),
         defaultChannel,
+        serverChannels,
       });
+    }
+
+    // 1b. GET /api/telegram/explore-feed (Multi-Channel Public Explore Feed for all visitors!)
+    if (pathname === 'explore-feed') {
+      const extraChannels = String(req.query?.channels || '');
+      const forceRefresh = req.query?.refresh === 'true';
+      const channels = getConfiguredServerChannels(extraChannels);
+
+      if (!activeSession || channels.length === 0) {
+        return res.status(200).json({
+          configured: Boolean(activeSession),
+          serverHasSession: Boolean(envSession),
+          channels: [],
+          allPdfs: [],
+        });
+      }
+
+      const cacheKey = `${activeSession.slice(0, 12)}:${channels.join(',')}`;
+      const now = Date.now();
+      if (
+        !forceRefresh &&
+        exploreCache &&
+        exploreCache.key === cacheKey &&
+        now - exploreCache.timestamp < 90_000
+      ) {
+        return res.status(200).json(exploreCache.data);
+      }
+
+      const client = new TelegramClient(new StringSession(activeSession), apiId, apiHash, {
+        connectionRetries: 3,
+      });
+      await client.connect();
+
+      const channelResults: Array<{
+        channel: string;
+        channelTitle: string;
+        pdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[];
+      }> = [];
+      const allPdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[] = [];
+
+      for (const ch of channels) {
+        try {
+          const entity = await client.getEntity(ch);
+          const channelTitle =
+            (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || `@${ch}`;
+          const messages = await client.getMessages(entity, { limit: 25 });
+          const pdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[] = [];
+
+          for (const msg of messages) {
+            if (msg instanceof Api.Message) {
+              const extracted = extractPdfFromMessage(msg, ch, channelTitle);
+              if (extracted) {
+                pdfs.push(extracted);
+                allPdfs.push(extracted);
+              }
+            }
+          }
+
+          channelResults.push({
+            channel: ch,
+            channelTitle,
+            pdfs,
+          });
+        } catch (chErr) {
+          console.warn(`[/api/telegram/explore-feed] Could not read channel @${ch}:`, chErr);
+        }
+      }
+
+      await client.disconnect();
+
+      // Sort combined feed newest-first
+      allPdfs.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+      const responseData = {
+        configured: true,
+        serverHasSession: Boolean(envSession),
+        channels: channelResults,
+        allPdfs,
+      };
+
+      exploreCache = {
+        timestamp: now,
+        key: cacheKey,
+        data: responseData,
+      };
+
+      return res.status(200).json(responseData);
     }
 
     // 2. POST /api/telegram/auth/send-code

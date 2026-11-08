@@ -18,7 +18,7 @@ import { SpotifyPlayerBar } from './components/SpotifyPlayerBar';
 import { TelegramChannelModal } from './components/TelegramChannelModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import {
-  fetchChannelPdfs,
+  fetchExploreChannelFeed,
   downloadAndImportTelegramPdf,
   normalizeChannelInput,
 } from './services/telegramSync';
@@ -239,19 +239,19 @@ export default function App() {
     setFullscreenReaderBook(book);
   };
 
-  // Automatic Background Sync for Newest PDF from Telegram Channel
+  // Automatic Background Sync for Newest PDF across connected Telegram Channels
   useEffect(() => {
-    const cleanChannel = normalizeChannelInput(telegramChannel);
-    if (!telegramAutoSync || !cleanChannel) return;
+    if (!telegramAutoSync) return;
 
     let cancelled = false;
 
-    const checkNewestFromChannel = async () => {
+    const checkNewestFromChannels = async () => {
       try {
-        const result = await fetchChannelPdfs(cleanChannel, 10);
-        if (cancelled || result.pdfs.length === 0) return;
+        const feed = await fetchExploreChannelFeed(telegramChannel, false);
+        if (cancelled || feed.allPdfs.length === 0) return;
 
-        const newestPdf = result.pdfs[0];
+        const newestPdf = feed.allPdfs[0];
+        const cleanChannel = normalizeChannelInput(newestPdf.channelUsername);
         const alreadyExists = books.some(
           b =>
             (b.telegramChannel === cleanChannel && b.telegramMessageId === newestPdf.messageId) ||
@@ -273,8 +273,8 @@ export default function App() {
       }
     };
 
-    checkNewestFromChannel();
-    const timer = setInterval(checkNewestFromChannel, 60000);
+    checkNewestFromChannels();
+    const timer = setInterval(checkNewestFromChannels, 60000);
     return () => {
       cancelled = true;
       clearInterval(timer);
@@ -366,11 +366,20 @@ export default function App() {
           {currentTab === 'explore' && (
             <ExploreShelvesView
               publicBooklists={booklists.filter(l => l.isPublic)}
+              existingBooks={books}
+              configuredChannels={telegramChannel}
               onSelectBooklist={id => {
                 setSelectedListId(id);
                 setCurrentTab('library');
               }}
               onToggleSaveList={handleToggleSaveList}
+              onBookImported={(book, openImmediately) => {
+                handleSaveBook(book);
+                if (openImmediately) {
+                  handleStartReadingBook(book);
+                }
+              }}
+              onOpenTelegramSetup={() => setIsTelegramSyncOpen(true)}
               theme={theme}
             />
           )}

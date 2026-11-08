@@ -13,6 +13,19 @@ const PALETTE = [
 
 const STORAGE_TG_SESSION_KEY = 'folio_tg_session_v1';
 
+export interface ExploreChannelGroup {
+  channel: string;
+  channelTitle: string;
+  pdfs: TelegramPdfItem[];
+}
+
+export interface ExploreTelegramFeedResponse {
+  configured: boolean;
+  serverHasSession: boolean;
+  channels: ExploreChannelGroup[];
+  allPdfs: TelegramPdfItem[];
+}
+
 export function getStoredTelegramSession(): string {
   try {
     return localStorage.getItem(STORAGE_TG_SESSION_KEY) || '';
@@ -48,6 +61,18 @@ export function normalizeChannelInput(raw: string): string {
   return trimmed.replace(/^@/, '');
 }
 
+export function normalizeMultipleChannels(raw: string): string[] {
+  if (!raw) return [];
+  return Array.from(
+    new Set(
+      raw
+        .split(/[\n,;]+/)
+        .map(s => normalizeChannelInput(s))
+        .filter(Boolean)
+    )
+  );
+}
+
 export async function fetchTelegramStatus(): Promise<TelegramConfigStatus> {
   const localSession = getStoredTelegramSession();
   try {
@@ -77,6 +102,39 @@ export async function fetchTelegramStatus(): Promise<TelegramConfigStatus> {
       hasApiHash: true,
       hasSession: Boolean(localSession),
       defaultChannel: '',
+    };
+  }
+}
+
+export async function fetchExploreChannelFeed(
+  extraChannels = '',
+  forceRefresh = false
+): Promise<ExploreTelegramFeedResponse> {
+  try {
+    const cleanList = normalizeMultipleChannels(extraChannels).join(',');
+    const params = new URLSearchParams();
+    if (cleanList) params.set('channels', cleanList);
+    if (forceRefresh) params.set('refresh', 'true');
+
+    const res = await fetch(`/api/telegram/explore-feed?${params.toString()}`, {
+      headers: getSessionHeaders(),
+    });
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok || !contentType.includes('application/json')) {
+      return {
+        configured: false,
+        serverHasSession: false,
+        channels: [],
+        allPdfs: [],
+      };
+    }
+    return await res.json();
+  } catch {
+    return {
+      configured: false,
+      serverHasSession: false,
+      channels: [],
+      allPdfs: [],
     };
   }
 }
