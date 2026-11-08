@@ -31,7 +31,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <aside
-      className={`w-60 border-r flex flex-col h-[calc(100vh-56px-80px)] select-none shrink-0 transition-colors ${
+      className={`w-48 sm:w-56 md:w-60 border-r flex flex-col h-full min-h-0 select-none shrink-0 transition-colors ${
         isDark
           ? 'bg-[#121212] border-[#242424] text-white'
           : theme === 'nordic-light'

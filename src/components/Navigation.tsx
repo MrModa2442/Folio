@@ -34,7 +34,7 @@ export const Navigation: React.FC<NavigationProps> = ({
 
   return (
     <header
-      className={`h-14 px-5 border-b flex items-center justify-between gap-4 shrink-0 z-40 transition-colors ${
+      className={`min-h-14 px-3 sm:px-5 py-2 border-b flex flex-wrap items-center justify-between gap-2 sm:gap-4 shrink-0 z-40 transition-colors ${
         isDark
           ? 'bg-[#121212] border-[#242424] text-white'
           : theme === 'nordic-light'

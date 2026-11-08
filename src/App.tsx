@@ -284,7 +284,7 @@ export default function App() {
   const isDark = theme === 'spotify-dark';
 
   return (
-    <div className={`h-screen flex flex-col font-sans transition-colors duration-200 theme-${theme}`}>
+    <div className={`h-full w-full overflow-hidden flex flex-col font-sans transition-colors duration-200 theme-${theme}`}>
       {/* Sleek Top Navigation */}
       <Navigation
         currentTab={currentTab}
@@ -317,14 +317,14 @@ export default function App() {
       <OfflineIndicator />
 
       {autoSyncedNotice && (
-        <div className="bg-[#1DB954] text-black px-4 py-1.5 text-xs font-semibold flex items-center justify-center gap-2 shadow-sm">
+        <div className="bg-[#1DB954] text-black px-4 py-1.5 text-xs font-semibold flex items-center justify-center gap-2 shadow-sm shrink-0">
           <Send className="w-3.5 h-3.5" />
           <span>{autoSyncedNotice}</span>
         </div>
       )}
 
       {/* Main Workspace Frame */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 min-h-0 flex overflow-hidden">
         {/* Left Spotify-style Sidebar */}
         <Sidebar
           booklists={booklists}
