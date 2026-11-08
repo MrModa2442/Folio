@@ -64,9 +64,10 @@ function extractPdfFromMessage(
 // Vercel Serverless Function Handler (Stateless MTProto support)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export default async function handler(req: any, res: any) {
-  const urlObj = new URL(req.url || '/', 'http://localhost');
+  const rawUrl = req.originalUrl || req.url || '/';
+  const urlObj = new URL(rawUrl, 'http://localhost');
   const actionParam = String(req.query?.action || '');
-  const pathname = urlObj.pathname.replace(/^\/api\/telegram\/?/, '') || actionParam;
+  const pathname = urlObj.pathname.replace(/^\/api\/telegram\/?/, '').replace(/^\//, '') || actionParam;
 
   const headerSession = String(req.headers?.['x-telegram-session'] || '').trim();
   const querySession = String(req.query?.session || '').trim();

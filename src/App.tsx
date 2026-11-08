@@ -16,6 +16,7 @@ import { CozyPdfReader } from './components/CozyPdfReader';
 import { ExploreShelvesView } from './components/ExploreShelvesView';
 import { SpotifyPlayerBar } from './components/SpotifyPlayerBar';
 import { TelegramChannelModal } from './components/TelegramChannelModal';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import {
   fetchChannelPdfs,
   downloadAndImportTelegramPdf,
@@ -298,9 +299,22 @@ export default function App() {
         onOpenTelegramSync={() => setIsTelegramSyncOpen(true)}
         telegramAutoSync={telegramAutoSync}
         telegramChannel={telegramChannel}
+        books={books}
+        booklists={booklists}
+        onRestoreLibrary={(restoredBooks, restoredLists) => {
+          setBooks(restoredBooks);
+          if (restoredLists.length > 0) {
+            setBooklists(restoredLists);
+          }
+          if (restoredBooks.length > 0) {
+            setActiveReadingBook(restoredBooks[0]);
+          }
+        }}
         theme={theme}
         onChangeTheme={setTheme}
       />
+
+      <OfflineIndicator />
 
       {autoSyncedNotice && (
         <div className="bg-[#1DB954] text-black px-4 py-1.5 text-xs font-semibold flex items-center justify-center gap-2 shadow-sm">

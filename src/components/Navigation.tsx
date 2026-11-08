@@ -1,5 +1,6 @@
 import React from 'react';
-import { AppTheme } from '../types/library';
+import { AppTheme, Book, Booklist } from '../types/library';
+import { PWAInstallButton } from './PWAInstallButton';
 import { Plus, Moon, Sun, Coffee, Send } from 'lucide-react';
 
 interface NavigationProps {
@@ -9,6 +10,9 @@ interface NavigationProps {
   onOpenTelegramSync: () => void;
   telegramAutoSync?: boolean;
   telegramChannel?: string;
+  books: Book[];
+  booklists: Booklist[];
+  onRestoreLibrary: (books: Book[], booklists: Booklist[]) => void;
   theme: AppTheme;
   onChangeTheme: (theme: AppTheme) => void;
 }
@@ -20,6 +24,9 @@ export const Navigation: React.FC<NavigationProps> = ({
   onOpenTelegramSync,
   telegramAutoSync = false,
   telegramChannel = '',
+  books,
+  booklists,
+  onRestoreLibrary,
   theme,
   onChangeTheme,
 }) => {
@@ -27,7 +34,7 @@ export const Navigation: React.FC<NavigationProps> = ({
 
   return (
     <header
-      className={`h-14 px-5 border-b flex items-center justify-between gap-6 shrink-0 z-40 transition-colors ${
+      className={`h-14 px-5 border-b flex items-center justify-between gap-4 shrink-0 z-40 transition-colors ${
         isDark
           ? 'bg-[#121212] border-[#242424] text-white'
           : theme === 'nordic-light'
@@ -86,8 +93,8 @@ export const Navigation: React.FC<NavigationProps> = ({
         </button>
       </nav>
 
-      {/* Zone 3: Theme Switcher, Telegram Channel Sync & Import PDF */}
-      <div className="flex items-center gap-2.5 shrink-0">
+      {/* Zone 3: Theme Switcher, Offline iPad App, Telegram Sync & Import PDF */}
+      <div className="flex items-center gap-2 shrink-0">
         {/* Minimal Theme Switcher */}
         <div
           className={`flex items-center p-0.5 rounded-full border text-xs ${
@@ -132,6 +139,14 @@ export const Navigation: React.FC<NavigationProps> = ({
           </button>
         </div>
 
+        {/* Mandatory In-App Offline / iPad PWA Install & Vault Button */}
+        <PWAInstallButton
+          books={books}
+          booklists={booklists}
+          onRestoreLibrary={onRestoreLibrary}
+          theme={theme}
+        />
+
         {/* Telegram Channel Auto-Sync Button */}
         <button
           onClick={onOpenTelegramSync}
@@ -168,4 +183,5 @@ export const Navigation: React.FC<NavigationProps> = ({
     </header>
   );
 };
+
 
