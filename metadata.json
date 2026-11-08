@@ -1,0 +1,6 @@
+{
+  "name": "Folio - Aesthetic PDF Bookshelf & Booklists",
+  "description": "A cozy, Spotify-inspired library manager for your PDFs. Curate public and private booklists, read seamlessly with an embedded PDF reader, and display books on aesthetic virtual shelves.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
