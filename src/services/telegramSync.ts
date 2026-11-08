@@ -11,6 +11,33 @@ const PALETTE = [
   '#1E1B4B', // Indigo
 ];
 
+const STORAGE_TG_SESSION_KEY = 'folio_tg_session_v1';
+
+export function getStoredTelegramSession(): string {
+  try {
+    return localStorage.getItem(STORAGE_TG_SESSION_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setStoredTelegramSession(session: string): void {
+  try {
+    if (session) {
+      localStorage.setItem(STORAGE_TG_SESSION_KEY, session);
+    } else {
+      localStorage.removeItem(STORAGE_TG_SESSION_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function getSessionHeaders(): Record<string, string> {
+  const session = getStoredTelegramSession();
+  return session ? { 'x-telegram-session': session } : {};
+}
+
 export function normalizeChannelInput(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return '';
@@ -22,11 +49,36 @@ export function normalizeChannelInput(raw: string): string {
 }
 
 export async function fetchTelegramStatus(): Promise<TelegramConfigStatus> {
-  const res = await fetch('/api/telegram/status');
-  if (!res.ok) {
-    throw new Error('Could not check Telegram server status.');
+  const localSession = getStoredTelegramSession();
+  try {
+    const res = await fetch('/api/telegram/status', {
+      headers: getSessionHeaders(),
+    });
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok || !contentType.includes('application/json')) {
+      return {
+        configured: Boolean(localSession),
+        hasApiId: true,
+        hasApiHash: true,
+        hasSession: Boolean(localSession),
+        defaultChannel: '',
+      };
+    }
+    const data = await res.json();
+    return {
+      ...data,
+      configured: Boolean(data.configured || localSession),
+      hasSession: Boolean(data.hasSession || localSession),
+    };
+  } catch {
+    return {
+      configured: Boolean(localSession),
+      hasApiId: true,
+      hasApiHash: true,
+      hasSession: Boolean(localSession),
+      defaultChannel: '',
+    };
   }
-  return res.json();
 }
 
 export async function fetchChannelPdfs(
@@ -35,7 +87,10 @@ export async function fetchChannelPdfs(
 ): Promise<{ channel: string; channelTitle: string; pdfs: TelegramPdfItem[] }> {
   const cleanChannel = normalizeChannelInput(channel);
   const res = await fetch(
-    `/api/telegram/channel-pdfs?channel=${encodeURIComponent(cleanChannel)}&limit=${limit}`
+    `/api/telegram/channel-pdfs?channel=${encodeURIComponent(cleanChannel)}&limit=${limit}`,
+    {
+      headers: getSessionHeaders(),
+    }
   );
   const data = await res.json();
   if (!res.ok) {
@@ -52,7 +107,9 @@ export async function downloadAndImportTelegramPdf(
     cleanChannel
   )}&messageId=${encodeURIComponent(String(item.messageId))}`;
 
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    headers: getSessionHeaders(),
+  });
   if (!res.ok) {
     let errMsg = `Failed to download PDF (#${item.messageId}).`;
     try {

@@ -5,6 +5,8 @@ import {
   fetchChannelPdfs,
   downloadAndImportTelegramPdf,
   normalizeChannelInput,
+  getStoredTelegramSession,
+  setStoredTelegramSession,
 } from '../services/telegramSync';
 import {
   X,
@@ -42,7 +44,13 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
   existingBooks,
   onBookImported,
 }) => {
-  const [status, setStatus] = useState<TelegramConfigStatus | null>(null);
+  const [status, setStatus] = useState<TelegramConfigStatus>(() => ({
+    configured: Boolean(getStoredTelegramSession()),
+    hasApiId: true,
+    hasApiHash: true,
+    hasSession: Boolean(getStoredTelegramSession()),
+    defaultChannel: '',
+  }));
   const [channelInput, setChannelInput] = useState(channel);
   const [pdfs, setPdfs] = useState<TelegramPdfItem[]>([]);
   const [channelTitle, setChannelTitle] = useState('');
@@ -52,9 +60,11 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
 
-  // Direct Phone Login State (bypasses my.telegram.org completely!)
+  // Stateless Phone Login State (works on both Vercel Serverless & Express!)
   const [phoneNumber, setPhoneNumber] = useState('');
   const [phoneCode, setPhoneCode] = useState('');
+  const [phoneCodeHash, setPhoneCodeHash] = useState('');
+  const [pendingSession, setPendingSession] = useState('');
   const [twoFaPassword, setTwoFaPassword] = useState('');
   const [needsPassword, setNeedsPassword] = useState(false);
   const [codeSent, setCodeSent] = useState(false);
@@ -65,17 +75,13 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
   }, [channel]);
 
   const refreshStatus = () => {
-    fetchTelegramStatus()
-      .then(st => {
-        setStatus(st);
-        if (!channelInput && st.defaultChannel) {
-          setChannelInput(st.defaultChannel);
-          onChangeChannel(st.defaultChannel);
-        }
-      })
-      .catch(err => {
-        setErrorMessage(err instanceof Error ? err.message : 'Could not check server status.');
-      });
+    fetchTelegramStatus().then(st => {
+      setStatus(st);
+      if (!channelInput && st.defaultChannel) {
+        setChannelInput(st.defaultChannel);
+        onChangeChannel(st.defaultChannel);
+      }
+    });
   };
 
   useEffect(() => {
@@ -117,6 +123,8 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
       if (!res.ok) {
         throw new Error(data.error || 'Could not send login code.');
       }
+      setPhoneCodeHash(data.phoneCodeHash || '');
+      setPendingSession(data.pendingSession || '');
       setCodeSent(true);
       setSuccessBanner('Code sent! Check your Telegram app for a 5-digit login code.');
     } catch (err) {
@@ -142,7 +150,10 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          phoneNumber: phoneNumber.trim(),
           phoneCode: phoneCode.trim(),
+          phoneCodeHash,
+          pendingSession,
           password: twoFaPassword.trim(),
         }),
       });
@@ -154,6 +165,10 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
       }
       if (!res.ok) {
         throw new Error(data.error || 'Failed to verify login code.');
+      }
+
+      if (data.sessionString) {
+        setStoredTelegramSession(data.sessionString);
       }
 
       setCodeSent(false);
@@ -170,7 +185,8 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
   };
 
   const handleLogout = async () => {
-    await fetch('/api/telegram/auth/logout', { method: 'POST' });
+    setStoredTelegramSession('');
+    await fetch('/api/telegram/auth/logout', { method: 'POST' }).catch(() => {});
     setPdfs([]);
     setCodeSent(false);
     refreshStatus();
@@ -301,16 +317,15 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
 
         {/* Body */}
         <div className="p-5 overflow-y-auto space-y-4 flex-1">
-          {/* Step 1: In-App Phone Sign-In (if not yet connected) */}
-          {status && !status.configured ? (
+          {/* Step 1: In-App Phone Sign-In (always visible when not yet signed in) */}
+          {!status.configured ? (
             <div className="p-4 rounded-xl bg-[#121212] border border-[#282828] space-y-3">
               <div className="flex items-center gap-2 text-xs font-semibold text-[#1DB954]">
                 <Smartphone className="w-4 h-4" />
-                <span>Quick Sign-In (Skip my.telegram.org completely!)</span>
+                <span>Step 1: Quick Telegram Sign-In</span>
               </div>
               <p className="text-[11px] text-[#B3B3B3] leading-relaxed">
-                Folio includes built-in Telegram Desktop client credentials, so you can close{' '}
-                <span className="text-white font-mono">my.telegram.org</span> and sign in directly below:
+                Enter your phone number to receive a 5-digit login code inside your Telegram app:
               </p>
 
               {!codeSent ? (
@@ -379,22 +394,20 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
               )}
             </div>
           ) : (
-            status?.configured && (
-              <div className="p-3 rounded-xl bg-[#1DB954]/10 border border-[#1DB954]/30 flex items-center justify-between">
-                <div className="flex items-center gap-2 text-xs">
-                  <CheckCircle2 className="w-4 h-4 text-[#1DB954]" />
-                  <span className="font-semibold">Telegram Account Connected</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleLogout}
-                  className="text-[11px] text-[#B3B3B3] hover:text-white flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 transition-colors"
-                >
-                  <LogOut className="w-3 h-3" />
-                  <span>Disconnect</span>
-                </button>
+            <div className="p-3 rounded-xl bg-[#1DB954]/10 border border-[#1DB954]/30 flex items-center justify-between">
+              <div className="flex items-center gap-2 text-xs">
+                <CheckCircle2 className="w-4 h-4 text-[#1DB954]" />
+                <span className="font-semibold">Telegram Account Connected</span>
               </div>
-            )
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="text-[11px] text-[#B3B3B3] hover:text-white flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 transition-colors"
+              >
+                <LogOut className="w-3 h-3" />
+                <span>Disconnect</span>
+              </button>
+            </div>
           )}
 
           {/* Channel Input + Primary Sync Newest CTA */}
