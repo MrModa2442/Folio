@@ -1,5 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist';
-import { cleanPdfFilename } from './library';
+import { cleanPdfFilename, sanitizeBookTitle, sanitizeBookAuthor } from './library';
 
 // Polyfill Promise.try for environments/runtimes that need it
 if (typeof Promise !== 'undefined' && !(Promise as unknown as { try?: unknown }).try) {
@@ -24,17 +24,85 @@ export interface ExtractedPdfMetadata {
   title: string;
   author: string;
   pageCount: number;
+  coverImage?: string;
 }
 
 /**
- * Automatically extracts the title, author, and total page count from a PDF file using PDF.js.
- * Requires zero user input. Falls back gracefully to binary inspection and smart filename parsing.
+ * Renders the first page of a PDF document proxy to a JPEG data URL for the book cover.
+ */
+async function renderPageOneToDataUrl(pdfDoc: pdfjsLib.PDFDocumentProxy): Promise<string | undefined> {
+  if (typeof document === 'undefined' || pdfDoc.numPages < 1) return undefined;
+  try {
+    const page = await pdfDoc.getPage(1);
+    const unscaledViewport = page.getViewport({ scale: 1 });
+    const targetWidth = 360;
+    const scale = targetWidth / Math.max(1, unscaledViewport.width);
+    const viewport = page.getViewport({ scale });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return undefined;
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    await page.render({
+      canvasContext: ctx,
+      viewport,
+      canvas,
+    }).promise;
+
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+    return dataUrl && dataUrl.startsWith('data:image/') ? dataUrl : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Standalone helper to render a cover image from a stored PDF Blob.
+ */
+export async function renderPdfFirstPageCover(blob: Blob): Promise<string | null> {
+  if (typeof document === 'undefined') return null;
+  let pdfDoc: pdfjsLib.PDFDocumentProxy | null = null;
+  try {
+    const buffer = await blob.arrayBuffer();
+    if (!buffer || buffer.byteLength === 0) return null;
+    const loadingTask = pdfjsLib.getDocument({
+      data: new Uint8Array(buffer),
+      cMapUrl: '/cmaps/',
+      cMapPacked: true,
+      standardFontDataUrl: '/standard_fonts/',
+      wasmUrl: '/wasm/',
+      stopAtErrors: false,
+    });
+    pdfDoc = await loadingTask.promise;
+    const cover = await renderPageOneToDataUrl(pdfDoc);
+    return cover || null;
+  } catch {
+    return null;
+  } finally {
+    if (pdfDoc) {
+      try {
+        pdfDoc.cleanup();
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+/**
+ * Automatically extracts the title, author, total page count, and first-page cover image from a PDF file.
  */
 export async function extractPdfMetadata(file: File): Promise<ExtractedPdfMetadata> {
   const fallback = cleanPdfFilename(file.name);
   let pageCount = 1;
   let detectedTitle = '';
   let detectedAuthor = '';
+  let coverImage: string | undefined;
 
   let buffer: ArrayBuffer | null = null;
   try {
@@ -59,55 +127,53 @@ export async function extractPdfMetadata(file: File): Promise<ExtractedPdfMetada
 
       pdfDoc = await loadingTask.promise;
       if (pdfDoc) {
-        // Extract total page count accurately
         if (typeof pdfDoc.numPages === 'number' && pdfDoc.numPages > 0) {
           pageCount = pdfDoc.numPages;
         }
+
+        // Render Page 1 as the book's cover image
+        coverImage = await renderPageOneToDataUrl(pdfDoc);
 
         // Extract metadata dictionary (Info and XMP metadata)
         try {
           const meta = await pdfDoc.getMetadata();
           const info = (meta?.info || {}) as Record<string, unknown>;
 
-          // Extract Title
           if (typeof info.Title === 'string' && info.Title.trim()) {
-            const cleaned = sanitizeString(info.Title);
+            const cleaned = sanitizeBookTitle(sanitizeString(info.Title));
             if (isValidTitle(cleaned)) {
               detectedTitle = cleaned;
             }
           }
 
-          // Check XMP dc:title if info.Title is not valid
           if (!detectedTitle && meta?.metadata) {
             try {
               const dcTitle = meta.metadata.get('dc:title');
               if (typeof dcTitle === 'string' && isValidTitle(dcTitle)) {
-                detectedTitle = sanitizeString(dcTitle);
+                detectedTitle = sanitizeBookTitle(sanitizeString(dcTitle));
               }
             } catch {
               // Ignore XMP read error
             }
           }
 
-          // Extract Author / Creator
           if (typeof info.Author === 'string' && info.Author.trim()) {
-            const cleaned = sanitizeString(info.Author);
+            const cleaned = sanitizeBookAuthor(sanitizeString(info.Author));
             if (isValidAuthor(cleaned)) {
               detectedAuthor = cleaned;
             }
           } else if (typeof info.Creator === 'string' && info.Creator.trim()) {
-            const cleaned = sanitizeString(info.Creator);
+            const cleaned = sanitizeBookAuthor(sanitizeString(info.Creator));
             if (isValidAuthor(cleaned)) {
               detectedAuthor = cleaned;
             }
           }
 
-          // Check XMP dc:creator if info.Author is not valid
           if (!detectedAuthor && meta?.metadata) {
             try {
               const dcCreator = meta.metadata.get('dc:creator');
               if (typeof dcCreator === 'string' && isValidAuthor(dcCreator)) {
-                detectedAuthor = sanitizeString(dcCreator);
+                detectedAuthor = sanitizeBookAuthor(sanitizeString(dcCreator));
               }
             } catch {
               // Ignore XMP read error
@@ -130,10 +196,9 @@ export async function extractPdfMetadata(file: File): Promise<ExtractedPdfMetada
                 })
                 .filter(s => s.length > 0);
 
-              // Find first prominent line
               for (const candidate of strings) {
                 if (candidate.length >= 3 && candidate.length <= 80 && isValidTitle(candidate)) {
-                  detectedTitle = sanitizeString(candidate);
+                  detectedTitle = sanitizeBookTitle(sanitizeString(candidate));
                   break;
                 }
               }
@@ -144,7 +209,6 @@ export async function extractPdfMetadata(file: File): Promise<ExtractedPdfMetada
         }
       }
     } catch (pdfJsErr) {
-      // PDF.js parser could fail on partial, corrupted, or non-browser environments
       console.warn('PDF.js parser encountered notice, trying secondary inspector:', pdfJsErr);
     } finally {
       if (pdfDoc) {
@@ -157,7 +221,7 @@ export async function extractPdfMetadata(file: File): Promise<ExtractedPdfMetada
     }
   }
 
-  // 2. Secondary Engine: Binary stream scanning fallback (for edge cases and headless test environments)
+  // 2. Secondary Engine: Binary stream scanning fallback
   if (buffer && (!detectedTitle || !detectedAuthor || pageCount <= 1)) {
     try {
       const binaryMeta = extractMetadataFromBinary(new Uint8Array(buffer));
@@ -165,24 +229,25 @@ export async function extractPdfMetadata(file: File): Promise<ExtractedPdfMetada
         pageCount = binaryMeta.pageCount;
       }
       if (!detectedTitle && binaryMeta.title) {
-        detectedTitle = binaryMeta.title;
+        detectedTitle = sanitizeBookTitle(binaryMeta.title);
       }
       if (!detectedAuthor && binaryMeta.author) {
-        detectedAuthor = binaryMeta.author;
+        detectedAuthor = sanitizeBookAuthor(binaryMeta.author);
       }
     } catch (binErr) {
       console.warn('Binary metadata fallback notice:', binErr);
     }
   }
 
-  // 3. Smart Filename Fallback (if PDF metadata fields were missing or empty)
-  const finalTitle = detectedTitle || fallback.title || file.name.replace(/\.pdf$/i, '');
-  const finalAuthor = detectedAuthor || (fallback.author !== 'Unknown Author' ? fallback.author : 'Unknown Writer');
+  // 3. Smart Filename Fallback (never use channel names or "Unknown Writer")
+  const finalTitle = sanitizeBookTitle(fallback.title || detectedTitle || file.name.replace(/\.pdf$/i, ''));
+  const finalAuthor = sanitizeBookAuthor(detectedAuthor || fallback.author);
 
   return {
     title: finalTitle,
     author: finalAuthor,
     pageCount: Math.max(1, pageCount),
+    coverImage,
   };
 }
 

@@ -1,7 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { Book, Booklist, ReadingStatus, ViewMode, AppTheme } from './types/library';
 import { INITIAL_BOOKS, INITIAL_BOOKLISTS } from './data/initialData';
-import { filterBooks, toggleBooklistPrivacy } from './utils/library';
+import {
+  filterBooks,
+  toggleBooklistPrivacy,
+  sanitizeBookTitle,
+  sanitizeBookAuthor,
+} from './utils/library';
 import { Navigation } from './components/Navigation';
 import { Sidebar } from './components/Sidebar';
 import { VirtualBookshelf } from './components/VirtualBookshelf';
@@ -22,6 +27,7 @@ import {
   downloadAndImportTelegramPdf,
   normalizeChannelInput,
 } from './services/telegramSync';
+import { deletePdfBlob } from './services/db';
 import { Search, LayoutGrid, List as ListIcon, Plus, Send } from 'lucide-react';
 
 // Use clean v3 storage keys to ensure a complete fresh zero-state first-time experience
@@ -43,10 +49,17 @@ export default function App() {
   });
 
   // Zero-state initialization: starts completely empty for first-time user
+  // Also sanitizes any previously stored books so @handles and channel names are stripped
   const [books, setBooks] = useState<Book[]>(() => {
     try {
       const stored = localStorage.getItem(STORAGE_BOOKS_KEY);
-      return stored ? JSON.parse(stored) : INITIAL_BOOKS;
+      const parsed: Book[] = stored ? JSON.parse(stored) : INITIAL_BOOKS;
+      return parsed.map(b => ({
+        ...b,
+        title: sanitizeBookTitle(b.title),
+        author: sanitizeBookAuthor(b.author),
+        coverImage: undefined,
+      }));
     } catch {
       return INITIAL_BOOKS;
     }
@@ -177,14 +190,21 @@ export default function App() {
   };
 
   const handleDeleteBook = (bookId: string) => {
-    if (confirm('Delete this book from your library?')) {
-      setBooks(prev => prev.filter(b => b.id !== bookId));
-      setBooklists(prev =>
-        prev.map(l => ({ ...l, bookIds: l.bookIds.filter(id => id !== bookId) }))
-      );
-      if (activeReadingBook?.id === bookId) {
-        setActiveReadingBook(null);
-      }
+    const targetBook = books.find(b => b.id === bookId);
+    if (targetBook?.pdfBlobKey) {
+      deletePdfBlob(targetBook.pdfBlobKey).catch(() => {});
+    }
+    deletePdfBlob(bookId).catch(() => {});
+
+    setBooks(prev => prev.filter(b => b.id !== bookId));
+    setBooklists(prev =>
+      prev.map(l => ({ ...l, bookIds: l.bookIds.filter(id => id !== bookId) }))
+    );
+    if (activeReadingBook?.id === bookId) {
+      setActiveReadingBook(null);
+    }
+    if (fullscreenReaderBook?.id === bookId) {
+      setFullscreenReaderBook(null);
     }
   };
 
@@ -533,6 +553,7 @@ export default function App() {
                           setEditingBook(b);
                           setIsImportOpen(true);
                         }}
+                        onDeleteBook={!currentBooklist ? handleDeleteBook : undefined}
                       />
                     ))}
                   </div>
@@ -559,6 +580,7 @@ export default function App() {
           setEditingBook(null);
         }}
         onBookImported={handleSaveBook}
+        onDeleteBook={handleDeleteBook}
         booklists={booklists}
         editingBook={editingBook}
       />
@@ -607,6 +629,7 @@ export default function App() {
             handleSaveBook(updated);
             setFullscreenReaderBook(updated);
           }}
+          onDeleteBook={handleDeleteBook}
         />
       )}
     </div>

@@ -23,6 +23,7 @@ export interface Book {
   pdfBlobKey?: string;
   telegramChannel?: string;
   telegramMessageId?: number;
+  coverImage?: string;
 }
 
 export interface TelegramPdfItem {
@@ -33,6 +34,10 @@ export interface TelegramPdfItem {
   caption: string;
   channelTitle: string;
   channelUsername: string;
+  coverPhotoMsgId?: number;
+  hasThumb?: boolean;
+  cleanTitle?: string;
+  author?: string;
 }
 
 export interface TelegramConfigStatus {

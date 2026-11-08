@@ -65,6 +65,40 @@ export async function deletePdfBlob(key: string): Promise<void> {
   });
 }
 
+export async function storeBookCover(key: string, dataUrl: string): Promise<void> {
+  if (!key || !dataUrl) return;
+  try {
+    const db = await openDatabase();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.put(dataUrl, `cover_${key}`);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } catch {
+    // non-fatal
+  }
+}
+
+export async function getBookCover(key: string): Promise<string | null> {
+  if (!key) return null;
+  try {
+    const db = await openDatabase();
+    return await new Promise<string | null>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.get(`cover_${key}`);
+      request.onsuccess = () => {
+        resolve(typeof request.result === 'string' ? request.result : null);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Creates a valid multi-page PDF Blob with correct xref offsets.
  */

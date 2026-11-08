@@ -2,7 +2,7 @@ import React from 'react';
 import { Book, AppTheme } from '../types/library';
 import { BookCover } from './BookCoverArt';
 import { Play, Trash2, Edit3, BookOpen, Plus } from 'lucide-react';
-import { formatBytes } from '../utils/library';
+import { formatBytes, sanitizeBookTitle, sanitizeBookAuthor } from '../utils/library';
 
 interface BookTableViewProps {
   books: Book[];
@@ -73,6 +73,8 @@ export const BookTableView: React.FC<BookTableViewProps> = ({
         <tbody className="divide-y divide-transparent">
           {books.map((book, idx) => {
             const progress = book.pageCount > 0 ? Math.round((book.currentPage / book.pageCount) * 100) : 0;
+            const cleanTitle = sanitizeBookTitle(book.title);
+            const cleanAuthor = sanitizeBookAuthor(book.author);
 
             return (
               <tr
@@ -92,7 +94,7 @@ export const BookTableView: React.FC<BookTableViewProps> = ({
                     }}
                     className="hidden group-hover:inline-flex p-1 rounded hover:scale-110 transition-transform"
                     title="Read PDF"
-                    aria-label={`Read ${book.title}`}
+                    aria-label={`Read ${cleanTitle}`}
                   >
                     <Play className="w-3.5 h-3.5 fill-current" />
                   </button>
@@ -102,20 +104,23 @@ export const BookTableView: React.FC<BookTableViewProps> = ({
                 <td className="py-3 px-3">
                   <div className="flex items-center gap-3">
                     <BookCover
-                      title={book.title}
-                      author={book.author}
+                      title={cleanTitle}
+                      author={cleanAuthor}
                       color={book.spineColor}
                       pattern={book.coverPattern}
+                      coverImage={book.coverImage}
                       showDetails={false}
                       className="w-8 h-11 shrink-0 rounded-xs shadow-xs"
                     />
                     <div className="min-w-0">
                       <p className={`font-semibold text-xs truncate ${isDark ? 'text-white' : 'text-zinc-900'}`}>
-                        {book.title}
+                        {cleanTitle}
                       </p>
-                      <p className={`text-[11px] truncate ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
-                        {book.author}
-                      </p>
+                      {cleanAuthor && (
+                        <p className={`text-[11px] truncate ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
+                          {cleanAuthor}
+                        </p>
+                      )}
                     </div>
                   </div>
                 </td>
@@ -142,13 +147,13 @@ export const BookTableView: React.FC<BookTableViewProps> = ({
 
                 {/* Actions */}
                 <td className="py-3 px-3 text-right">
-                  <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div className="flex items-center justify-end gap-1.5 opacity-80 sm:opacity-60 group-hover:opacity-100 transition-opacity">
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
                         onEditBook(book);
                       }}
-                      className="p-1 rounded opacity-70 hover:opacity-100"
+                      className="p-1.5 rounded hover:bg-white/10 opacity-80 hover:opacity-100"
                       title="Edit book"
                       aria-label="Edit book"
                     >
@@ -161,7 +166,7 @@ export const BookTableView: React.FC<BookTableViewProps> = ({
                           e.stopPropagation();
                           onRemoveBook(book.id);
                         }}
-                        className="p-1 rounded text-rose-500 opacity-70 hover:opacity-100"
+                        className="p-1.5 rounded text-rose-500 hover:bg-rose-500/15 opacity-85 hover:opacity-100"
                         title="Remove from playlist"
                         aria-label="Remove from playlist"
                       >
@@ -175,9 +180,9 @@ export const BookTableView: React.FC<BookTableViewProps> = ({
                           e.stopPropagation();
                           onDeleteBook(book.id);
                         }}
-                        className="p-1 rounded text-rose-500 opacity-70 hover:opacity-100"
-                        title="Delete from library"
-                        aria-label="Delete book"
+                        className="p-1.5 rounded text-rose-500 hover:bg-rose-500/15 opacity-85 hover:opacity-100"
+                        title="Remove from library"
+                        aria-label="Remove book from library"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>

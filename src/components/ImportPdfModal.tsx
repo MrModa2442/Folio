@@ -1,13 +1,14 @@
 import React, { useState, useRef } from 'react';
-import { Book, Booklist, SpineTexture, CoverPattern } from '../types/library';
+import { Book, Booklist, CoverPattern } from '../types/library';
 import { extractPdfMetadata } from '../utils/pdfParser';
-import { storePdfBlob } from '../services/db';
-import { X, Upload, Check, Loader2, FileText } from 'lucide-react';
+import { storePdfBlob, storeBookCover } from '../services/db';
+import { X, Upload, Loader2, Trash2 } from 'lucide-react';
 
 interface ImportPdfModalProps {
   isOpen: boolean;
   onClose: () => void;
   onBookImported: (book: Book, targetListId?: string) => void;
+  onDeleteBook?: (bookId: string) => void;
   booklists: Booklist[];
   editingBook?: Book | null;
 }
@@ -25,7 +26,7 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
   isOpen,
   onClose,
   onBookImported,
-  booklists,
+  onDeleteBook,
   editingBook,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -51,10 +52,9 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Fully automatic import: extracts pages, author, and title with zero questions asked!
+  // Fully automatic import: extracts pages, author, title, and cover image
   const handleProcessPdfFile = async (file: File) => {
     if (!file.name.toLowerCase().endsWith('.pdf')) {
-      alert('Please select a valid PDF file.');
       return;
     }
 
@@ -62,22 +62,24 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
     setStatusMessage('Parsing PDF structure with PDF.js...');
 
     try {
-      // 1. Automatically extract metadata (author, title, page count) via PDF.js
       const metadata = await extractPdfMetadata(file);
-      setStatusMessage(`Extracted: "${metadata.title}" by ${metadata.author} (${metadata.pageCount} pages)`);
+      setStatusMessage(
+        `Extracted: "${metadata.title}" (${metadata.pageCount} pages)`
+      );
 
       const bookId = 'book_' + Date.now().toString(36);
 
-      // 2. Store binary blob in IndexedDB
       await storePdfBlob(bookId, file);
+      if (metadata.coverImage) {
+        await storeBookCover(bookId, metadata.coverImage);
+      }
 
-      // 3. Automatically assign palette tone based on title
       const colorIndex = Math.abs(
         metadata.title.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)
       ) % PALETTE.length;
       const spineColor = PALETTE[colorIndex];
 
-      const patterns: CoverPattern[] = ['classical', 'minimal', 'botanical', 'geometric'];
+      const patterns: CoverPattern[] = ['botanical', 'geometric', 'embossed', 'classical'];
       const coverPattern = patterns[colorIndex % patterns.length];
 
       const newBook: Book = {
@@ -92,21 +94,20 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
         spineColor,
         spineTexture: 'leather',
         coverPattern,
+        coverImage: metadata.coverImage,
         dateAdded: new Date().toISOString().split('T')[0],
         lastRead: null,
         pdfBlobKey: bookId,
       };
 
-      // Brief gentle transition so user sees the detected title
       setTimeout(() => {
         onBookImported(newBook);
         setIsProcessing(false);
         onClose();
-      }, 500);
+      }, 400);
     } catch (err) {
       console.error('Failed to import PDF automatically:', err);
       setIsProcessing(false);
-      alert('Could not parse PDF. Please try again.');
     }
   };
 
@@ -125,7 +126,7 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
     onBookImported({
       ...editingBook,
       title: editTitle.trim(),
-      author: editAuthor.trim() || 'Unknown Writer',
+      author: editAuthor.trim(),
     });
     onClose();
   };
@@ -177,20 +178,36 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
                 />
               </div>
 
-              <div className="flex justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={onClose}
-                  className="px-3.5 py-1.5 text-xs opacity-70 hover:opacity-100"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-1.5 text-xs font-semibold bg-[#1DB954] text-black rounded-full"
-                >
-                  Save
-                </button>
+              <div className="flex items-center justify-between gap-2 pt-2">
+                {onDeleteBook ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onDeleteBook(editingBook.id);
+                      onClose();
+                    }}
+                    className="px-3 py-1.5 rounded-full text-xs font-semibold bg-rose-500/15 text-rose-400 hover:bg-rose-500/25 flex items-center gap-1.5 transition-colors"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Remove from Library</span>
+                  </button>
+                ) : <div />}
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="px-3.5 py-1.5 text-xs opacity-70 hover:opacity-100"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-4 py-1.5 text-xs font-semibold bg-[#1DB954] text-black rounded-full"
+                  >
+                    Save
+                  </button>
+                </div>
               </div>
             </form>
           ) : (

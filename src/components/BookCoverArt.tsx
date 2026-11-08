@@ -1,23 +1,28 @@
 import React from 'react';
 import { CoverPattern, CoverArtStyle } from '../types/library';
+import { sanitizeBookTitle, sanitizeBookAuthor } from '../utils/library';
 
 interface BookCoverProps {
   title: string;
-  author: string;
+  author?: string;
   color: string;
   pattern?: CoverPattern;
+  coverImage?: string;
   className?: string;
   showDetails?: boolean;
 }
 
 export const BookCover: React.FC<BookCoverProps> = ({
   title,
-  author,
+  author = '',
   color,
   pattern = 'minimal',
   className = '',
   showDetails = true,
 }) => {
+  const cleanTitle = sanitizeBookTitle(title);
+  const cleanAuthor = sanitizeBookAuthor(author);
+
   return (
     <div
       className={`relative rounded-sm overflow-hidden flex flex-col justify-between p-3.5 select-none transition-transform shadow-md ${className}`}
@@ -38,7 +43,7 @@ export const BookCover: React.FC<BookCoverProps> = ({
         }}
       />
 
-      {/* Decorative SVG Pattern */}
+      {/* Decorative Editorial Book Motif (no generic star) */}
       <div className="absolute inset-0 flex items-center justify-center opacity-20 pointer-events-none">
         {pattern === 'botanical' && (
           <svg className="w-24 h-24 text-amber-100" viewBox="0 0 100 100" fill="currentColor">
@@ -47,10 +52,10 @@ export const BookCover: React.FC<BookCoverProps> = ({
           </svg>
         )}
         {pattern === 'classical' && (
-          <svg className="w-20 h-20 text-amber-200" viewBox="0 0 100 100" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="50" cy="50" r="38" />
-            <circle cx="50" cy="50" r="28" strokeDasharray="3 3" />
-            <polygon points="50,22 60,40 80,40 64,52 70,72 50,60 30,72 36,52 20,40 40,40" fill="currentColor" fillOpacity="0.2" />
+          <svg className="w-20 h-20 text-amber-200" viewBox="0 0 100 100" fill="none" stroke="currentColor" strokeWidth="1.8">
+            <rect x="22" y="16" width="56" height="68" rx="4" />
+            <path d="M32 34 C40 30 46 30 50 34 C54 30 60 30 68 34 L68 66 C60 62 54 62 50 66 C46 62 40 62 32 66 Z" />
+            <line x1="50" y1="34" x2="50" y2="66" />
           </svg>
         )}
         {pattern === 'geometric' && (
@@ -74,19 +79,19 @@ export const BookCover: React.FC<BookCoverProps> = ({
       {/* Book Cover Typography */}
       {showDetails && (
         <>
-          <div className="relative z-10 text-center pt-2">
-            <p className="text-[10px] tracking-widest text-amber-200/80 uppercase font-sans mb-1">
-              {author}
-            </p>
-            <h4 className="font-serif text-sm font-semibold text-amber-100 leading-tight line-clamp-3 px-1">
-              {title}
+          <div className="relative z-10 text-center pt-3">
+            {cleanAuthor && (
+              <p className="text-[10px] tracking-widest text-amber-200/80 uppercase font-sans mb-1.5 truncate px-1">
+                {cleanAuthor}
+              </p>
+            )}
+            <h4 className="font-serif text-sm font-semibold text-amber-100 leading-snug line-clamp-4 px-1">
+              {cleanTitle}
             </h4>
           </div>
 
           <div className="relative z-10 flex items-center justify-center pb-1">
-            <span className="text-[9px] tracking-wider text-amber-200/60 uppercase font-mono">
-              Folio PDF Edition
-            </span>
+            <span className="w-8 h-[1px] bg-amber-200/30" />
           </div>
         </>
       )}

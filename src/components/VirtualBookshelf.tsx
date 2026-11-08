@@ -130,6 +130,7 @@ export const VirtualBookshelf: React.FC<VirtualBookshelfProps> = ({
                             author={book.author}
                             color={book.spineColor}
                             pattern={book.coverPattern}
+                            coverImage={book.coverImage}
                             className="w-32 h-44 hover:shadow-2xl"
                           />
                         </div>

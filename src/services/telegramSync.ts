@@ -1,6 +1,7 @@
 import { Book, CoverPattern, TelegramConfigStatus, TelegramPdfItem } from '../types/library';
 import { extractPdfMetadata } from '../utils/pdfParser';
-import { storePdfBlob } from './db';
+import { cleanPdfFilename, sanitizeBookTitle, sanitizeBookAuthor } from '../utils/library';
+import { storePdfBlob, getBookCover, storeBookCover } from './db';
 
 const PALETTE = [
   '#1E293B', // Slate
@@ -12,6 +13,7 @@ const PALETTE = [
 ];
 
 const STORAGE_TG_SESSION_KEY = 'folio_tg_session_v1';
+const inflightCoverRequests = new Map<string, Promise<string | null>>();
 
 export interface ExploreChannelGroup {
   channel: string;
@@ -139,6 +141,55 @@ export async function fetchExploreChannelFeed(
   }
 }
 
+export async function fetchTelegramBookCover(
+  item: {
+    channelUsername: string;
+    messageId: number;
+    coverPhotoMsgId?: number;
+  },
+  cleanTitle: string
+): Promise<string | null> {
+  const cleanChannel = normalizeChannelInput(item.channelUsername);
+  const cacheKey = `tg_${cleanChannel}_${item.messageId}`;
+
+  const cached = await getBookCover(cacheKey);
+  if (cached) return cached;
+
+  const existingPromise = inflightCoverRequests.get(cacheKey);
+  if (existingPromise) return existingPromise;
+
+  const promise = (async () => {
+    try {
+      const params = new URLSearchParams({
+        channel: cleanChannel,
+        messageId: String(item.messageId),
+        title: cleanTitle,
+      });
+      if (item.coverPhotoMsgId) {
+        params.set('photoMsgId', String(item.coverPhotoMsgId));
+      }
+
+      const res = await fetch(`/api/telegram/cover?${params.toString()}`, {
+        headers: getSessionHeaders(),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data?.coverUrl && typeof data.coverUrl === 'string') {
+        await storeBookCover(cacheKey, data.coverUrl);
+        return data.coverUrl;
+      }
+      return null;
+    } catch {
+      return null;
+    } finally {
+      inflightCoverRequests.delete(cacheKey);
+    }
+  })();
+
+  inflightCoverRequests.set(cacheKey, promise);
+  return promise;
+}
+
 export async function fetchChannelPdfs(
   channel: string,
   limit = 20
@@ -180,9 +231,8 @@ export async function downloadAndImportTelegramPdf(
   }
 
   const arrayBuffer = await res.arrayBuffer();
-  const fileName = item.fileName.toLowerCase().endsWith('.pdf')
-    ? item.fileName
-    : `${item.fileName}.pdf`;
+  const parsedName = cleanPdfFilename(item.cleanTitle || item.fileName, item.caption, item.channelTitle);
+  const fileName = `${parsedName.title}.pdf`;
 
   const file = new File([arrayBuffer], fileName, { type: 'application/pdf' });
   const metadata = await extractPdfMetadata(file);
@@ -190,18 +240,27 @@ export async function downloadAndImportTelegramPdf(
   const bookId = `tg_${cleanChannel}_${item.messageId}`;
   await storePdfBlob(bookId, file);
 
+  const finalTitle = sanitizeBookTitle(
+    item.cleanTitle || parsedName.title || metadata.title,
+    item.channelTitle
+  );
+  const finalAuthor = sanitizeBookAuthor(
+    item.author || parsedName.author || metadata.author,
+    item.channelTitle
+  );
+
   const colorIndex =
     Math.abs(
-      metadata.title.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)
+      finalTitle.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)
     ) % PALETTE.length;
   const spineColor = PALETTE[colorIndex];
-  const patterns: CoverPattern[] = ['classical', 'minimal', 'botanical', 'geometric'];
+  const patterns: CoverPattern[] = ['botanical', 'geometric', 'embossed', 'classical'];
   const coverPattern = patterns[colorIndex % patterns.length];
 
   return {
     id: bookId,
-    title: metadata.title,
-    author: metadata.author,
+    title: finalTitle,
+    author: finalAuthor,
     fileName,
     fileSize: file.size || item.fileSize,
     pageCount: metadata.pageCount,
@@ -210,7 +269,7 @@ export async function downloadAndImportTelegramPdf(
     spineColor,
     spineTexture: 'leather',
     coverPattern,
-    notes: item.caption || `Synced from Telegram @${cleanChannel}`,
+    notes: sanitizeBookTitle(item.caption || '', item.channelTitle),
     dateAdded: new Date().toISOString().split('T')[0],
     lastRead: null,
     pdfBlobKey: bookId,

@@ -81,6 +81,7 @@ export const SpotifyPlayerBar: React.FC<SpotifyPlayerBarProps> = ({
           author={currentBook.author}
           color={currentBook.spineColor}
           pattern={currentBook.coverPattern}
+          coverImage={currentBook.coverImage}
           showDetails={false}
           className="w-10 h-14 shrink-0 rounded-xs shadow-md group-hover:scale-105 transition-transform"
         />
@@ -88,9 +89,11 @@ export const SpotifyPlayerBar: React.FC<SpotifyPlayerBarProps> = ({
           <p className="text-xs font-semibold truncate group-hover:underline">
             {currentBook.title}
           </p>
-          <p className={`text-[11px] truncate ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
-            {currentBook.author}
-          </p>
+          {currentBook.author && (
+            <p className={`text-[11px] truncate ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
+              {currentBook.author}
+            </p>
+          )}
         </div>
       </div>
 

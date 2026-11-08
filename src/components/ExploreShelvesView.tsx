@@ -1,6 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { Book, Booklist, AppTheme, TelegramPdfItem } from '../types/library';
-import { searchPublicBooklists, cleanPdfFilename } from '../utils/library';
+import { Book, Booklist, AppTheme, TelegramPdfItem, CoverPattern } from '../types/library';
+import {
+  searchPublicBooklists,
+  cleanPdfFilename,
+  sanitizeBookTitle,
+  sanitizeBookAuthor,
+} from '../utils/library';
 import {
   fetchExploreChannelFeed,
   downloadAndImportTelegramPdf,
@@ -41,6 +46,8 @@ const COVER_COLORS = [
   '#1E1B4B',
 ];
 
+const COVER_PATTERNS: CoverPattern[] = ['botanical', 'geometric', 'embossed', 'classical'];
+
 export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
   publicBooklists,
   existingBooks,
@@ -75,6 +82,10 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
 
   useEffect(() => {
     loadExploreFeed(false);
+    const interval = setInterval(() => {
+      loadExploreFeed(false);
+    }, 60000);
+    return () => clearInterval(interval);
   }, [configuredChannels]);
 
   const filteredLists = searchPublicBooklists(publicBooklists, searchQuery);
@@ -85,10 +96,11 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
     }
     if (!searchQuery.trim()) return true;
     const q = searchQuery.toLowerCase();
+    const cleanName = sanitizeBookTitle(item.cleanTitle || item.fileName, item.channelTitle).toLowerCase();
     return (
-      item.fileName.toLowerCase().includes(q) ||
+      cleanName.includes(q) ||
       item.caption.toLowerCase().includes(q) ||
-      item.channelTitle.toLowerCase().includes(q)
+      (item.author || '').toLowerCase().includes(q)
     );
   });
 
@@ -133,10 +145,10 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl sm:text-3xl font-serif font-bold tracking-tight text-balance">
-            Explore Books &amp; Channels
+            Explore Books
           </h2>
           <p className={`text-xs sm:text-sm mt-1 font-medium ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
-            Instant PDF books automatically synced from connected Telegram channels — no login required
+            Instant PDF books automatically synced — tap any book to read or save offline
           </p>
         </div>
 
@@ -148,7 +160,7 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
               type="text"
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
-              placeholder="Search books or channels..."
+              placeholder="Search books..."
               className={`w-full text-xs pl-8 pr-3 py-2 rounded-full border focus:outline-hidden ${
                 isDark
                   ? 'bg-[#242424] border-[#333333] text-white placeholder-zinc-500'
@@ -165,7 +177,7 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
                 ? 'bg-[#181818] border-[#282828] hover:bg-[#282828] text-white'
                 : 'bg-white border-zinc-200 hover:bg-zinc-100 text-zinc-900'
             }`}
-            title="Refresh Telegram Channels Feed"
+            title="Refresh Books Feed"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isLoadingFeed ? 'animate-spin text-[#1DB954]' : ''}`} />
           </button>
@@ -177,19 +189,19 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <span className="w-6 h-6 rounded-lg bg-[#1DB954]/15 text-[#1DB954] flex items-center justify-center">
-              <Send className="w-3.5 h-3.5" />
+              <BookOpen className="w-3.5 h-3.5" />
             </span>
             <h3 className="text-lg font-serif font-bold tracking-tight">
-              Live Telegram Channel PDFs
+              Available Books
             </h3>
             {allChannelPdfs.length > 0 && (
               <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[#1DB954]/15 text-[#1DB954]">
-                {allChannelPdfs.length} books available
+                {allChannelPdfs.length} books
               </span>
             )}
           </div>
 
-          {/* Channel Filter Pills */}
+          {/* Channel Filter Pills (only shown if multiple channels exist) */}
           {channelGroups.length > 1 && (
             <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
               <button
@@ -202,9 +214,9 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
                     : 'bg-zinc-100 text-zinc-700'
                 }`}
               >
-                All Channels ({allChannelPdfs.length})
+                All ({allChannelPdfs.length})
               </button>
-              {channelGroups.map(group => (
+              {channelGroups.map((group, idx) => (
                 <button
                   key={group.channel}
                   onClick={() => setSelectedChannelFilter(group.channel)}
@@ -216,7 +228,7 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
                       : 'bg-zinc-100 text-zinc-700'
                   }`}
                 >
-                  {group.channelTitle} ({group.pdfs.length})
+                  Collection {idx + 1} ({group.pdfs.length})
                 </button>
               ))}
             </div>
@@ -230,35 +242,33 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
             }`}
           >
             <Loader2 className="w-6 h-6 animate-spin text-[#1DB954]" />
-            <p className="text-xs font-semibold">Fetching newest PDFs from connected Telegram channels...</p>
+            <p className="text-xs font-semibold">Loading books...</p>
           </div>
         ) : visibleTelegramPdfs.length > 0 ? (
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
             {visibleTelegramPdfs.map(item => {
-              const parsed = cleanPdfFilename(item.fileName);
+              const parsed = cleanPdfFilename(
+                item.cleanTitle || item.fileName,
+                item.caption,
+                item.channelTitle
+              );
+              const cleanTitle = sanitizeBookTitle(
+                item.cleanTitle || parsed.title,
+                item.channelTitle
+              );
+              const cleanAuthor = sanitizeBookAuthor(
+                item.author || parsed.author,
+                item.channelTitle
+              );
+
               const existing = findExistingBook(item);
               const key = `${item.channelUsername}_${item.messageId}`;
               const isBusy = downloadingKey === key;
-              const colorIdx =
-                Math.abs(
-                  parsed.title.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0)
-                ) % COVER_COLORS.length;
-              const coverColor = COVER_COLORS[colorIdx];
-
-              const previewBook: Book = existing || {
-                id: key,
-                title: parsed.title,
-                author: parsed.author !== 'Unknown Author' ? parsed.author : item.channelTitle,
-                fileName: item.fileName,
-                fileSize: item.fileSize,
-                pageCount: 1,
-                currentPage: 1,
-                status: 'to-read',
-                spineColor: coverColor,
-                spineTexture: 'leather',
-                coverPattern: 'classical',
-                dateAdded: item.date.split('T')[0],
-              };
+              const hashVal = Math.abs(
+                cleanTitle.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0)
+              );
+              const coverColor = COVER_COLORS[hashVal % COVER_COLORS.length];
+              const coverPattern = COVER_PATTERNS[hashVal % COVER_PATTERNS.length];
 
               return (
                 <div
@@ -272,17 +282,12 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
                 >
                   <div className="relative mb-3">
                     <BookCover
-                      title={previewBook.title}
-                      author={previewBook.author}
-                      color={previewBook.spineColor}
-                      pattern={previewBook.coverPattern}
+                      title={cleanTitle}
+                      author={cleanAuthor}
+                      color={existing?.spineColor || coverColor}
+                      pattern={existing?.coverPattern || coverPattern}
                       className="w-full aspect-[3/4] rounded-lg shadow-md group-hover:scale-[1.02] transition-transform"
                     />
-
-                    {/* Channel Badge */}
-                    <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-black/75 text-[#1DB954] backdrop-blur-xs">
-                      @{item.channelUsername}
-                    </span>
 
                     {/* Play / Read Now Hover Button */}
                     <div className="absolute right-2 bottom-2 opacity-0 group-hover:opacity-100 transition-all translate-y-2 group-hover:translate-y-0">
@@ -297,11 +302,11 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
                   </div>
 
                   <div>
-                    <h4 className="font-semibold text-xs truncate mb-0.5" title={parsed.title}>
-                      {parsed.title}
+                    <h4 className="font-semibold text-xs truncate mb-0.5" title={cleanTitle}>
+                      {cleanTitle}
                     </h4>
                     <p className={`text-[11px] truncate mb-2 ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
-                      {previewBook.author} · {formatBytes(item.fileSize)}
+                      {cleanAuthor ? `${cleanAuthor} · ${formatBytes(item.fileSize)}` : formatBytes(item.fileSize)}
                     </p>
 
                     <div className="flex items-center justify-between pt-1 border-t border-white/5">

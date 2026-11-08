@@ -45,9 +45,11 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [docError, setDocError] = useState<string | null>(null);
   const [pageRenderError, setPageRenderError] = useState<string | null>(null);
   const [pageInput, setPageInput] = useState<string>(String(initialPage));
+  const [tapFeedback, setTapFeedback] = useState<'left' | 'right' | null>(null);
 
   const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
   const rawPageDimensionsRef = useRef<{ width: number; height: number } | null>(null);
+  const pointerStartRef = useRef<{ x: number; y: number; time: number } | null>(null);
 
   // Load PDF Document
   useEffect(() => {
@@ -58,7 +60,6 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     setDocError(null);
     setPageRenderError(null);
 
-    // Pass slice to prevent transfer detachment
     const dataCopy = new Uint8Array(arrayBuffer.slice(0));
 
     const loadingTask = pdfjsLib.getDocument({
@@ -102,7 +103,6 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const renderCurrentPage = useCallback(async () => {
     if (!pdfDoc || !canvasRef.current) return;
 
-    // Cancel existing render operation if running
     if (renderTaskRef.current) {
       try {
         renderTaskRef.current.cancel();
@@ -120,14 +120,12 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       const canvas = canvasRef.current;
       if (!canvas) return;
 
-      // Base unscaled viewport for sizing references
       const unscaledViewport = page.getViewport({ scale: 1, rotation });
       rawPageDimensionsRef.current = {
         width: unscaledViewport.width,
         height: unscaledViewport.height,
       };
 
-      // Use High-DPI devicePixelRatio (capped at 2 for performance)
       const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
       const viewport = page.getViewport({ scale: scale * pixelRatio, rotation });
 
@@ -141,13 +139,11 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         throw new Error('Could not get 2D canvas context');
       }
 
-      // Pre-fill canvas with crisp solid white paper
       context.fillStyle = '#FFFFFF';
       context.fillRect(0, 0, canvas.width, canvas.height);
       context.imageSmoothingEnabled = true;
       context.imageSmoothingQuality = 'high';
 
-      // Standard canonical PDF.js render context
       const renderContext = {
         canvas: canvas,
         canvasContext: context,
@@ -174,26 +170,87 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   }, [renderCurrentPage]);
 
   // Page turns
-  const goToPage = (pageNum: number) => {
-    if (!pdfDoc) return;
-    const clamped = Math.max(1, Math.min(totalPages, pageNum));
-    setCurrentPage(clamped);
-    setPageInput(String(clamped));
-    if (onPageChange) {
-      onPageChange(clamped, totalPages);
+  const goToPage = useCallback(
+    (pageNum: number) => {
+      if (!pdfDoc) return;
+      const clamped = Math.max(1, Math.min(totalPages, pageNum));
+      setCurrentPage(clamped);
+      setPageInput(String(clamped));
+      if (onPageChange) {
+        onPageChange(clamped, totalPages);
+      }
+      if (containerRef.current) {
+        containerRef.current.scrollTop = 0;
+      }
+    },
+    [pdfDoc, totalPages, onPageChange]
+  );
+
+  const handlePrevPage = useCallback(() => {
+    if (currentPage > 1) {
+      setTapFeedback('left');
+      setTimeout(() => setTapFeedback(null), 220);
+      goToPage(currentPage - 1);
     }
-    if (containerRef.current) {
-      containerRef.current.scrollTop = 0;
+  }, [currentPage, goToPage]);
+
+  const handleNextPage = useCallback(() => {
+    if (currentPage < totalPages) {
+      setTapFeedback('right');
+      setTimeout(() => setTapFeedback(null), 220);
+      goToPage(currentPage + 1);
     }
+  }, [currentPage, totalPages, goToPage]);
+
+  // Tap Left / Right side of book or Swipe to turn pages
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    pointerStartRef.current = {
+      x: e.clientX,
+      y: e.clientY,
+      time: Date.now(),
+    };
   };
 
-  const handlePrevPage = () => goToPage(currentPage - 1);
-  const handleNextPage = () => goToPage(currentPage + 1);
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const start = pointerStartRef.current;
+    pointerStartRef.current = null;
+    if (!start || !containerRef.current) return;
+
+    // Ignore if user clicked a button or input inside the container
+    const target = e.target as HTMLElement;
+    if (target.closest('button') || target.closest('input')) return;
+
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    const elapsed = Date.now() - start.time;
+
+    // 1. Horizontal swipe gesture (iPad / touch)
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.8 && elapsed < 500) {
+      if (dx < 0) {
+        handleNextPage();
+      } else {
+        handlePrevPage();
+      }
+      return;
+    }
+
+    // 2. Clean tap (not a scroll/drag): check if left 40% or right 40% of the book/screen was tapped
+    if (Math.abs(dx) < 14 && Math.abs(dy) < 14 && elapsed < 450) {
+      const rect = containerRef.current.getBoundingClientRect();
+      const relX = (e.clientX - rect.left) / rect.width;
+
+      if (relX <= 0.42) {
+        handlePrevPage();
+      } else if (relX >= 0.58) {
+        handleNextPage();
+      }
+    }
+  };
 
   // Zoom presets
   const handleFitWidth = () => {
     if (!containerRef.current || !rawPageDimensionsRef.current) return;
-    const containerWidth = containerRef.current.clientWidth - 48; // padding
+    const containerWidth = containerRef.current.clientWidth - 48;
     const targetScale = Math.max(0.5, Math.min(2.5, containerWidth / rawPageDimensionsRef.current.width));
     setScale(parseFloat(targetScale.toFixed(2)));
   };
@@ -225,7 +282,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [currentPage, totalPages]);
+  }, [handleNextPage, handlePrevPage, goToPage, totalPages]);
 
   const getThemeFilter = () => {
     switch (paperTheme) {
@@ -259,7 +316,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             onClick={handlePrevPage}
             disabled={currentPage <= 1}
             className="p-1 rounded hover:bg-white/10 disabled:opacity-30 transition-colors"
-            title="Previous page (Left arrow)"
+            title="Previous page (Tap left side or Left arrow)"
             aria-label="Previous page"
           >
             <ChevronLeft className="w-4 h-4" />
@@ -286,7 +343,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             onClick={handleNextPage}
             disabled={currentPage >= totalPages}
             className="p-1 rounded hover:bg-white/10 disabled:opacity-30 transition-colors"
-            title="Next page (Right arrow)"
+            title="Next page (Tap right side or Right arrow)"
             aria-label="Next page"
           >
             <ChevronRight className="w-4 h-4" />
@@ -300,11 +357,14 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           >
             {totalPages}
           </button>
+
+          <span className="hidden lg:inline-block ml-2 text-[11px] opacity-45">
+            Tip: Tap left/right side of page to turn
+          </span>
         </div>
 
         {/* Zoom Controls & Fit Presets */}
         <div className="flex items-center gap-1 sm:gap-2">
-          {/* Fit Width / Fit Page */}
           <div className="hidden md:flex items-center gap-1 border-r border-white/10 pr-2">
             <button
               onClick={handleFitWidth}
@@ -357,11 +417,25 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         </div>
       </div>
 
-      {/* Main Canvas Container */}
+      {/* Main Canvas Container with Left/Right Tap-to-Turn Zones */}
       <div
         ref={containerRef}
-        className="flex-1 overflow-auto p-4 sm:p-6 flex items-start justify-center relative"
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        className="flex-1 overflow-auto p-4 sm:p-6 flex items-start justify-center relative cursor-pointer"
       >
+        {/* Subtle Visual Left/Right Page Turn Feedback Pill */}
+        {tapFeedback === 'left' && (
+          <div className="fixed left-4 top-1/2 -translate-y-1/2 z-30 w-10 h-10 rounded-full bg-black/70 text-white flex items-center justify-center shadow-lg pointer-events-none animate-fade-in">
+            <ChevronLeft className="w-5 h-5 text-[#1DB954]" />
+          </div>
+        )}
+        {tapFeedback === 'right' && (
+          <div className="fixed right-4 top-1/2 -translate-y-1/2 z-30 w-10 h-10 rounded-full bg-black/70 text-white flex items-center justify-center shadow-lg pointer-events-none animate-fade-in">
+            <ChevronRight className="w-5 h-5 text-[#1DB954]" />
+          </div>
+        )}
+
         {isLoadingDoc && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-xs z-20">
             <div className="flex flex-col items-center gap-2 text-xs font-semibold">

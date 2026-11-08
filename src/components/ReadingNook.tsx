@@ -85,6 +85,7 @@ export const ReadingNook: React.FC<ReadingNookProps> = ({
                   author={currentRead.author}
                   color={currentRead.spineColor}
                   pattern={currentRead.coverPattern}
+                  coverImage={currentRead.coverImage}
                   className="w-36 h-52 shrink-0 shadow-xl"
                 />
 
@@ -92,9 +93,11 @@ export const ReadingNook: React.FC<ReadingNookProps> = ({
                   <h3 className="font-serif text-2xl font-bold text-[#2B1E16] mb-1">
                     {currentRead.title}
                   </h3>
-                  <p className="text-xs text-[#7A6B5C] mb-3 font-sans">
-                    By {currentRead.author}
-                  </p>
+                  {currentRead.author && (
+                    <p className="text-xs text-[#7A6B5C] mb-3 font-sans">
+                      By {currentRead.author}
+                    </p>
+                  )}
 
                   {/* Excerpt / Notes */}
                   {currentRead.notes ? (

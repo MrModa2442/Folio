@@ -3,12 +3,13 @@ import { Book } from '../types/library';
 import { getPdfBlob, createSamplePdfBlob } from '../services/db';
 import { ambientSound } from '../services/ambientAudio';
 import { RealPdfViewer } from './RealPdfViewer';
-import { X, ChevronLeft, CloudRain, Flame, Building2, Check, BookOpen } from 'lucide-react';
+import { X, ChevronLeft, CloudRain, Flame, Building2, Check, BookOpen, Trash2 } from 'lucide-react';
 
 interface CozyPdfReaderProps {
   book: Book;
   onClose: () => void;
   onUpdateBook: (updated: Book) => void;
+  onDeleteBook?: (bookId: string) => void;
 }
 
 type ReaderTheme = 'white' | 'cream' | 'sepia' | 'night';
@@ -17,6 +18,7 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
   book,
   onClose,
   onUpdateBook,
+  onDeleteBook,
 }) => {
   const [arrayBuffer, setArrayBuffer] = useState<ArrayBuffer | null>(null);
   const [currentPage, setCurrentPage] = useState<number>(book.currentPage || 1);
@@ -24,6 +26,7 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
   const [theme, setTheme] = useState<ReaderTheme>('cream');
   const [activeSound, setActiveSound] = useState<'none' | 'rain' | 'fireplace' | 'library'>('none');
   const [isLoadingPdf, setIsLoadingPdf] = useState<boolean>(true);
+  const [confirmRemove, setConfirmRemove] = useState<boolean>(false);
 
   // Load PDF Blob as ArrayBuffer
   useEffect(() => {
@@ -122,8 +125,8 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
           </div>
         </div>
 
-        {/* Ambient Sounds, Themes & Close */}
-        <div className="flex items-center gap-3">
+        {/* Ambient Sounds, Themes, Remove & Close */}
+        <div className="flex items-center gap-2.5">
           {/* Ambient Sound Buttons */}
           <div className="hidden sm:flex items-center gap-1 bg-white/5 p-1 rounded-md text-xs">
             <button
@@ -194,6 +197,35 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
               <Check className="w-3 h-3" />
               <span>Finished</span>
             </span>
+          )}
+
+          {/* Remove Book from Library */}
+          {onDeleteBook && (
+            confirmRemove ? (
+              <button
+                onClick={() => {
+                  onDeleteBook(book.id);
+                  onClose();
+                }}
+                className="px-2.5 py-1 rounded-full bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center gap-1 transition-colors"
+                title="Confirm removing book from library"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Confirm Remove</span>
+              </button>
+            ) : (
+              <button
+                onClick={() => {
+                  setConfirmRemove(true);
+                  setTimeout(() => setConfirmRemove(false), 4000);
+                }}
+                className="p-1.5 rounded-full text-rose-400 hover:bg-rose-500/20 transition-colors"
+                title="Remove book from library"
+                aria-label="Remove book from library"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )
           )}
 
           {/* Exit Button */}

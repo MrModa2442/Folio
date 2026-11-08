@@ -1,16 +1,113 @@
 import { Book, Booklist, Collaborator, ReadingStatus } from '../types/library';
 
+const BANNED_CHANNEL_PHRASES = [
+  'کتاب‌هایی که باید بخونیم',
+  'کتاب هایی که باید بخونیم',
+  'کتاب‌هایی که باید بخوانیم',
+  'کتاب هایی که باید بخوانیم',
+  'کتابهایی که باید بخوانیم',
+  'کتابهایی که باید بخونیم',
+  'unknown author',
+  'unknown writer',
+];
+
+/**
+ * Removes Telegram handles (e.g. (@ocbooks), @ocbooks, t.me/...), channel names,
+ * and empty brackets/parentheses from book titles and authors.
+ */
+export function sanitizeBookTitle(raw: string, channelTitle?: string): string {
+  if (!raw) return '';
+  let text = raw
+    // Remove file extension if present
+    .replace(/\.pdf$/i, '')
+    // Remove parenthesized or bracketed @handles or t.me links e.g. (@ocbooks), [@ocbooks]
+    .replace(/[\(\[\{«]\s*(?:@[a-zA-Z0-9_]+|(?:https?:\/\/)?(?:t|telegram)\.me\/[^\s\)\]\}»]+)\s*[\)\]\}»]/gi, ' ')
+    // Remove bare @handles e.g. @ocbooks
+    .replace(/@[a-zA-Z0-9_]+/g, ' ')
+    // Remove bare t.me links
+    .replace(/(?:https?:\/\/)?(?:t|telegram)\.me\/[a-zA-Z0-9_\/]+/gi, ' ');
+
+  for (const phrase of BANNED_CHANNEL_PHRASES) {
+    text = text.split(phrase).join(' ');
+  }
+  if (channelTitle && channelTitle.trim()) {
+    text = text.split(channelTitle.trim()).join(' ');
+  }
+
+  text = text
+    // Remove empty parentheses or brackets left behind
+    .replace(/\(\s*\)|\[\s*\]|\{\s*\}|«\s*»/g, ' ')
+    // Replace underscores with spaces
+    .replace(/_+/g, ' ')
+    // Trim leading/trailing dashes or dots
+    .replace(/^[\s\-–—·.|]+|[\s\-–—·.|]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return text || 'Untitled Book';
+}
+
+export function sanitizeBookAuthor(raw: string, channelTitle?: string): string {
+  if (!raw) return '';
+  let text = raw
+    .replace(/[\(\[\{«]\s*@[a-zA-Z0-9_]+\s*[\)\]\}»]/gi, ' ')
+    .replace(/@[a-zA-Z0-9_]+/g, ' ')
+    .replace(/(?:https?:\/\/)?(?:t|telegram)\.me\/[a-zA-Z0-9_\/]+/gi, ' ')
+    .replace(/\(\s*\)|\[\s*\]/g, ' ')
+    .replace(/_+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const lower = text.toLowerCase();
+  for (const phrase of BANNED_CHANNEL_PHRASES) {
+    if (lower === phrase.toLowerCase() || text.includes(phrase)) {
+      text = text.split(phrase).join('').trim();
+    }
+  }
+  if (channelTitle && text.toLowerCase() === channelTitle.trim().toLowerCase()) {
+    return '';
+  }
+  if (
+    !text ||
+    text.toLowerCase() === 'unknown author' ||
+    text.toLowerCase() === 'unknown writer' ||
+    text.startsWith('@')
+  ) {
+    return '';
+  }
+  return text.replace(/^[\s\-–—·.|]+|[\s\-–—·.|]+$/g, '').trim();
+}
+
+export function extractAuthorFromCaption(caption: string): string {
+  if (!caption) return '';
+  const patterns = [
+    /(?:نویسنده|نویسندگان|اثر|تألیف|تالیف|نگارش)\s*[:：\-]\s*([^\n\r#@|()]+)/i,
+    /(?:author|written by|by)\s*[:：]\s*([^\n\r#@|()]+)/i,
+  ];
+  for (const regex of patterns) {
+    const match = caption.match(regex);
+    if (match && match[1]) {
+      const candidate = sanitizeBookAuthor(match[1]);
+      if (candidate && candidate.length >= 2 && candidate.length <= 60) {
+        return candidate;
+      }
+    }
+  }
+  return '';
+}
+
 /**
  * Parses a PDF filename into a clean suggested title and author.
  */
-export function cleanPdfFilename(fileName: string): { title: string; author: string } {
-  const withoutExt = fileName.replace(/\.[^/.]+$/, '').trim();
-  
+export function cleanPdfFilename(fileName: string, caption = '', channelTitle = ''): { title: string; author: string } {
+  const withoutExt = sanitizeBookTitle(fileName.replace(/\.[^/.]+$/, '').trim(), channelTitle);
+  const captionAuthor = extractAuthorFromCaption(caption);
+
   if (withoutExt.includes(' - ')) {
-    const parts = withoutExt.split(' - ');
+    const parts = withoutExt.split(' - ').map(p => sanitizeBookTitle(p, channelTitle)).filter(Boolean);
     if (parts.length >= 2) {
       return {
-        author: parts[0].trim(),
+        author: sanitizeBookAuthor(parts[0], channelTitle) || captionAuthor,
         title: parts.slice(1).join(' - ').trim(),
       };
     }
@@ -19,27 +116,28 @@ export function cleanPdfFilename(fileName: string): { title: string; author: str
   if (withoutExt.includes('_by_')) {
     const [t, a] = withoutExt.split('_by_');
     return {
-      title: formatTitleCasing(t.replace(/_/g, ' ')),
-      author: formatTitleCasing(a.replace(/_/g, ' ')),
+      title: formatTitleCasing(sanitizeBookTitle(t, channelTitle)),
+      author: sanitizeBookAuthor(formatTitleCasing(a), channelTitle) || captionAuthor,
     };
   }
 
-  const clean = withoutExt
-    .replace(/[_-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
   return {
-    title: formatTitleCasing(clean),
-    author: 'Unknown Author',
+    title: formatTitleCasing(withoutExt),
+    author: captionAuthor,
   };
 }
 
 function formatTitleCasing(str: string): string {
-  if (!str) return 'Untitled Document';
+  if (!str) return 'Untitled Book';
+  // Only apply Latin title-casing to words that start with ASCII letters
   return str
     .split(' ')
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .map(w => {
+      if (/^[a-zA-Z]/.test(w)) {
+        return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+      }
+      return w;
+    })
     .join(' ');
 }
 

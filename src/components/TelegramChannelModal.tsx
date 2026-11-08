@@ -124,8 +124,9 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
         body: JSON.stringify({ phoneNumber: phoneNumber.trim() }),
       });
       const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Could not send login code.');
+      if (!res.ok || data.ok === false || data.error) {
+        setErrorMessage(data.error || 'Could not send login code.');
+        return;
       }
       setPhoneCodeHash(data.phoneCodeHash || '');
       setPendingSession(data.pendingSession || '');
@@ -162,13 +163,14 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
         }),
       });
       const data = await res.json();
-      if (res.status === 401 && data.needsPassword) {
+      if (data.needsPassword) {
         setNeedsPassword(true);
         setErrorMessage(data.error);
         return;
       }
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to verify login code.');
+      if (!res.ok || data.ok === false || data.error) {
+        setErrorMessage(data.error || 'Failed to verify login code.');
+        return;
       }
 
       if (data.sessionString) {
@@ -568,10 +570,9 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                                 Newest
                               </span>
                             )}
-                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-[#B3B3B3]">
-                              @{item.channelUsername}
-                            </span>
-                            <p className="text-xs font-semibold truncate">{item.fileName}</p>
+                            <p className="text-xs font-semibold truncate">
+                              {item.cleanTitle || item.fileName.replace(/\.pdf$/i, '')}
+                            </p>
                           </div>
                           <p className="text-[11px] text-[#B3B3B3] truncate">
                             {formatBytes(item.fileSize)} · {new Date(item.date).toLocaleDateString()}

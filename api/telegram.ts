@@ -1,8 +1,51 @@
 import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
+import { Logger } from 'telegram/extensions/index.js';
 
 const DEFAULT_API_ID = 2040;
 const DEFAULT_API_HASH = 'b18441a1ff607e10a989891a5462e627';
+
+// Suppress GramJS background update/ping TIMEOUT unhandled rejections
+if (typeof process !== 'undefined' && process.on) {
+  process.on('unhandledRejection', (reason: unknown) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    if (msg.includes('TIMEOUT') || msg.includes('Not connected')) {
+      // Ignore benign GramJS background socket idle timeout
+      return;
+    }
+    console.warn('[UnhandledRejection]', reason);
+  });
+}
+
+// Reusable connected client cache so we don't connect/disconnect on every request
+const clientPool = new Map<string, TelegramClient>();
+
+async function getConnectedClient(
+  sessionStr: string,
+  apiId: number,
+  apiHash: string
+): Promise<TelegramClient> {
+  const key = `${apiId}:${sessionStr.slice(0, 32)}`;
+  const existing = clientPool.get(key);
+  if (existing && existing.connected) {
+    return existing;
+  }
+
+  const silentLogger = new Logger('none' as never);
+  const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
+    connectionRetries: 2,
+    retryDelay: 500,
+    timeout: 10,
+    autoReconnect: false,
+    baseLogger: silentLogger,
+  });
+
+  await client.connect();
+  if (sessionStr) {
+    clientPool.set(key, client);
+  }
+  return client;
+}
 
 // 90-second in-memory cache for the public Explore multi-channel feed
 let exploreCache: {
@@ -10,12 +53,13 @@ let exploreCache: {
   key: string;
   data: {
     configured: boolean;
+    serverHasSession: boolean;
     channels: Array<{
       channel: string;
       channelTitle: string;
-      pdfs: ReturnType<typeof extractPdfFromMessage>[];
+      pdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[];
     }>;
-    allPdfs: ReturnType<typeof extractPdfFromMessage>[];
+    allPdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[];
   };
 } | null = null;
 
@@ -56,10 +100,133 @@ function getConfiguredServerChannels(extraQueryChannels = ''): string[] {
   return parseChannelList(combined);
 }
 
+// In-memory cache for downloaded book cover data URLs
+const serverCoverCache = new Map<string, string>();
+
+function stripHandlesAndChannelNames(raw: string, channelTitle = ''): string {
+  if (!raw) return '';
+  let text = raw
+    .replace(/\.pdf$/i, '')
+    .replace(/[\(\[\{«]\s*(?:@[a-zA-Z0-9_]+|(?:https?:\/\/)?(?:t|telegram)\.me\/[^\s\)\]\}»]+)\s*[\)\]\}»]/gi, ' ')
+    .replace(/@[a-zA-Z0-9_]+/g, ' ')
+    .replace(/(?:https?:\/\/)?(?:t|telegram)\.me\/[a-zA-Z0-9_\/]+/gi, ' ');
+
+  const bannedPhrases = [
+    'کتاب‌هایی که باید بخونیم',
+    'کتاب هایی که باید بخونیم',
+    'کتاب‌هایی که باید بخوانیم',
+    'کتاب هایی که باید بخوانیم',
+    'کتابهایی که باید بخوانیم',
+    'کتابهایی که باید بخونیم',
+  ];
+  for (const phrase of bannedPhrases) {
+    text = text.split(phrase).join(' ');
+  }
+  if (channelTitle && channelTitle.trim()) {
+    text = text.split(channelTitle.trim()).join(' ');
+  }
+
+  return text
+    .replace(/\(\s*\)|\[\s*\]|\{\s*\}|«\s*»/g, ' ')
+    .replace(/_+/g, ' ')
+    .replace(/^[\s\-–—·.|]+|[\s\-–—·.|]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseAuthorFromText(caption: string): string {
+  if (!caption) return '';
+  const patterns = [
+    /(?:نویسنده|نویسندگان|اثر|تألیف|تالیف|نگارش)\s*[:：\-]\s*([^\n\r#@|()]+)/i,
+    /(?:author|written by|by)\s*[:：]\s*([^\n\r#@|()]+)/i,
+  ];
+  for (const regex of patterns) {
+    const match = caption.match(regex);
+    if (match && match[1]) {
+      const cleaned = stripHandlesAndChannelNames(match[1]);
+      if (cleaned.length >= 2 && cleaned.length <= 60) {
+        return cleaned;
+      }
+    }
+  }
+  return '';
+}
+
+function messageHasPhoto(msg: Api.Message | undefined): boolean {
+  if (!msg || !msg.media) return false;
+  if (msg.media instanceof Api.MessageMediaPhoto) return true;
+  if (
+    msg.media instanceof Api.MessageMediaWebPage &&
+    msg.media.webpage instanceof Api.WebPage &&
+    msg.media.webpage.photo
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function findCompanionPhotoMessage(
+  pdfMsg: Api.Message,
+  indexInList: number,
+  allMessages: Api.TypeMessage[]
+): Api.Message | undefined {
+  // 1. Check direct replyToMsgId
+  const replyHeader = pdfMsg.replyTo;
+  if (replyHeader && 'replyToMsgId' in replyHeader && replyHeader.replyToMsgId) {
+    const targetId = replyHeader.replyToMsgId;
+    const found = allMessages.find(
+      (m): m is Api.Message => m instanceof Api.Message && m.id === targetId
+    );
+    if (found && messageHasPhoto(found)) {
+      return found;
+    }
+  }
+
+  // 2. Check same media group (groupedId)
+  if (pdfMsg.groupedId) {
+    const groupStr = pdfMsg.groupedId.toString();
+    const found = allMessages.find(
+      (m): m is Api.Message =>
+        m instanceof Api.Message &&
+        Boolean(m.groupedId) &&
+        m.groupedId!.toString() === groupStr &&
+        messageHasPhoto(m)
+    );
+    if (found) return found;
+  }
+
+  // 3. Check messages posted immediately before this PDF (indexInList + 1 .. indexInList + 3)
+  // Note: GramJS getMessages returns newest first, so indexInList + 1 is the message posted just BEFORE the PDF
+  for (let offset = 1; offset <= 3; offset++) {
+    const olderMsg = allMessages[indexInList + offset];
+    if (!(olderMsg instanceof Api.Message)) continue;
+    // Stop if we hit another PDF document before finding a photo
+    if (olderMsg.media instanceof Api.MessageMediaDocument && olderMsg.media.document instanceof Api.Document) {
+      const mime = (olderMsg.media.document.mimeType || '').toLowerCase();
+      if (mime === 'application/pdf') break;
+    }
+    if (messageHasPhoto(olderMsg)) {
+      return olderMsg;
+    }
+  }
+
+  // 4. Check message posted immediately after this PDF (indexInList - 1)
+  if (indexInList > 0) {
+    const newerMsg = allMessages[indexInList - 1];
+    if (newerMsg instanceof Api.Message && messageHasPhoto(newerMsg)) {
+      return newerMsg;
+    }
+  }
+
+  return undefined;
+}
+
 function extractPdfFromMessage(
   msg: Api.Message,
   channelUsername: string,
-  channelTitle: string
+  channelTitle: string,
+  indexInList = 0,
+  allMessages: Api.TypeMessage[] = []
 ) {
   if (!msg || !msg.media) return null;
   if (!(msg.media instanceof Api.MessageMediaDocument)) return null;
@@ -83,15 +250,63 @@ function extractPdfFromMessage(
   const fileSize = Number(doc.size?.toString() || '0');
   const dateObj = msg.date ? new Date(msg.date * 1000) : new Date();
 
+  const companionPhoto = findCompanionPhotoMessage(msg, indexInList, allMessages);
+  const combinedCaption = [msg.message || '', companionPhoto?.message || '']
+    .map(s => s.trim())
+    .filter(Boolean)
+    .join('\n');
+
+  const cleanBaseName = stripHandlesAndChannelNames(fileName, channelTitle) || `Book ${msg.id}`;
+  const cleanFileName = `${cleanBaseName}.pdf`;
+  const author = parseAuthorFromText(combinedCaption);
+  const hasThumb = Boolean((doc.thumbs && doc.thumbs.length > 0) || companionPhoto);
+
   return {
     messageId: msg.id,
-    fileName: fileName.toLowerCase().endsWith('.pdf') ? fileName : `${fileName}.pdf`,
+    fileName: cleanFileName,
+    cleanTitle: cleanBaseName,
+    author,
     fileSize,
     date: dateObj.toISOString(),
-    caption: (msg.message || '').trim(),
-    channelTitle,
+    caption: stripHandlesAndChannelNames(combinedCaption, channelTitle),
+    channelTitle: '',
     channelUsername,
+    coverPhotoMsgId: companionPhoto?.id,
+    hasThumb,
   };
+}
+
+async function fetchExternalBookCoverDataUrl(title: string): Promise<string | null> {
+  if (!title || title.length < 2) return null;
+  try {
+    const query = encodeURIComponent(title);
+    const gRes = await fetch(
+      `https://www.googleapis.com/books/v1/volumes?q=${query}&maxResults=3`,
+      { signal: AbortSignal.timeout(4500) }
+    );
+    if (gRes.ok) {
+      const gData = await gRes.json();
+      const items = Array.isArray(gData?.items) ? gData.items : [];
+      for (const item of items) {
+        const links = item?.volumeInfo?.imageLinks;
+        const rawThumb = links?.thumbnail || links?.smallThumbnail;
+        if (typeof rawThumb === 'string' && rawThumb) {
+          const httpsUrl = rawThumb.replace(/^http:\/\//i, 'https://');
+          const imgRes = await fetch(httpsUrl, { signal: AbortSignal.timeout(4500) });
+          if (imgRes.ok) {
+            const arr = await imgRes.arrayBuffer();
+            if (arr.byteLength > 200) {
+              const mime = imgRes.headers.get('content-type') || 'image/jpeg';
+              return `data:${mime};base64,${Buffer.from(arr).toString('base64')}`;
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore external cover lookup errors
+  }
+  return null;
 }
 
 // Vercel Serverless & Express Unified Handler
@@ -105,7 +320,6 @@ export default async function handler(req: any, res: any) {
   const headerSession = String(req.headers?.['x-telegram-session'] || '').trim();
   const querySession = String(req.query?.session || '').trim();
   const envSession = (process.env.TELEGRAM_SESSION || '').trim();
-  // Prefer server-level TELEGRAM_SESSION or fallback to user's header session
   const activeSession = envSession || headerSession || querySession;
 
   const { apiId, apiHash } = getApiCredentials();
@@ -126,7 +340,7 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    // 1b. GET /api/telegram/explore-feed (Multi-Channel Public Explore Feed for all visitors!)
+    // 1b. GET /api/telegram/explore-feed
     if (pathname === 'explore-feed') {
       const extraChannels = String(req.query?.channels || '');
       const forceRefresh = req.query?.refresh === 'true';
@@ -141,7 +355,7 @@ export default async function handler(req: any, res: any) {
         });
       }
 
-      const cacheKey = `${activeSession.slice(0, 12)}:${channels.join(',')}`;
+      const cacheKey = `v2:${activeSession.slice(0, 12)}:${channels.join(',')}`;
       const now = Date.now();
       if (
         !forceRefresh &&
@@ -152,10 +366,7 @@ export default async function handler(req: any, res: any) {
         return res.status(200).json(exploreCache.data);
       }
 
-      const client = new TelegramClient(new StringSession(activeSession), apiId, apiHash, {
-        connectionRetries: 3,
-      });
-      await client.connect();
+      const client = await getConnectedClient(activeSession, apiId, apiHash);
 
       const channelResults: Array<{
         channel: string;
@@ -169,12 +380,13 @@ export default async function handler(req: any, res: any) {
           const entity = await client.getEntity(ch);
           const channelTitle =
             (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || `@${ch}`;
-          const messages = await client.getMessages(entity, { limit: 25 });
+          const messages = await client.getMessages(entity, { limit: 45 });
           const pdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[] = [];
 
-          for (const msg of messages) {
+          for (let i = 0; i < messages.length; i++) {
+            const msg = messages[i];
             if (msg instanceof Api.Message) {
-              const extracted = extractPdfFromMessage(msg, ch, channelTitle);
+              const extracted = extractPdfFromMessage(msg, ch, channelTitle, i, messages);
               if (extracted) {
                 pdfs.push(extracted);
                 allPdfs.push(extracted);
@@ -192,9 +404,6 @@ export default async function handler(req: any, res: any) {
         }
       }
 
-      await client.disconnect();
-
-      // Sort combined feed newest-first
       allPdfs.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
       const responseData = {
@@ -213,6 +422,100 @@ export default async function handler(req: any, res: any) {
       return res.status(200).json(responseData);
     }
 
+    // 1c. GET /api/telegram/cover
+    if (pathname === 'cover') {
+      const rawChannel = String(req.query?.channel || process.env.TELEGRAM_CHANNEL || '');
+      const channel = normalizeTelegramChannel(rawChannel);
+      const messageId = Number.parseInt(String(req.query?.messageId || '0'), 10);
+      const photoMsgId = Number.parseInt(String(req.query?.photoMsgId || '0'), 10);
+      const title = String(req.query?.title || '').trim();
+
+      const cacheKey = `${channel}:${messageId}:${photoMsgId}`;
+      const cached = serverCoverCache.get(cacheKey);
+      if (cached) {
+        return res.status(200).json({ ok: true, coverUrl: cached });
+      }
+
+      let coverDataUrl: string | null = null;
+
+      if (activeSession && channel && (messageId > 0 || photoMsgId > 0)) {
+        try {
+          const client = await getConnectedClient(activeSession, apiId, apiHash);
+          const entity = await client.getEntity(channel);
+
+          // Step A: Try companion photo message or adjacent messages around messageId
+          const idsToFetch: number[] = [];
+          if (photoMsgId > 0) idsToFetch.push(photoMsgId);
+          if (messageId > 0) {
+            idsToFetch.push(messageId);
+            if (!photoMsgId) {
+              // Also check immediately preceding/succeeding message IDs for a cover photo post
+              if (messageId > 1) idsToFetch.push(messageId - 1);
+              if (messageId > 2) idsToFetch.push(messageId - 2);
+              idsToFetch.push(messageId + 1);
+            }
+          }
+
+          const uniqueIds = Array.from(new Set(idsToFetch));
+          const msgs = await client.getMessages(entity, { ids: uniqueIds });
+          const validMsgs = (msgs || []).filter((m): m is Api.Message => m instanceof Api.Message);
+
+          // 1) Check explicit photoMsgId first, then adjacent photo messages
+          const targetPhotoMsg =
+            validMsgs.find(m => photoMsgId > 0 && m.id === photoMsgId && messageHasPhoto(m)) ||
+            validMsgs.find(m => m.id !== messageId && messageHasPhoto(m));
+
+          if (targetPhotoMsg) {
+            const buf = await client.downloadMedia(targetPhotoMsg, {});
+            if (buf && Buffer.isBuffer(buf) && buf.byteLength > 100) {
+              coverDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+            }
+          }
+
+          // 2) If no companion photo, check the PDF document's own embedded thumbnail
+          if (!coverDataUrl && messageId > 0) {
+            const pdfMsg = validMsgs.find(m => m.id === messageId);
+            if (
+              pdfMsg &&
+              pdfMsg.media instanceof Api.MessageMediaDocument &&
+              pdfMsg.media.document instanceof Api.Document
+            ) {
+              const doc = pdfMsg.media.document;
+              if (doc.thumbs && doc.thumbs.length > 0) {
+                const thumbObj = doc.thumbs[doc.thumbs.length - 1];
+                const thumbBuf = await client.downloadMedia(pdfMsg, {
+                  thumb: thumbObj as never,
+                });
+                if (thumbBuf && Buffer.isBuffer(thumbBuf) && thumbBuf.byteLength > 80) {
+                  coverDataUrl = `data:image/jpeg;base64,${thumbBuf.toString('base64')}`;
+                }
+              }
+            }
+          }
+        } catch (tgCoverErr) {
+          console.warn('[/api/telegram/cover] Telegram media thumb notice:', tgCoverErr);
+        }
+      }
+
+      // Step B: Fallback to Google Books cover lookup by cleaned book title
+      if (!coverDataUrl && title) {
+        coverDataUrl = await fetchExternalBookCoverDataUrl(title);
+      }
+
+      if (coverDataUrl) {
+        if (serverCoverCache.size > 150) {
+          const firstKey = serverCoverCache.keys().next().value;
+          if (firstKey) serverCoverCache.delete(firstKey);
+        }
+        serverCoverCache.set(cacheKey, coverDataUrl);
+      }
+
+      return res.status(200).json({
+        ok: Boolean(coverDataUrl),
+        coverUrl: coverDataUrl || null,
+      });
+    }
+
     // 2. POST /api/telegram/auth/send-code
     if (pathname === 'auth/send-code' && req.method === 'POST') {
       const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
@@ -223,14 +526,19 @@ export default async function handler(req: any, res: any) {
         });
       }
 
+      const silentLogger = new Logger('none' as never);
       const client = new TelegramClient(new StringSession(''), apiId, apiHash, {
-        connectionRetries: 3,
+        connectionRetries: 2,
+        retryDelay: 500,
+        timeout: 10,
+        autoReconnect: false,
+        baseLogger: silentLogger,
       });
       await client.connect();
 
       const result = await client.sendCode({ apiId, apiHash }, phoneNumber);
       const pendingSession = (client.session.save() as unknown as string) || '';
-      await client.disconnect();
+      clientPool.set(`${apiId}:${pendingSession.slice(0, 32)}`, client);
 
       return res.status(200).json({
         ok: true,
@@ -261,10 +569,7 @@ export default async function handler(req: any, res: any) {
         });
       }
 
-      const client = new TelegramClient(new StringSession(pendingSession), apiId, apiHash, {
-        connectionRetries: 3,
-      });
-      await client.connect();
+      const client = await getConnectedClient(pendingSession, apiId, apiHash);
 
       try {
         await client.invoke(
@@ -278,7 +583,6 @@ export default async function handler(req: any, res: any) {
         const errMsg = signInErr instanceof Error ? signInErr.message : String(signInErr);
         if (errMsg.includes('SESSION_PASSWORD_NEEDED')) {
           if (!password) {
-            await client.disconnect();
             return res.status(401).json({
               needsPassword: true,
               error: 'Your Telegram account has 2-Step Verification (2FA) enabled. Enter your 2FA password below.',
@@ -294,13 +598,12 @@ export default async function handler(req: any, res: any) {
             }
           );
         } else {
-          await client.disconnect();
           throw signInErr;
         }
       }
 
       const sessionString = (client.session.save() as unknown as string) || '';
-      await client.disconnect();
+      clientPool.set(`${apiId}:${sessionString.slice(0, 32)}`, client);
 
       return res.status(200).json({
         ok: true,
@@ -311,6 +614,7 @@ export default async function handler(req: any, res: any) {
 
     // 4. POST /api/telegram/auth/logout
     if (pathname === 'auth/logout') {
+      clientPool.clear();
       return res.status(200).json({ ok: true });
     }
 
@@ -318,7 +622,7 @@ export default async function handler(req: any, res: any) {
     if (pathname === 'channel-pdfs') {
       const rawChannel = String(req.query?.channel || process.env.TELEGRAM_CHANNEL || '');
       const channel = normalizeTelegramChannel(rawChannel);
-      const limit = Math.min(50, Math.max(1, Number(req.query?.limit) || 25));
+      const limit = Math.min(50, Math.max(1, Number(req.query?.limit) || 35));
 
       if (!channel) {
         return res.status(400).json({
@@ -332,11 +636,7 @@ export default async function handler(req: any, res: any) {
         });
       }
 
-      const client = new TelegramClient(new StringSession(activeSession), apiId, apiHash, {
-        connectionRetries: 3,
-      });
-      await client.connect();
-
+      const client = await getConnectedClient(activeSession, apiId, apiHash);
       const entity = await client.getEntity(channel);
       const channelTitle =
         (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || `@${channel}`;
@@ -344,16 +644,15 @@ export default async function handler(req: any, res: any) {
       const messages = await client.getMessages(entity, { limit });
       const pdfItems = [];
 
-      for (const msg of messages) {
+      for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
         if (msg instanceof Api.Message) {
-          const extracted = extractPdfFromMessage(msg, channel, channelTitle);
+          const extracted = extractPdfFromMessage(msg, channel, channelTitle, i, messages);
           if (extracted) {
             pdfItems.push(extracted);
           }
         }
       }
-
-      await client.disconnect();
 
       return res.status(200).json({
         channel,
@@ -380,28 +679,21 @@ export default async function handler(req: any, res: any) {
         });
       }
 
-      const client = new TelegramClient(new StringSession(activeSession), apiId, apiHash, {
-        connectionRetries: 3,
-      });
-      await client.connect();
-
+      const client = await getConnectedClient(activeSession, apiId, apiHash);
       const entity = await client.getEntity(channel);
       const messages = await client.getMessages(entity, { ids: [messageId] });
       const msg = messages?.[0];
 
       if (!msg || !(msg instanceof Api.Message)) {
-        await client.disconnect();
         return res.status(404).json({ error: `Message #${messageId} not found in @${channel}.` });
       }
 
       const meta = extractPdfFromMessage(msg, channel, channel);
       if (!meta) {
-        await client.disconnect();
         return res.status(400).json({ error: `Message #${messageId} does not contain a valid PDF document.` });
       }
 
       const buffer = await client.downloadMedia(msg, {});
-      await client.disconnect();
 
       if (!buffer || !(buffer instanceof Buffer)) {
         return res.status(500).json({ error: 'Failed to download PDF binary stream from Telegram.' });
@@ -418,8 +710,19 @@ export default async function handler(req: any, res: any) {
 
     return res.status(404).json({ error: `Unknown Telegram API route: ${pathname}` });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Telegram server error.';
-    console.error('[/api/telegram] Error:', message);
-    return res.status(500).json({ error: message });
+    const rawMessage = err instanceof Error ? err.message : 'Telegram server error.';
+    console.warn('[/api/telegram] Notice:', rawMessage);
+    const friendlyMessage =
+      rawMessage === 'TIMEOUT' || rawMessage.includes('TIMEOUT')
+        ? 'Connection to Telegram MTProto timed out in this cloud environment. If you deployed to Vercel, open your Vercel URL to sign in directly.'
+        : rawMessage;
+    return res.status(200).json({
+      ok: false,
+      configured: false,
+      channels: [],
+      allPdfs: [],
+      pdfs: [],
+      error: friendlyMessage,
+    });
   }
 }
