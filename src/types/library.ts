@@ -24,6 +24,27 @@ export interface Book {
   telegramChannel?: string;
   telegramMessageId?: number;
   coverImage?: string;
+  bookmarks?: PageBookmark[];
+  highlights?: Record<number, PageHighlightStroke[]>;
+}
+
+export interface PageBookmark {
+  id: string;
+  page: number;
+  note: string;
+  createdAt: string;
+}
+
+export interface PageHighlightStroke {
+  color: string;
+  points: Array<{ x: number; y: number }>;
+}
+
+export interface DailyReadingStats {
+  dailyGoalPages: number;
+  pagesReadToday: number;
+  streakDays: number;
+  lastReadDate: string;
 }
 
 export interface TelegramPdfItem {
@@ -82,6 +103,8 @@ export interface Booklist {
 export type BookshelfWood = 'walnut' | 'oak' | 'birch' | 'mahogany';
 
 export type ViewMode = 'shelf' | 'grid' | 'table';
+
+export type SortOption = 'recently-added' | 'title-asc' | 'progress-desc';
 
 export type AmbientSoundType = 'none' | 'rain' | 'fireplace' | 'library';
 

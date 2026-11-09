@@ -1,5 +1,5 @@
 import React from 'react';
-import { BookOpen, Bookmark, CheckCircle2, Lock, Globe, Plus } from 'lucide-react';
+import { BookOpen, Bookmark, CheckCircle2, Lock, Globe, Plus, Smartphone } from 'lucide-react';
 import { Booklist, ReadingStatus, AppTheme } from '../types/library';
 
 interface SidebarProps {
@@ -12,6 +12,7 @@ interface SidebarProps {
   onSelectList: (id: string | null) => void;
   onSelectStatus: (status: ReadingStatus | 'all') => void;
   onOpenCreateList: () => void;
+  onOpenSyncModal: () => void;
   theme: AppTheme;
 }
 
@@ -25,6 +26,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onSelectList,
   onSelectStatus,
   onOpenCreateList,
+  onOpenSyncModal,
   theme,
 }) => {
   const isDark = theme === 'spotify-dark';
@@ -188,6 +190,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
             No playlists yet. Click + to create one.
           </div>
         )}
+      </div>
+
+      {/* Device Sync Button */}
+      <div className="p-2.5">
+        <button
+          type="button"
+          onClick={onOpenSyncModal}
+          className={`w-full flex items-center justify-center gap-1.5 py-2 rounded-xl text-xs font-semibold border transition-colors ${
+            isDark
+              ? 'bg-[#181818] border-[#282828] text-white/90 hover:bg-[#242424]'
+              : 'bg-white border-zinc-200 text-zinc-800 hover:bg-zinc-100'
+          }`}
+          title="Sync reading progress, bookmarks, and highlights across iPad & phone"
+        >
+          <Smartphone className="w-3.5 h-3.5 text-[#1DB954]" />
+          <span>Sync Progress & Pins</span>
+        </button>
       </div>
     </aside>
   );

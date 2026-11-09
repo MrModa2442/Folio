@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Book } from '../types/library';
+import { Book, PageBookmark, PageHighlightStroke } from '../types/library';
 import { getPdfBlob, createSamplePdfBlob } from '../services/db';
 import { ambientSound } from '../services/ambientAudio';
 import { RealPdfViewer } from './RealPdfViewer';
@@ -87,6 +87,63 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
     });
   };
 
+  const handleToggleBookmark = (page: number, note = '') => {
+    const currentBookmarks = book.bookmarks || [];
+    const existing = currentBookmarks.find(b => b.page === page);
+    let nextBookmarks: PageBookmark[];
+    if (existing && !note) {
+      nextBookmarks = currentBookmarks.filter(b => b.page !== page);
+    } else if (existing && note) {
+      nextBookmarks = currentBookmarks.map(b => (b.page === page ? { ...b, note } : b));
+    } else {
+      nextBookmarks = [
+        ...currentBookmarks,
+        {
+          id: 'bm_' + Date.now().toString(36),
+          page,
+          note,
+          createdAt: new Date().toISOString(),
+        },
+      ].sort((a, b) => a.page - b.page);
+    }
+
+    onUpdateBook({
+      ...book,
+      bookmarks: nextBookmarks,
+    });
+  };
+
+  const handleUpdateBookmarkNote = (bookmarkId: string, note: string) => {
+    const nextBookmarks = (book.bookmarks || []).map(b =>
+      b.id === bookmarkId ? { ...b, note } : b
+    );
+    onUpdateBook({
+      ...book,
+      bookmarks: nextBookmarks,
+    });
+  };
+
+  const handleRemoveBookmark = (bookmarkId: string) => {
+    const nextBookmarks = (book.bookmarks || []).filter(b => b.id !== bookmarkId);
+    onUpdateBook({
+      ...book,
+      bookmarks: nextBookmarks,
+    });
+  };
+
+  const handleUpdatePageHighlights = (page: number, strokes: PageHighlightStroke[]) => {
+    const nextHighlights = { ...(book.highlights || {}) };
+    if (strokes.length === 0) {
+      delete nextHighlights[page];
+    } else {
+      nextHighlights[page] = strokes;
+    }
+    onUpdateBook({
+      ...book,
+      highlights: nextHighlights,
+    });
+  };
+
   const getContainerBg = () => {
     switch (theme) {
       case 'sepia':
@@ -119,16 +176,18 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
             <h2 className="text-xs sm:text-sm font-bold truncate">
               {book.title}
             </h2>
-            <p className="text-[11px] opacity-60 truncate">
-              {book.author}
-            </p>
+            {book.author && (
+              <p className="text-[11px] opacity-60 truncate">
+                {book.author}
+              </p>
+            )}
           </div>
         </div>
 
-        {/* Ambient Sounds, Themes, Remove & Close */}
-        <div className="flex items-center gap-2.5">
+        {/* Ambient Sounds, PDF Page Color Modes, Remove & Close */}
+        <div className="flex items-center gap-2">
           {/* Ambient Sound Buttons */}
-          <div className="hidden sm:flex items-center gap-1 bg-white/5 p-1 rounded-md text-xs">
+          <div className="hidden md:flex items-center gap-1 bg-white/5 p-1 rounded-md text-xs">
             <button
               onClick={() => handleSoundToggle('rain')}
               className={`p-1.5 rounded transition-colors flex items-center gap-1 ${
@@ -138,7 +197,7 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
               aria-label="Rain soundscape"
             >
               <CloudRain className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">Rain</span>
+              <span className="hidden lg:inline">Rain</span>
             </button>
             <button
               onClick={() => handleSoundToggle('fireplace')}
@@ -149,7 +208,7 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
               aria-label="Fireplace crackle"
             >
               <Flame className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">Fire</span>
+              <span className="hidden lg:inline">Fire</span>
             </button>
             <button
               onClick={() => handleSoundToggle('library')}
@@ -160,26 +219,36 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
               aria-label="Quiet library ambiance"
             >
               <Building2 className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">Library</span>
+              <span className="hidden lg:inline">Library</span>
             </button>
           </div>
 
-          {/* Theme Color Picker */}
-          <div className="flex items-center gap-1 bg-white/5 p-1 rounded-md">
-            {(['cream', 'sepia', 'night', 'white'] as ReaderTheme[]).map(t => (
+          {/* PDF Page Color Filter Switcher (Cream / Sepia / Night Dark / White) */}
+          <div className="flex items-center gap-1 bg-white/5 p-1 rounded-full border border-white/10">
+            {(
+              [
+                { id: 'cream', label: 'Cream', bg: '#FBF9F5' },
+                { id: 'sepia', label: 'Sepia', bg: '#F4ECE1' },
+                { id: 'night', label: 'Night', bg: '#18181B' },
+                { id: 'white', label: 'White', bg: '#FFFFFF' },
+              ] as Array<{ id: ReaderTheme; label: string; bg: string }>
+            ).map(t => (
               <button
-                key={t}
-                onClick={() => setTheme(t)}
-                className={`w-4 h-4 rounded-full border border-white/20 capitalize transition-transform ${
-                  theme === t ? 'scale-125 ring-2 ring-white' : 'hover:scale-110'
+                key={t.id}
+                onClick={() => setTheme(t.id)}
+                className={`px-2 py-0.5 rounded-full text-[11px] font-medium flex items-center gap-1 transition-all ${
+                  theme === t.id
+                    ? 'bg-white text-black font-semibold shadow-xs'
+                    : 'text-white/75 hover:text-white'
                 }`}
-                style={{
-                  backgroundColor:
-                    t === 'cream' ? '#FBF9F5' : t === 'sepia' ? '#F4ECE1' : t === 'night' ? '#18181B' : '#FFFFFF',
-                }}
-                title={`${t} paper mode`}
-                aria-label={`${t} paper mode`}
-              />
+                title={`${t.label} page mode`}
+              >
+                <span
+                  className="w-2.5 h-2.5 rounded-full border border-black/20"
+                  style={{ backgroundColor: t.bg }}
+                />
+                <span className="hidden sm:inline">{t.label}</span>
+              </button>
             ))}
           </div>
 
@@ -253,6 +322,12 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
             initialPage={currentPage}
             onPageChange={handlePageChange}
             paperTheme={theme}
+            bookmarks={book.bookmarks || []}
+            onToggleBookmark={handleToggleBookmark}
+            onUpdateBookmarkNote={handleUpdateBookmarkNote}
+            onRemoveBookmark={handleRemoveBookmark}
+            highlights={book.highlights || {}}
+            onUpdatePageHighlights={handleUpdatePageHighlights}
           />
         )}
       </div>

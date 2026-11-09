@@ -38,14 +38,6 @@ export const BooklistHero: React.FC<BooklistHeroProps> = ({
       }`}
     >
       <div className="flex flex-col sm:flex-row items-start sm:items-end gap-6">
-        {/* Playlist Cover */}
-        <PlaylistCoverArt
-          styleName={booklist.coverArtStyle}
-          color={booklist.coverColor}
-          title={booklist.title}
-          className="w-40 h-40 sm:w-48 sm:h-48 shrink-0 rounded-md shadow-2xl"
-        />
-
         {/* Text Info */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider mb-2 opacity-75">

@@ -48,6 +48,123 @@ const COVER_COLORS = [
 
 const COVER_PATTERNS: CoverPattern[] = ['botanical', 'geometric', 'embossed', 'classical'];
 
+type ExploreTopicFilter = 'all' | 'literature' | 'history' | 'philosophy' | 'psychology' | 'science';
+
+const TOPIC_DEFINITIONS: Array<{
+  id: ExploreTopicFilter;
+  label: string;
+  keywords: string[];
+}> = [
+  { id: 'all', label: 'All Topics', keywords: [] },
+  {
+    id: 'literature',
+    label: 'Literature & Novel',
+    keywords: [
+      'رمان',
+      'داستان',
+      'شعر',
+      'ادبیات',
+      'نول',
+      'نمایشنامه',
+      'novel',
+      'fiction',
+      'poetry',
+      'literature',
+      'story',
+    ],
+  },
+  {
+    id: 'history',
+    label: 'History & Society',
+    keywords: [
+      'تاریخ',
+      'ایران',
+      'جهان',
+      'تمدن',
+      'سیاست',
+      'سیاسی',
+      'جامعه',
+      'جنگ',
+      'باستان',
+      'ملل',
+      'history',
+      'society',
+      'politics',
+      'civilization',
+    ],
+  },
+  {
+    id: 'philosophy',
+    label: 'Philosophy',
+    keywords: [
+      'فلسفه',
+      'فلسفی',
+      'منطق',
+      'اندیشه',
+      'حکمت',
+      'هستی',
+      'اخلاق',
+      'نیچه',
+      'کانت',
+      'افلاطون',
+      'سقراط',
+      'philosophy',
+      'ethics',
+      'logic',
+    ],
+  },
+  {
+    id: 'psychology',
+    label: 'Psychology',
+    keywords: [
+      'روانشناسی',
+      'روان',
+      'ذهن',
+      'خودشناسی',
+      'شخصیت',
+      'عزت',
+      'اضطراب',
+      'زندگی',
+      'عشق',
+      'psychology',
+      'mind',
+      'self',
+      'habit',
+    ],
+  },
+  {
+    id: 'science',
+    label: 'Science & Nature',
+    keywords: [
+      'علم',
+      'علمی',
+      'فیزیک',
+      'کیهان',
+      'نجوم',
+      'زیست',
+      'تکامل',
+      'طبیعت',
+      'ریاضی',
+      'پزشکی',
+      'science',
+      'physics',
+      'nature',
+      'cosmos',
+      'biology',
+    ],
+  },
+];
+
+function matchesExploreTopic(item: TelegramPdfItem, topic: ExploreTopicFilter): boolean {
+  if (topic === 'all') return true;
+  const def = TOPIC_DEFINITIONS.find(t => t.id === topic);
+  if (!def) return true;
+  const hay = `${item.cleanTitle || ''} ${item.fileName || ''} ${item.caption || ''} ${
+    item.author || ''
+  }`.toLowerCase();
+  return def.keywords.some(kw => hay.includes(kw.toLowerCase()));
+}
+
 export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
   publicBooklists,
   existingBooks,
@@ -62,8 +179,10 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
   const [channelGroups, setChannelGroups] = useState<ExploreChannelGroup[]>([]);
   const [allChannelPdfs, setAllChannelPdfs] = useState<TelegramPdfItem[]>([]);
   const [selectedChannelFilter, setSelectedChannelFilter] = useState<string>('all');
+  const [selectedTopicFilter, setSelectedTopicFilter] = useState<ExploreTopicFilter>('all');
   const [isLoadingFeed, setIsLoadingFeed] = useState(true);
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number } | null>(null);
   const [feedConfigured, setFeedConfigured] = useState(false);
 
   const isDark = theme === 'spotify-dark';
@@ -90,8 +209,20 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
 
   const filteredLists = searchPublicBooklists(publicBooklists, searchQuery);
 
+  const findExistingBook = (item: TelegramPdfItem): Book | undefined => {
+    const cleanCh = normalizeChannelInput(item.channelUsername);
+    return existingBooks.find(
+      b =>
+        (b.telegramChannel === cleanCh && b.telegramMessageId === item.messageId) ||
+        b.id === `tg_${cleanCh}_${item.messageId}`
+    );
+  };
+
   const visibleTelegramPdfs = allChannelPdfs.filter(item => {
     if (selectedChannelFilter !== 'all' && item.channelUsername !== selectedChannelFilter) {
+      return false;
+    }
+    if (!matchesExploreTopic(item, selectedTopicFilter)) {
       return false;
     }
     if (!searchQuery.trim()) return true;
@@ -104,14 +235,7 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
     );
   });
 
-  const findExistingBook = (item: TelegramPdfItem): Book | undefined => {
-    const cleanCh = normalizeChannelInput(item.channelUsername);
-    return existingBooks.find(
-      b =>
-        (b.telegramChannel === cleanCh && b.telegramMessageId === item.messageId) ||
-        b.id === `tg_${cleanCh}_${item.messageId}`
-    );
-  };
+  const unsavedVisiblePdfs = visibleTelegramPdfs.filter(item => !findExistingBook(item));
 
   const handleGetOrReadChannelPdf = async (item: TelegramPdfItem, openReader: boolean) => {
     const existing = findExistingBook(item);
@@ -130,6 +254,28 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
     } finally {
       setDownloadingKey(null);
     }
+  };
+
+  const handleBatchSaveAllOffline = async () => {
+    if (batchProgress || unsavedVisiblePdfs.length === 0) return;
+    const queue = [...unsavedVisiblePdfs];
+    setBatchProgress({ current: 0, total: queue.length });
+
+    for (let i = 0; i < queue.length; i++) {
+      const item = queue[i];
+      setBatchProgress({ current: i + 1, total: queue.length });
+      const key = `${item.channelUsername}_${item.messageId}`;
+      setDownloadingKey(key);
+      try {
+        const importedBook = await downloadAndImportTelegramPdf(item);
+        onBookImported(importedBook, false);
+      } catch (err) {
+        console.error('Failed batch downloading item:', err);
+      }
+    }
+
+    setDownloadingKey(null);
+    setBatchProgress(null);
   };
 
   const formatBytes = (bytes: number) => {
@@ -152,8 +298,32 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
           </p>
         </div>
 
-        {/* Search */}
-        <div className="flex items-center gap-2">
+        {/* Search + Batch Offline Download */}
+        <div className="flex flex-wrap items-center gap-2">
+          {unsavedVisiblePdfs.length > 0 && (
+            <button
+              type="button"
+              onClick={handleBatchSaveAllOffline}
+              disabled={Boolean(batchProgress)}
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-full text-xs font-bold bg-[#1DB954] text-black hover:bg-[#1ed760] disabled:opacity-60 transition-all shadow-sm"
+              title="Download all unsaved books in this view for 100% offline iPad reading"
+            >
+              {batchProgress ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>
+                    Saving {batchProgress.current} / {batchProgress.total}...
+                  </span>
+                </>
+              ) : (
+                <>
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Save All for Offline ({unsavedVisiblePdfs.length})</span>
+                </>
+              )}
+            </button>
+          )}
+
           <div className="relative w-full sm:w-64">
             <Search className="w-3.5 h-3.5 opacity-50 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
@@ -194,9 +364,9 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
             <h3 className="text-lg font-serif font-bold tracking-tight">
               Available Books
             </h3>
-            {allChannelPdfs.length > 0 && (
+            {visibleTelegramPdfs.length > 0 && (
               <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[#1DB954]/15 text-[#1DB954]">
-                {allChannelPdfs.length} books
+                {visibleTelegramPdfs.length} books
               </span>
             )}
           </div>
@@ -234,6 +404,31 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
             </div>
           )}
         </div>
+
+        {/* Topic / Genre Filter Pills */}
+        {allChannelPdfs.length > 0 && (
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+            {TOPIC_DEFINITIONS.map(topic => {
+              const isSelected = selectedTopicFilter === topic.id;
+              return (
+                <button
+                  key={topic.id}
+                  type="button"
+                  onClick={() => setSelectedTopicFilter(topic.id)}
+                  className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-colors whitespace-nowrap border ${
+                    isSelected
+                      ? 'bg-white text-black border-white'
+                      : isDark
+                      ? 'bg-[#181818] border-[#282828] text-[#B3B3B3] hover:text-white hover:border-[#383838]'
+                      : 'bg-white border-zinc-200 text-zinc-600 hover:text-zinc-900'
+                  }`}
+                >
+                  {topic.label}
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         {isLoadingFeed ? (
           <div

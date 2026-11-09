@@ -114,7 +114,7 @@ export const PlaylistCoverArt: React.FC<PlaylistCoverArtProps> = ({
 }) => {
   return (
     <div
-      className={`relative overflow-hidden flex flex-col justify-between p-6 select-none shadow-xl ${className}`}
+      className={`relative overflow-hidden flex items-center justify-center p-5 select-none shadow-xl ${className}`}
       style={{
         backgroundColor: color,
       }}
@@ -123,15 +123,15 @@ export const PlaylistCoverArt: React.FC<PlaylistCoverArtProps> = ({
       <div className="absolute inset-0 bg-radial from-white/10 via-transparent to-black/40 pointer-events-none" />
 
       {/* Decorative Motif */}
-      <div className="absolute inset-0 flex items-center justify-center opacity-30 pointer-events-none">
+      <div className="absolute inset-0 flex items-center justify-center opacity-25 pointer-events-none">
         {styleName === 'autumn' && (
-          <svg className="w-32 h-32 text-amber-300" viewBox="0 0 100 100" fill="currentColor">
+          <svg className="w-28 h-28 text-amber-300" viewBox="0 0 100 100" fill="currentColor">
             <path d="M50,15 C65,30 75,55 50,85 C25,55 35,30 50,15 Z" />
             <path d="M50,15 L50,85" stroke="#000" strokeWidth="2" opacity="0.3" />
           </svg>
         )}
         {styleName === 'scholar' && (
-          <svg className="w-32 h-32 text-amber-200" viewBox="0 0 100 100" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg className="w-28 h-28 text-amber-200" viewBox="0 0 100 100" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M20,70 L50,30 L80,70 Z" />
             <circle cx="50" cy="55" r="12" />
             <line x1="20" y1="80" x2="80" y2="80" strokeWidth="3" />
@@ -141,42 +141,27 @@ export const PlaylistCoverArt: React.FC<PlaylistCoverArtProps> = ({
           <svg className="w-28 h-28 text-amber-200" viewBox="0 0 100 100" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="M30,45 C30,65 40,75 55,75 C70,75 75,65 75,45 Z" />
             <path d="M75,50 C85,50 88,58 85,63 C82,68 75,65 75,65" />
-            <path d="M42,35 C42,25 48,25 48,15" strokeDasharray="3 2" />
-            <path d="M55,35 C55,25 61,25 61,15" strokeDasharray="3 2" />
           </svg>
         )}
         {styleName === 'botanical' && (
-          <svg className="w-32 h-32 text-emerald-200" viewBox="0 0 100 100" fill="currentColor">
+          <svg className="w-28 h-28 text-emerald-200" viewBox="0 0 100 100" fill="currentColor">
             <path d="M50,20 Q65,40 50,60 Q35,40 50,20 Z" />
             <path d="M35,45 Q50,65 35,85 Q20,65 35,45 Z" />
             <path d="M65,45 Q80,65 65,85 Q50,65 65,45 Z" />
           </svg>
         )}
         {styleName === 'night' && (
-          <svg className="w-32 h-32 text-indigo-200" viewBox="0 0 100 100" fill="currentColor">
+          <svg className="w-28 h-28 text-indigo-200" viewBox="0 0 100 100" fill="currentColor">
             <path d="M60,25 C45,25 35,38 35,53 C35,68 47,80 62,80 C50,78 42,66 45,52 C48,38 60,27 60,25 Z" />
-            <circle cx="75" cy="30" r="2" />
-            <circle cx="80" cy="50" r="1.5" />
           </svg>
         )}
       </div>
 
-      {/* Top Header Tag */}
-      <div className="relative z-10 flex items-center justify-between">
-        <span className="text-[11px] font-mono uppercase tracking-widest text-amber-200/90 font-semibold">
-          Curated Booklist
-        </span>
-        <span className="text-xs text-amber-200/60 font-serif italic">Folio</span>
-      </div>
-
-      {/* Bottom Title Lockup */}
-      <div className="relative z-10">
-        <h3 className="font-serif text-2xl font-bold text-amber-100 leading-snug drop-shadow-sm">
+      {/* Clean Centered Playlist Title Only */}
+      <div className="relative z-10 text-center">
+        <h3 className="font-serif text-lg sm:text-xl font-bold text-amber-100 leading-snug drop-shadow-sm line-clamp-3">
           {title}
         </h3>
-        <p className="text-xs text-amber-200/70 font-sans mt-1">
-          Spotify-style Personal Library
-        </p>
       </div>
     </div>
   );

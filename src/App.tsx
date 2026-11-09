@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Book, Booklist, ReadingStatus, ViewMode, AppTheme } from './types/library';
+import { Book, Booklist, ReadingStatus, ViewMode, SortOption, AppTheme } from './types/library';
 import { INITIAL_BOOKS, INITIAL_BOOKLISTS } from './data/initialData';
 import {
   filterBooks,
+  sortBooks,
   toggleBooklistPrivacy,
   sanitizeBookTitle,
   sanitizeBookAuthor,
@@ -22,13 +23,14 @@ import { ExploreShelvesView } from './components/ExploreShelvesView';
 import { SpotifyPlayerBar } from './components/SpotifyPlayerBar';
 import { TelegramChannelModal } from './components/TelegramChannelModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
+import { SyncProgressModal } from './components/SyncProgressModal';
 import {
   fetchExploreChannelFeed,
   downloadAndImportTelegramPdf,
   normalizeChannelInput,
 } from './services/telegramSync';
 import { deletePdfBlob } from './services/db';
-import { Search, LayoutGrid, List as ListIcon, Plus, Send } from 'lucide-react';
+import { Search, LayoutGrid, List as ListIcon, Plus, Send, ArrowUpDown } from 'lucide-react';
 
 // Use clean v3 storage keys to ensure a complete fresh zero-state first-time experience
 const STORAGE_BOOKS_KEY = 'folio_books_v3_zero';
@@ -80,6 +82,7 @@ export default function App() {
   const [selectedStatus, setSelectedStatus] = useState<ReadingStatus | 'all'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [viewMode, setViewMode] = useState<ViewMode>('table');
+  const [sortBy, setSortBy] = useState<SortOption>('recently-added');
 
   // Currently Playing / Reading Book (for Spotify Bottom Bar)
   const [activeReadingBook, setActiveReadingBook] = useState<Book | null>(() => {
@@ -89,6 +92,7 @@ export default function App() {
   // Modals & Fullscreen Reader
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [isTelegramSyncOpen, setIsTelegramSyncOpen] = useState(false);
+  const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
   const [editingBook, setEditingBook] = useState<Book | null>(null);
   const [isCreateListOpen, setIsCreateListOpen] = useState(false);
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
@@ -143,7 +147,10 @@ export default function App() {
     ? books.filter(b => currentBooklist.bookIds.includes(b.id))
     : books;
 
-  const displayedBooks = filterBooks(baseBooks, searchQuery, selectedStatus);
+  const displayedBooks = sortBooks(
+    filterBooks(baseBooks, searchQuery, selectedStatus),
+    sortBy
+  );
 
   const readingBooksCount = books.filter(b => b.status === 'reading').length;
   const finishedBooksCount = books.filter(b => b.status === 'completed').length;
@@ -362,6 +369,7 @@ export default function App() {
             setCurrentTab('library');
           }}
           onOpenCreateList={() => setIsCreateListOpen(true)}
+          onOpenSyncModal={() => setIsSyncModalOpen(true)}
           theme={theme}
         />
 
@@ -426,7 +434,7 @@ export default function App() {
               ) : (
                 /* Clean Library Header */
                 <div
-                  className={`p-6 border-b flex items-center justify-between ${
+                  className={`p-6 border-b flex flex-wrap items-center justify-between gap-4 ${
                     isDark
                       ? 'bg-gradient-to-b from-[#1E1E1E] to-[#121212] border-[#242424]'
                       : 'bg-gradient-to-b from-zinc-100 to-white border-zinc-200'
@@ -445,25 +453,49 @@ export default function App() {
                     </p>
                   </div>
 
-                  <button
-                    onClick={() => {
-                      setEditingBook(null);
-                      setIsImportOpen(true);
-                    }}
-                    className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-semibold ${
-                      isDark ? 'bg-white text-black hover:bg-zinc-200' : 'bg-zinc-900 text-white hover:bg-zinc-800'
-                    }`}
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Import PDF</span>
-                  </button>
+                  <div className="flex items-center gap-2.5">
+                    {/* Sort Dropdown in Library View Header */}
+                    <div className="relative flex items-center">
+                      <ArrowUpDown className="w-3.5 h-3.5 opacity-60 absolute left-3 pointer-events-none" />
+                      <select
+                        value={sortBy}
+                        onChange={e => setSortBy(e.target.value as SortOption)}
+                        aria-label="Sort books"
+                        className={`text-xs font-medium pl-8 pr-7 py-1.5 rounded-full border appearance-none cursor-pointer focus:outline-hidden transition-colors ${
+                          isDark
+                            ? 'bg-[#242424] border-[#333333] text-white hover:border-[#555555]'
+                            : 'bg-white border-zinc-200 text-zinc-900 hover:border-zinc-400'
+                        }`}
+                      >
+                        <option value="recently-added">Recently Added</option>
+                        <option value="title-asc">Title (A-Z)</option>
+                        <option value="progress-desc">Reading Progress</option>
+                      </select>
+                      <span className="pointer-events-none absolute right-2.5 text-[10px] opacity-60">
+                        ▾
+                      </span>
+                    </div>
+
+                    <button
+                      onClick={() => {
+                        setEditingBook(null);
+                        setIsImportOpen(true);
+                      }}
+                      className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-semibold ${
+                        isDark ? 'bg-white text-black hover:bg-zinc-200' : 'bg-zinc-900 text-white hover:bg-zinc-800'
+                      }`}
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Import PDF</span>
+                    </button>
+                  </div>
                 </div>
               )}
 
               {/* Minimal Filter & View Switcher Strip */}
               {books.length > 0 && (
                 <div
-                  className={`px-6 py-2.5 border-b flex items-center justify-between gap-4 text-xs ${
+                  className={`px-6 py-2.5 border-b flex flex-wrap items-center justify-between gap-4 text-xs ${
                     isDark ? 'border-[#242424]' : 'border-zinc-200'
                   }`}
                 >
@@ -483,8 +515,28 @@ export default function App() {
                     />
                   </div>
 
-                  {/* View Mode */}
-                  <div className="flex items-center gap-2">
+                  {/* Sort & View Mode */}
+                  <div className="flex items-center gap-2.5">
+                    {currentBooklist && (
+                      <div className="relative flex items-center">
+                        <ArrowUpDown className="w-3 h-3 opacity-60 absolute left-2.5 pointer-events-none" />
+                        <select
+                          value={sortBy}
+                          onChange={e => setSortBy(e.target.value as SortOption)}
+                          aria-label="Sort playlist books"
+                          className={`text-xs pl-7 pr-6 py-1 rounded-full border appearance-none cursor-pointer focus:outline-hidden ${
+                            isDark
+                              ? 'bg-[#242424] border-[#333333] text-white'
+                              : 'bg-white border-zinc-200 text-zinc-900'
+                          }`}
+                        >
+                          <option value="recently-added">Recently Added</option>
+                          <option value="title-asc">Title (A-Z)</option>
+                          <option value="progress-desc">Reading Progress</option>
+                        </select>
+                      </div>
+                    )}
+
                     <span className="opacity-60 text-[11px] font-mono tabular-nums">
                       {displayedBooks.length} items
                     </span>
@@ -600,6 +652,41 @@ export default function App() {
         isOpen={isCreateListOpen}
         onClose={() => setIsCreateListOpen(false)}
         onCreateList={handleCreateList}
+      />
+
+      <SyncProgressModal
+        isOpen={isSyncModalOpen}
+        onClose={() => setIsSyncModalOpen(false)}
+        books={books}
+        booklists={booklists}
+        onApplySyncPayload={({ booksProgress, booklists: syncedLists }) => {
+          setBooks(prev =>
+            prev.map(book => {
+              const match = booksProgress.find(
+                p => p.id === book.id || p.title.toLowerCase() === book.title.toLowerCase()
+              );
+              if (!match) return book;
+              const mergedPage = Math.max(book.currentPage, match.currentPage || 1);
+              return {
+                ...book,
+                currentPage: mergedPage,
+                status: mergedPage >= book.pageCount ? 'completed' : match.status || book.status,
+                bookmarks: match.bookmarks && match.bookmarks.length > 0 ? match.bookmarks : book.bookmarks,
+                highlights:
+                  match.highlights && Object.keys(match.highlights).length > 0
+                    ? { ...(book.highlights || {}), ...match.highlights }
+                    : book.highlights,
+              };
+            })
+          );
+          if (syncedLists && syncedLists.length > 0) {
+            setBooklists(prev => {
+              const existingIds = new Set(prev.map(l => l.id));
+              const additions = syncedLists.filter(l => !existingIds.has(l.id));
+              return [...prev, ...additions];
+            });
+          }
+        }}
       />
 
       {currentBooklist && (

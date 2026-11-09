@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
-import { Booklist, CoverArtStyle } from '../types/library';
+import { Booklist } from '../types/library';
 import { createBooklist } from '../utils/library';
-import { PlaylistCoverArt } from './BookCoverArt';
 import { X, Globe, Lock } from 'lucide-react';
 
 interface CreateBooklistModalProps {
@@ -9,14 +8,6 @@ interface CreateBooklistModalProps {
   onClose: () => void;
   onCreateList: (newList: Booklist) => void;
 }
-
-const PALETTE = [
-  { name: 'Dark Slate', hex: '#1E293B' },
-  { name: 'Spotify Green-Black', hex: '#123D24' },
-  { name: 'Espresso', hex: '#271B14' },
-  { name: 'Wine', hex: '#4A1521' },
-  { name: 'Deep Scholar', hex: '#1E1B4B' },
-];
 
 export const CreateBooklistModal: React.FC<CreateBooklistModalProps> = ({
   isOpen,
@@ -26,8 +17,6 @@ export const CreateBooklistModal: React.FC<CreateBooklistModalProps> = ({
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [isPublic, setIsPublic] = useState(false);
-  const [coverColor, setCoverColor] = useState('#1E293B');
-  const [coverArtStyle, setCoverArtStyle] = useState<CoverArtStyle>('autumn');
 
   if (!isOpen) return null;
 
@@ -39,11 +28,11 @@ export const CreateBooklistModal: React.FC<CreateBooklistModalProps> = ({
       title: title.trim(),
       description: description.trim(),
       isPublic,
-      coverColor,
-      coverArtStyle,
     });
 
     onCreateList(newList);
+    setTitle('');
+    setDescription('');
     onClose();
   };
 
@@ -66,41 +55,32 @@ export const CreateBooklistModal: React.FC<CreateBooklistModalProps> = ({
 
         {/* Form Body */}
         <form onSubmit={handleSubmit} className="p-5 space-y-4">
-          <div className="flex gap-4 items-start">
-            <PlaylistCoverArt
-              styleName={coverArtStyle}
-              color={coverColor}
-              title={title || 'Playlist'}
-              className="w-28 h-28 shrink-0 rounded shadow-md"
-            />
+          <div className="space-y-3">
+            <div>
+              <label className="block text-[11px] font-semibold opacity-80 mb-1">
+                Playlist Name *
+              </label>
+              <input
+                type="text"
+                required
+                value={title}
+                onChange={e => setTitle(e.target.value)}
+                placeholder="e.g. Weekend Reads"
+                className="w-full text-xs px-3 py-2 rounded bg-[#242424] border border-[#333333] focus:outline-hidden focus:border-white"
+              />
+            </div>
 
-            <div className="flex-1 space-y-2.5">
-              <div>
-                <label className="block text-[11px] font-semibold opacity-80 mb-1">
-                  Playlist Name *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={title}
-                  onChange={e => setTitle(e.target.value)}
-                  placeholder="e.g. Weekend Reads"
-                  className="w-full text-xs px-3 py-2 rounded bg-[#242424] border border-[#333333] focus:outline-hidden focus:border-white"
-                />
-              </div>
-
-              <div>
-                <label className="block text-[11px] font-semibold opacity-80 mb-1">
-                  Description
-                </label>
-                <textarea
-                  rows={2}
-                  value={description}
-                  onChange={e => setDescription(e.target.value)}
-                  placeholder="Optional description..."
-                  className="w-full text-xs px-3 py-1.5 rounded bg-[#242424] border border-[#333333] focus:outline-hidden"
-                />
-              </div>
+            <div>
+              <label className="block text-[11px] font-semibold opacity-80 mb-1">
+                Description
+              </label>
+              <textarea
+                rows={2}
+                value={description}
+                onChange={e => setDescription(e.target.value)}
+                placeholder="Optional description..."
+                className="w-full text-xs px-3 py-1.5 rounded bg-[#242424] border border-[#333333] focus:outline-hidden"
+              />
             </div>
           </div>
 
@@ -145,27 +125,6 @@ export const CreateBooklistModal: React.FC<CreateBooklistModalProps> = ({
                   Searchable in Explore.
                 </p>
               </button>
-            </div>
-          </div>
-
-          {/* Cover Color */}
-          <div>
-            <label className="block text-[11px] font-semibold opacity-80 mb-1">
-              Cover Tone
-            </label>
-            <div className="flex gap-2">
-              {PALETTE.map(p => (
-                <button
-                  key={p.hex}
-                  type="button"
-                  onClick={() => setCoverColor(p.hex)}
-                  title={p.name}
-                  className={`w-6 h-6 rounded border transition-transform ${
-                    coverColor === p.hex ? 'ring-2 ring-white scale-110' : 'border-white/20 hover:scale-105'
-                  }`}
-                  style={{ backgroundColor: p.hex }}
-                />
-              ))}
             </div>
           </div>
 

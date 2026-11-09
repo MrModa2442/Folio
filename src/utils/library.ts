@@ -257,6 +257,41 @@ export function filterBooks(
   });
 }
 
+export function sortBooks(
+  books: Book[],
+  sortBy: 'recently-added' | 'title-asc' | 'progress-desc'
+): Book[] {
+  const copy = [...books];
+
+  if (sortBy === 'title-asc') {
+    return copy.sort((a, b) =>
+      sanitizeBookTitle(a.title).localeCompare(sanitizeBookTitle(b.title), undefined, {
+        sensitivity: 'base',
+      })
+    );
+  }
+
+  if (sortBy === 'progress-desc') {
+    return copy.sort((a, b) => {
+      const progA = a.pageCount > 0 ? a.currentPage / a.pageCount : 0;
+      const progB = b.pageCount > 0 ? b.currentPage / b.pageCount : 0;
+      if (progB !== progA) return progB - progA;
+      return sanitizeBookTitle(a.title).localeCompare(sanitizeBookTitle(b.title));
+    });
+  }
+
+  // 'recently-added': sort by dateAdded descending, keeping original insertion order for same-day items
+  return copy
+    .map((book, idx) => ({ book, idx }))
+    .sort((a, b) => {
+      const timeA = a.book.dateAdded ? new Date(a.book.dateAdded).getTime() : 0;
+      const timeB = b.book.dateAdded ? new Date(b.book.dateAdded).getTime() : 0;
+      if (timeB !== timeA) return timeB - timeA;
+      return a.idx - b.idx;
+    })
+    .map(entry => entry.book);
+}
+
 export function searchPublicBooklists(lists: Booklist[], query: string): Booklist[] {
   const q = query.trim().toLowerCase();
   
