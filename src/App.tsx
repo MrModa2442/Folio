@@ -7,6 +7,7 @@ import {
   toggleBooklistPrivacy,
   sanitizeBookTitle,
   sanitizeBookAuthor,
+  deduplicateBooks,
 } from './utils/library';
 import { Navigation } from './components/Navigation';
 import { Sidebar } from './components/Sidebar';
@@ -51,17 +52,12 @@ export default function App() {
   });
 
   // Zero-state initialization: starts completely empty for first-time user
-  // Also sanitizes any previously stored books so @handles and channel names are stripped
+  // Also sanitizes and deduplicates any previously stored books so duplicates, @handles, and channel names are removed
   const [books, setBooks] = useState<Book[]>(() => {
     try {
       const stored = localStorage.getItem(STORAGE_BOOKS_KEY);
       const parsed: Book[] = stored ? JSON.parse(stored) : INITIAL_BOOKS;
-      return parsed.map(b => ({
-        ...b,
-        title: sanitizeBookTitle(b.title),
-        author: sanitizeBookAuthor(b.author),
-        coverImage: undefined,
-      }));
+      return deduplicateBooks(parsed);
     } catch {
       return INITIAL_BOOKS;
     }
@@ -148,7 +144,7 @@ export default function App() {
     : books;
 
   const displayedBooks = sortBooks(
-    filterBooks(baseBooks, searchQuery, selectedStatus),
+    filterBooks(deduplicateBooks(baseBooks), searchQuery, selectedStatus),
     sortBy
   );
 
@@ -158,13 +154,25 @@ export default function App() {
   // Handlers
   const handleSaveBook = (book: Book, targetListId?: string) => {
     setBooks(prev => {
-      const existing = prev.findIndex(b => b.id === book.id);
+      const existing = prev.findIndex(
+        b =>
+          b.id.toLowerCase() === book.id.toLowerCase() ||
+          sanitizeBookTitle(b.title).toLowerCase() === sanitizeBookTitle(book.title).toLowerCase() ||
+          (b.telegramChannel &&
+            book.telegramChannel &&
+            b.telegramChannel.toLowerCase() === book.telegramChannel.toLowerCase() &&
+            b.telegramMessageId === book.telegramMessageId)
+      );
       if (existing >= 0) {
         const copy = [...prev];
-        copy[existing] = book;
-        return copy;
+        copy[existing] = {
+          ...copy[existing],
+          ...book,
+          id: copy[existing].id,
+        };
+        return deduplicateBooks(copy);
       }
-      return [book, ...prev];
+      return deduplicateBooks([book, ...prev]);
     });
 
     if (!activeReadingBook || activeReadingBook.id === book.id) {

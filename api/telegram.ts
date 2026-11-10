@@ -75,11 +75,11 @@ function getApiCredentials(): { apiId: number; apiHash: string } {
 export function normalizeTelegramChannel(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return '';
-  const urlMatch = trimmed.match(/(?:https?:\/\/)?t\.me\/(?:s\/)?([a-zA-Z0-9_]+)/i);
+  const urlMatch = trimmed.match(/(?:https?:\/\/)?(?:t|telegram)\.me\/(?:s\/)?([a-zA-Z0-9_]+)/i);
   if (urlMatch && urlMatch[1]) {
-    return urlMatch[1];
+    return urlMatch[1].toLowerCase();
   }
-  return trimmed.replace(/^@/, '');
+  return trimmed.replace(/^@/, '').trim().toLowerCase();
 }
 
 export function parseChannelList(raw: string): string[] {
@@ -374,22 +374,42 @@ export default async function handler(req: any, res: any) {
         pdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[];
       }> = [];
       const allPdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[] = [];
+      const seenEntityIds = new Set<string>();
+      const seenGlobalPdfKeys = new Set<string>();
 
       for (const ch of channels) {
         try {
           const entity = await client.getEntity(ch);
+          const entityIdStr =
+            entity && 'id' in entity && entity.id ? String(entity.id) : ch.toLowerCase();
+          if (seenEntityIds.has(entityIdStr)) {
+            continue;
+          }
+          seenEntityIds.add(entityIdStr);
+
           const channelTitle =
             (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || `@${ch}`;
           const messages = await client.getMessages(entity, { limit: 45 });
           const pdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[] = [];
+          const seenChannelTitles = new Set<string>();
 
           for (let i = 0; i < messages.length; i++) {
             const msg = messages[i];
             if (msg instanceof Api.Message) {
               const extracted = extractPdfFromMessage(msg, ch, channelTitle, i, messages);
               if (extracted) {
-                pdfs.push(extracted);
-                allPdfs.push(extracted);
+                const titleKey = (extracted.cleanTitle || extracted.fileName).toLowerCase().trim();
+                const uniqueKey = `${titleKey}_${extracted.fileSize || 0}`;
+                if (!seenChannelTitles.has(uniqueKey) && !seenChannelTitles.has(titleKey)) {
+                  seenChannelTitles.add(uniqueKey);
+                  seenChannelTitles.add(titleKey);
+                  pdfs.push(extracted);
+                }
+                if (!seenGlobalPdfKeys.has(uniqueKey) && !seenGlobalPdfKeys.has(titleKey)) {
+                  seenGlobalPdfKeys.add(uniqueKey);
+                  seenGlobalPdfKeys.add(titleKey);
+                  allPdfs.push(extracted);
+                }
               }
             }
           }

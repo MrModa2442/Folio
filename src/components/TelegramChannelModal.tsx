@@ -99,10 +99,12 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
 
   const isBookAlreadyImported = (item: TelegramPdfItem) => {
     const cleanCh = normalizeChannelInput(item.channelUsername);
+    const itemTitle = (item.cleanTitle || item.fileName.replace(/\.pdf$/i, '')).toLowerCase().trim();
     return existingBooks.some(
       b =>
-        (b.telegramChannel === cleanCh && b.telegramMessageId === item.messageId) ||
-        b.id === `tg_${cleanCh}_${item.messageId}`
+        (b.telegramChannel?.toLowerCase() === cleanCh && b.telegramMessageId === item.messageId) ||
+        b.id.toLowerCase() === `tg_${cleanCh}_${item.messageId}` ||
+        (itemTitle && b.title.toLowerCase().trim() === itemTitle)
     );
   };
 

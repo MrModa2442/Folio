@@ -27,9 +27,67 @@ if (typeof window !== 'undefined') {
   pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
 }
 
+interface PdfSearchBox {
+  x: number; // normalized 0..1 of uncropped page width
+  y: number; // normalized 0..1 of uncropped page height
+  w: number;
+  h: number;
+}
+
 interface PdfSearchHit {
+  id: string;
   page: number;
-  snippet: string;
+  matchIndexOnPage: number;
+  snippetBefore: string;
+  snippetMatch: string;
+  snippetAfter: string;
+  boxes: PdfSearchBox[];
+}
+
+interface CachedPageItem {
+  rawStr: string;
+  normStr: string;
+  normNoSpace: string;
+  box: PdfSearchBox;
+}
+
+interface CachedPageText {
+  page: number;
+  items: CachedPageItem[];
+  fullRawText: string;
+  fullNormText: string;
+}
+
+/**
+ * Normalizes Persian, Arabic, and Latin text so searches work reliably regardless of
+ * Arabic vs Persian Yeh/Kaf, Presentation Forms (\uFB50-\uFEFF), ZWNJ (نیم‌فاصله), or diacritics.
+ */
+function normalizePdfTextForSearch(input: string, stripSpaces = false): string {
+  if (!input) return '';
+  let s = input
+    .normalize('NFKC')
+    // Unify Arabic/Persian Yeh variants
+    .replace(/[\u064A\u0649\u0626\u06CC\uFBFD\uFBFE\uFBFF\uFEF1\uFEF2\uFEF3\uFEF4]/g, 'ی')
+    // Unify Arabic/Persian Kaf variants
+    .replace(/[\u0643\u06A9\uFB8E\uFB8F\uFB90\uFB91\uFED9\uFEDA\uFEDB\uFEDC]/g, 'ک')
+    // Unify Heh / Teh Marbuta
+    .replace(/[\u0629\u06C0\u06C1\u06D5]/g, 'ه')
+    // Unify Alef variants
+    .replace(/[\u0622\u0623\u0625\u0671]/g, 'ا')
+    // Unify Waw variants
+    .replace(/[\u0624]/g, 'و')
+    // Remove harakat, tatweel, and directional/zero-width marks (ZWNJ, ZWJ, LRM, RLM)
+    .replace(/[\u064B-\u065F\u0670\u0640\u200B-\u200F\u202A-\u202E\uFEFF]/g, '')
+    .toLowerCase();
+
+  if (stripSpaces) {
+    return s.replace(/\s+/g, '');
+  }
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+function reverseRtlString(str: string): string {
+  return Array.from(str).reverse().join('');
 }
 
 interface RealPdfViewerProps {
@@ -90,7 +148,19 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [isSearching, setIsSearching] = useState<boolean>(false);
+  const [searchScanProgress, setSearchScanProgress] = useState<{ scanned: number; total: number } | null>(null);
   const [searchResults, setSearchResults] = useState<PdfSearchHit[]>([]);
+  const [activeHitIndex, setActiveHitIndex] = useState<number>(0);
+  const [showAllSearchHits, setShowAllSearchHits] = useState<boolean>(false);
+
+  const pageTextCacheRef = useRef<Map<number, CachedPageText>>(new Map());
+  const searchAbortRef = useRef<number>(0);
+  const cropTransformRef = useRef<{
+    offsetX: number;
+    offsetY: number;
+    scaleX: number;
+    scaleY: number;
+  }>({ offsetX: 0, offsetY: 0, scaleX: 1, scaleY: 1 });
 
   // Bookmarks & Notes Drawer state
   const [isBookmarksDrawerOpen, setIsBookmarksDrawerOpen] = useState<boolean>(false);
@@ -111,6 +181,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     setIsLoadingDoc(true);
     setDocError(null);
     setPageRenderError(null);
+    pageTextCacheRef.current.clear();
+    setSearchResults([]);
+    setActiveHitIndex(0);
 
     const dataCopy = new Uint8Array(arrayBuffer.slice(0));
 
@@ -151,7 +224,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     };
   }, [arrayBuffer]);
 
-  // Draw highlighter strokes on the transparent overlay canvas
+  // Draw highlighter strokes AND active search match boxes on the transparent overlay canvas
   const drawHighlightOverlay = useCallback(
     (extraPoints?: Array<{ x: number; y: number }> | null) => {
       const overlay = overlayCanvasRef.current;
@@ -167,6 +240,45 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       if (!ctx) return;
 
       ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+      // 1. Draw Search Match Bounding Boxes on current page
+      if (isSearchOpen && searchResults.length > 0) {
+        const pageHits = searchResults.filter(h => h.page === currentPage);
+        const activeHit = searchResults[activeHitIndex];
+        const { offsetX, offsetY, scaleX, scaleY } = cropTransformRef.current;
+
+        for (const hit of pageHits) {
+          const isCurrentActiveHit = activeHit && activeHit.id === hit.id;
+          for (const box of hit.boxes) {
+            const adjX = (box.x - offsetX) * scaleX;
+            const adjY = (box.y - offsetY) * scaleY;
+            const adjW = box.w * scaleX;
+            const adjH = box.h * scaleY;
+
+            const px = adjX * overlay.width;
+            const py = adjY * overlay.height;
+            const pw = Math.max(18, adjW * overlay.width);
+            const ph = Math.max(14, adjH * overlay.height);
+
+            ctx.save();
+            ctx.fillStyle = isCurrentActiveHit
+              ? 'rgba(29, 185, 84, 0.42)'
+              : 'rgba(250, 204, 21, 0.30)';
+            ctx.strokeStyle = isCurrentActiveHit ? '#1DB954' : '#FACC15';
+            ctx.lineWidth = isCurrentActiveHit ? 3 : 1.5;
+
+            const padX = 4;
+            const padY = 3;
+            ctx.beginPath();
+            ctx.roundRect(px - padX, py - padY, pw + padX * 2, ph + padY * 2, 4);
+            ctx.fill();
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
+      }
+
+      // 2. Draw user Apple Pencil / finger highlighter strokes
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
 
@@ -192,7 +304,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         ctx.restore();
       }
     },
-    [highlights, currentPage, highlightColor]
+    [highlights, currentPage, highlightColor, isSearchOpen, searchResults, activeHitIndex]
   );
 
   // Render Page onto Canvas (with optional Auto-Crop White Margins)
@@ -282,6 +394,13 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           const cropW = Math.min(w - cropX, maxX - minX + pad * 2);
           const cropH = Math.min(h - cropY, maxY - minY + pad * 2);
 
+          cropTransformRef.current = {
+            offsetX: cropX / w,
+            offsetY: cropY / h,
+            scaleX: w / cropW,
+            scaleY: h / cropH,
+          };
+
           canvas.width = cropW;
           canvas.height = cropH;
           canvas.style.width = `${Math.floor(cropW / pixelRatio)}px`;
@@ -294,6 +413,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             destCtx.drawImage(workCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
           }
         } else {
+          cropTransformRef.current = { offsetX: 0, offsetY: 0, scaleX: 1, scaleY: 1 };
           canvas.width = w;
           canvas.height = h;
           canvas.style.width = `${Math.floor(w / pixelRatio)}px`;
@@ -302,6 +422,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           destCtx?.drawImage(workCanvas, 0, 0);
         }
       } else {
+        cropTransformRef.current = { offsetX: 0, offsetY: 0, scaleX: 1, scaleY: 1 };
         canvas.style.width = `${Math.floor(viewport.width / pixelRatio)}px`;
         canvas.style.height = `${Math.floor(viewport.height / pixelRatio)}px`;
       }
@@ -324,11 +445,11 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
 
   useEffect(() => {
     drawHighlightOverlay(null);
-  }, [highlights, currentPage, drawHighlightOverlay]);
+  }, [highlights, currentPage, isSearchOpen, searchResults, activeHitIndex, drawHighlightOverlay]);
 
   // Page turns
   const goToPage = useCallback(
-    (pageNum: number) => {
+    (pageNum: number, scrollRatioY?: number) => {
       if (!pdfDoc) return;
       const clamped = Math.max(1, Math.min(totalPages, pageNum));
       setCurrentPage(clamped);
@@ -337,7 +458,19 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         onPageChange(clamped, totalPages);
       }
       if (containerRef.current) {
-        containerRef.current.scrollTop = 0;
+        if (typeof scrollRatioY === 'number' && canvasRef.current) {
+          setTimeout(() => {
+            if (!containerRef.current || !canvasRef.current) return;
+            const canvasH = canvasRef.current.clientHeight || 800;
+            const targetScroll = Math.max(
+              0,
+              scrollRatioY * canvasH - containerRef.current.clientHeight * 0.35
+            );
+            containerRef.current.scrollTo({ top: targetScroll, behavior: 'smooth' });
+          }, 60);
+        } else {
+          containerRef.current.scrollTop = 0;
+        }
       }
     },
     [pdfDoc, totalPages, onPageChange]
@@ -443,48 +576,303 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     }
   };
 
-  // Full-text search inside the open PDF
-  const handleRunPdfSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const q = searchQuery.trim().toLowerCase();
-    if (!pdfDoc || !q) {
-      setSearchResults([]);
-      return;
-    }
+  // Extract and cache page text + normalized bounding boxes for fast, accurate Persian & English search
+  const getOrExtractPageText = useCallback(
+    async (pageNum: number): Promise<CachedPageText | null> => {
+      if (!pdfDoc) return null;
+      const cached = pageTextCacheRef.current.get(pageNum);
+      if (cached) return cached;
 
-    setIsSearching(true);
-    const hits: PdfSearchHit[] = [];
+      const page = await pdfDoc.getPage(pageNum);
+      const vp = page.getViewport({ scale: 1, rotation });
+      const pageW = Math.max(1, vp.width);
+      const pageH = Math.max(1, vp.height);
+      const content = await page.getTextContent();
 
-    try {
-      const maxPagesToScan = Math.min(pdfDoc.numPages, 250);
-      for (let p = 1; p <= maxPagesToScan; p++) {
-        const page = await pdfDoc.getPage(p);
-        const content = await page.getTextContent();
-        const pageText = content.items
-          .map((it: unknown) => ((it as { str?: string }).str || ''))
-          .join(' ')
-          .replace(/\s+/g, ' ');
+      // Group raw PDF text items into visual lines so split Persian/Arabic glyph runs rejoin cleanly
+      interface RawGlyphItem {
+        str: string;
+        x: number;
+        y: number;
+        w: number;
+        h: number;
+      }
 
-        const lower = pageText.toLowerCase();
-        const idx = lower.indexOf(q);
-        if (idx !== -1) {
-          const start = Math.max(0, idx - 35);
-          const end = Math.min(pageText.length, idx + q.length + 55);
-          const snippet =
-            (start > 0 ? '…' : '') + pageText.slice(start, end).trim() + (end < pageText.length ? '…' : '');
-          hits.push({ page: p, snippet });
-          if (hits.length >= 40) break;
+      const rawGlyphs: RawGlyphItem[] = [];
+      for (const rawIt of content.items) {
+        const it = rawIt as {
+          str?: string;
+          transform?: number[];
+          width?: number;
+          height?: number;
+        };
+        const str = it.str || '';
+        if (!str.trim()) continue;
+
+        const tx = it.transform ? it.transform[4] : 0;
+        const ty = it.transform ? it.transform[5] : 0;
+        const fontH =
+          it.height || (it.transform ? Math.hypot(it.transform[2], it.transform[3]) : 12) || 12;
+        const fontW = it.width || Math.max(8, str.length * (fontH * 0.48));
+
+        const p1 = vp.convertToViewportPoint(tx, ty);
+        const p2 = vp.convertToViewportPoint(tx + fontW, ty + fontH);
+        const minX = Math.min(p1[0], p2[0]);
+        const maxX = Math.max(p1[0], p2[0]);
+        const minY = Math.min(p1[1], p2[1]);
+        const maxY = Math.max(p1[1], p2[1]);
+
+        rawGlyphs.push({
+          str,
+          x: Math.max(0, Math.min(1, minX / pageW)),
+          y: Math.max(0, Math.min(1, minY / pageH)),
+          w: Math.max(0.01, Math.min(1, (maxX - minX) / pageW)),
+          h: Math.max(0.012, Math.min(1, (maxY - minY) / pageH)),
+        });
+      }
+
+      // Group glyphs by line (similar Y coordinate) so each visual line becomes a clean searchable unit
+      const lines: RawGlyphItem[][] = [];
+      for (const g of rawGlyphs) {
+        const existingLine = lines.find(
+          line => Math.abs(line[0].y - g.y) <= Math.max(0.01, line[0].h * 0.65)
+        );
+        if (existingLine) {
+          existingLine.push(g);
+        } else {
+          lines.push([g]);
         }
       }
-      setSearchResults(hits);
-      if (hits.length > 0) {
-        goToPage(hits[0].page);
+
+      lines.sort((a, b) => a[0].y - b[0].y);
+
+      const items: Array<
+        CachedPageItem & {
+          rtlNormStr: string;
+          rtlNormNoSpace: string;
+          glyphs: Array<{
+            rawStr: string;
+            normStr: string;
+            normNoSpace: string;
+            box: PdfSearchBox;
+          }>;
+        }
+      > = [];
+
+      for (const line of lines) {
+        const lineRaw = line.map(g => g.str).join(' ').replace(/\s+/g, ' ').trim();
+        const lineCompact = line.map(g => g.str).join('');
+
+        // Also build right-to-left X-sorted string for PDFs that store RTL words in visual LTR order
+        const rtlSorted = [...line].sort((a, b) => b.x - a.x);
+        const rtlRaw = rtlSorted.map(g => g.str).join(' ').replace(/\s+/g, ' ').trim();
+        const rtlCompact = rtlSorted.map(g => g.str).join('');
+
+        const minX = Math.min(...line.map(g => g.x));
+        const maxX = Math.max(...line.map(g => g.x + g.w));
+        const minY = Math.min(...line.map(g => g.y));
+        const maxY = Math.max(...line.map(g => g.y + g.h));
+
+        const normStr = normalizePdfTextForSearch(lineRaw, false);
+        const normNoSpace = normalizePdfTextForSearch(lineCompact, true);
+        const rtlNormStr = normalizePdfTextForSearch(rtlRaw, false);
+        const rtlNormNoSpace = normalizePdfTextForSearch(rtlCompact, true);
+
+        const isRtlLine = /[\u0600-\u06FF\uFB50-\uFEFF]/.test(lineRaw);
+        const displayRaw = isRtlLine && !lineRaw.includes(' ') && rtlRaw.includes(' ') ? rtlRaw : lineRaw;
+
+        if (normStr || normNoSpace) {
+          items.push({
+            rawStr: displayRaw,
+            normStr,
+            normNoSpace,
+            rtlNormStr,
+            rtlNormNoSpace,
+            box: {
+              x: minX,
+              y: minY,
+              w: Math.max(0.02, maxX - minX),
+              h: Math.max(0.016, maxY - minY),
+            },
+            glyphs: line.map(g => ({
+              rawStr: g.str,
+              normStr: normalizePdfTextForSearch(g.str, false),
+              normNoSpace: normalizePdfTextForSearch(g.str, true),
+              box: { x: g.x, y: g.y, w: g.w, h: g.h },
+            })),
+          });
+        }
       }
-    } catch (searchErr) {
-      console.warn('PDF text search error:', searchErr);
-    } finally {
-      setIsSearching(false);
+
+      const fullRawText = items.map(i => i.rawStr).join(' ');
+      const fullNormText = items.map(i => i.normStr).join(' ');
+
+      const result: CachedPageText = {
+        page: pageNum,
+        items,
+        fullRawText,
+        fullNormText,
+      };
+      pageTextCacheRef.current.set(pageNum, result);
+      return result;
+    },
+    [pdfDoc, rotation]
+  );
+
+  const selectSearchHit = useCallback(
+    (index: number, resultsList: PdfSearchHit[] = searchResults) => {
+      if (resultsList.length === 0) return;
+      const wrapped = ((index % resultsList.length) + resultsList.length) % resultsList.length;
+      setActiveHitIndex(wrapped);
+      const hit = resultsList[wrapped];
+      const firstBoxY = hit.boxes[0]?.y;
+      goToPage(hit.page, firstBoxY);
+    },
+    [searchResults, goToPage]
+  );
+
+  // Full-text search inside the open PDF with Persian/Arabic/Latin normalization & visual highlighting
+  const executePdfSearch = useCallback(
+    async (rawQuery: string) => {
+      const qNorm = normalizePdfTextForSearch(rawQuery, false);
+      const qNoSpace = normalizePdfTextForSearch(rawQuery, true);
+      const qReversed = reverseRtlString(qNorm);
+      const qReversedNoSpace = reverseRtlString(qNoSpace);
+      const queryTokens = qNorm.split(/\s+/).filter(Boolean);
+
+      if (!pdfDoc || !qNorm) {
+        setSearchResults([]);
+        setActiveHitIndex(0);
+        setIsSearching(false);
+        setSearchScanProgress(null);
+        return;
+      }
+
+      const searchId = ++searchAbortRef.current;
+      setIsSearching(true);
+      const hits: PdfSearchHit[] = [];
+      const total = pdfDoc.numPages;
+
+      try {
+        for (let p = 1; p <= total; p++) {
+          if (searchAbortRef.current !== searchId) return;
+          if (p % 8 === 0 || p === total) {
+            setSearchScanProgress({ scanned: p, total });
+            await new Promise(r => setTimeout(r, 0));
+          }
+
+          const pageData = await getOrExtractPageText(p);
+          if (!pageData || pageData.items.length === 0) continue;
+
+          let pageMatchIdx = 0;
+
+          for (let lineIdx = 0; lineIdx < pageData.items.length; lineIdx++) {
+            const lineItem = pageData.items[lineIdx] as CachedPageItem & {
+              rtlNormStr?: string;
+              rtlNormNoSpace?: string;
+              glyphs?: Array<{
+                rawStr: string;
+                normStr: string;
+                normNoSpace: string;
+                box: PdfSearchBox;
+              }>;
+            };
+
+            const matchedSpaced =
+              lineItem.normStr.includes(qNorm) ||
+              (lineItem.rtlNormStr && lineItem.rtlNormStr.includes(qNorm)) ||
+              (qReversed.length >= 2 && lineItem.normStr.includes(qReversed));
+
+            const matchedCompact =
+              !matchedSpaced &&
+              qNoSpace.length >= 2 &&
+              (lineItem.normNoSpace.includes(qNoSpace) ||
+                (lineItem.rtlNormNoSpace && lineItem.rtlNormNoSpace.includes(qNoSpace)) ||
+                lineItem.normNoSpace.includes(qReversedNoSpace));
+
+            if (matchedSpaced || matchedCompact) {
+              // Pinpoint exact word glyph boxes on the line if possible
+              let wordBoxes: PdfSearchBox[] = [];
+              if (lineItem.glyphs && lineItem.glyphs.length > 0) {
+                for (const g of lineItem.glyphs) {
+                  if (!g.normNoSpace) continue;
+                  const glyphMatches =
+                    g.normStr.includes(qNorm) ||
+                    g.normNoSpace.includes(qNoSpace) ||
+                    (qReversedNoSpace.length >= 2 && g.normNoSpace.includes(qReversedNoSpace)) ||
+                    queryTokens.some(
+                      tok =>
+                        tok.length >= 2 &&
+                        (g.normStr.includes(tok) || g.normNoSpace.includes(tok))
+                    );
+                  if (glyphMatches) {
+                    wordBoxes.push(g.box);
+                  }
+                }
+              }
+
+              if (wordBoxes.length === 0) {
+                wordBoxes = [lineItem.box];
+              }
+
+              const prevLine = lineIdx > 0 ? pageData.items[lineIdx - 1].rawStr : '';
+              const nextLine =
+                lineIdx + 1 < pageData.items.length ? pageData.items[lineIdx + 1].rawStr : '';
+
+              hits.push({
+                id: `p${p}_m${pageMatchIdx++}_l${lineIdx}`,
+                page: p,
+                matchIndexOnPage: pageMatchIdx,
+                snippetBefore: prevLine ? `${prevLine.slice(-40)} ` : '',
+                snippetMatch: lineItem.rawStr,
+                snippetAfter: nextLine ? ` ${nextLine.slice(0, 45)}` : '',
+                boxes: wordBoxes,
+              });
+
+              if (hits.length >= 120) break;
+            }
+          }
+
+          if (hits.length >= 120) break;
+        }
+
+        if (searchAbortRef.current !== searchId) return;
+        setSearchResults(hits);
+
+        if (hits.length > 0) {
+          // Prefer jumping to the first match on or after currentPage
+          const nearIdx = hits.findIndex(h => h.page >= currentPage);
+          const initialIdx = nearIdx >= 0 ? nearIdx : 0;
+          setActiveHitIndex(initialIdx);
+          const targetHit = hits[initialIdx];
+          goToPage(targetHit.page, targetHit.boxes[0]?.y);
+        } else {
+          setActiveHitIndex(0);
+        }
+      } catch (searchErr) {
+        console.warn('PDF text search error:', searchErr);
+      } finally {
+        if (searchAbortRef.current === searchId) {
+          setIsSearching(false);
+          setSearchScanProgress(null);
+        }
+      }
+    },
+    [pdfDoc, getOrExtractPageText, currentPage, goToPage]
+  );
+
+  const handleRunPdfSearch = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (
+      searchResults.length > 0 &&
+      normalizePdfTextForSearch(searchQuery) !== '' &&
+      !isSearching
+    ) {
+      // If results are already loaded for this query, pressing Enter steps to the next match!
+      selectSearchHit(activeHitIndex + 1);
+      return;
     }
+    executePdfSearch(searchQuery);
   };
 
   // Zoom presets
@@ -502,9 +890,15 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     setScale(parseFloat(targetScale.toFixed(2)));
   };
 
-  // Keyboard navigation
+  // Keyboard navigation + Ctrl/Cmd+F shortcut
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setIsSearchOpen(true);
+        setIsBookmarksDrawerOpen(false);
+        return;
+      }
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') {
         e.preventDefault();
@@ -800,67 +1194,159 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         </div>
       )}
 
-      {/* Floating Full-Text Search Bar & Results */}
+      {/* Non-Blocking Top Search Bar with On-Page Word Highlighting & Prev/Next Match Stepper */}
       {isSearchOpen && (
-        <div className="w-full sm:w-96 sm:right-4 sm:top-12 sm:absolute z-30 bg-[#181818] text-white border border-[#333333] sm:rounded-xl shadow-2xl p-3 space-y-2.5">
-          <form onSubmit={handleRunPdfSearch} className="flex items-center gap-2">
-            <div className="relative flex-1">
-              <Search className="w-3.5 h-3.5 opacity-50 absolute left-2.5 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
-                placeholder="Search word or phrase in PDF..."
-                className="w-full text-xs pl-8 pr-3 py-1.5 rounded-lg bg-[#242424] border border-[#383838] text-white focus:outline-hidden focus:border-[#1DB954]"
-                autoFocus
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={isSearching}
-              className="px-3 py-1.5 rounded-lg bg-[#1DB954] text-black font-semibold text-xs hover:bg-[#1ed760] disabled:opacity-50"
-            >
-              {isSearching ? '...' : 'Search'}
-            </button>
-            <button
-              type="button"
-              onClick={() => setIsSearchOpen(false)}
-              className="p-1 rounded hover:bg-white/10"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </form>
+        <div className="bg-[#181818] text-white border-b border-[#333333] px-3 sm:px-4 py-2 shrink-0 z-20 space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <form onSubmit={handleRunPdfSearch} className="flex items-center gap-2 flex-1 min-w-[240px] max-w-xl">
+              <div className="relative flex-1">
+                <Search className="w-3.5 h-3.5 opacity-50 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  dir="auto"
+                  value={searchQuery}
+                  onChange={e => {
+                    const val = e.target.value;
+                    setSearchQuery(val);
+                    if (!val.trim()) {
+                      searchAbortRef.current++;
+                      setSearchResults([]);
+                      setActiveHitIndex(0);
+                      setIsSearching(false);
+                    }
+                  }}
+                  placeholder="Type a word or phrase and press Find..."
+                  className="w-full text-xs pl-8 pr-7 py-1.5 rounded-lg bg-[#242424] border border-[#383838] text-white focus:outline-hidden focus:border-[#1DB954]"
+                  autoFocus
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      searchAbortRef.current++;
+                      setSearchQuery('');
+                      setSearchResults([]);
+                      setActiveHitIndex(0);
+                      setIsSearching(false);
+                    }}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-[#B3B3B3] hover:text-white"
+                    title="Clear search"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
 
-          {searchResults.length > 0 ? (
-            <div className="max-h-56 overflow-y-auto space-y-1 pr-1">
-              <p className="text-[11px] text-[#B3B3B3] px-1">
-                Found {searchResults.length} matching pages:
-              </p>
-              {searchResults.map(hit => (
-                <button
-                  key={hit.page}
-                  type="button"
-                  onClick={() => goToPage(hit.page)}
-                  className={`w-full text-left p-2 rounded-lg text-xs transition-colors flex items-start justify-between gap-2 ${
-                    currentPage === hit.page
-                      ? 'bg-[#1DB954]/20 border border-[#1DB954]/40'
-                      : 'bg-[#242424] hover:bg-[#2E2E2E]'
-                  }`}
-                >
-                  <span className="text-[11px] opacity-90 line-clamp-2">{hit.snippet}</span>
-                  <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-black/40 text-[#1DB954] shrink-0">
-                    p. {hit.page}
+              <button
+                type="button"
+                onClick={() => executePdfSearch(searchQuery)}
+                disabled={isSearching || !searchQuery.trim()}
+                className="px-3.5 py-1.5 rounded-lg bg-[#1DB954] text-black font-bold text-xs hover:bg-[#1ed760] disabled:opacity-50 shrink-0"
+              >
+                {isSearching
+                  ? searchScanProgress
+                    ? `${searchScanProgress.scanned}/${searchScanProgress.total}`
+                    : 'Scanning...'
+                  : 'Find'}
+              </button>
+            </form>
+
+            {/* Match Counter + Prev / Next Match Buttons */}
+            <div className="flex items-center gap-2">
+              {searchResults.length > 0 ? (
+                <>
+                  <span className="text-xs font-mono text-[#1DB954] font-semibold px-2 py-1 rounded bg-[#1DB954]/10">
+                    Match {activeHitIndex + 1} of {searchResults.length} · p.{' '}
+                    {searchResults[activeHitIndex]?.page}
                   </span>
-                </button>
-              ))}
+
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => selectSearchHit(activeHitIndex - 1)}
+                      className="px-2.5 py-1 rounded-lg bg-[#282828] hover:bg-[#383838] text-xs font-semibold flex items-center gap-1"
+                      title="Previous match"
+                    >
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                      <span>Prev</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => selectSearchHit(activeHitIndex + 1)}
+                      className="px-2.5 py-1 rounded-lg bg-[#282828] hover:bg-[#383838] text-xs font-semibold flex items-center gap-1"
+                      title="Next match"
+                    >
+                      <span>Next</span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowAllSearchHits(v => !v)}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors ${
+                      showAllSearchHits
+                        ? 'bg-white text-black border-white'
+                        : 'bg-[#242424] border-[#383838] text-[#B3B3B3] hover:text-white'
+                    }`}
+                  >
+                    {showAllSearchHits ? 'Hide List' : `All (${searchResults.length})`}
+                  </button>
+                </>
+              ) : (
+                searchQuery.trim() &&
+                !isSearching && (
+                  <span className="text-xs text-amber-300 font-medium">
+                    No matching text found
+                  </span>
+                )
+              )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  setIsSearchOpen(false);
+                  setShowAllSearchHits(false);
+                }}
+                className="p-1.5 rounded-lg hover:bg-white/10 text-[#B3B3B3] hover:text-white"
+                title="Close search"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
-          ) : (
-            searchQuery.trim() &&
-            !isSearching && (
-              <p className="text-[11px] text-[#B3B3B3] text-center py-2">
-                No matching text found in scanned pages.
-              </p>
-            )
+          </div>
+
+          {/* Optional Expandable Match Snippets Drawer */}
+          {showAllSearchHits && searchResults.length > 0 && (
+            <div className="max-h-48 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-1.5 pt-1 border-t border-white/10">
+              {searchResults.map((hit, idx) => {
+                const isSelected = idx === activeHitIndex;
+                return (
+                  <button
+                    key={hit.id}
+                    type="button"
+                    onClick={() => selectSearchHit(idx)}
+                    dir="auto"
+                    className={`text-left p-2 rounded-lg text-xs transition-colors flex items-start justify-between gap-2 border ${
+                      isSelected
+                        ? 'bg-[#1DB954]/20 border-[#1DB954] text-white'
+                        : 'bg-[#242424] border-transparent hover:bg-[#2E2E2E] text-white/85'
+                    }`}
+                  >
+                    <span className="text-[11px] line-clamp-2 leading-relaxed">
+                      <span className="opacity-60">{hit.snippetBefore}</span>
+                      <span className="font-bold text-[#1DB954] underline decoration-[#1DB954]/60">
+                        {hit.snippetMatch}
+                      </span>
+                      <span className="opacity-60">{hit.snippetAfter}</span>
+                    </span>
+                    <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-black/50 text-[#1DB954] shrink-0">
+                      p. {hit.page}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           )}
         </div>
       )}

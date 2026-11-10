@@ -211,10 +211,15 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
 
   const findExistingBook = (item: TelegramPdfItem): Book | undefined => {
     const cleanCh = normalizeChannelInput(item.channelUsername);
+    const itemTitle = sanitizeBookTitle(
+      item.cleanTitle || item.fileName,
+      item.channelTitle
+    ).toLowerCase();
     return existingBooks.find(
       b =>
-        (b.telegramChannel === cleanCh && b.telegramMessageId === item.messageId) ||
-        b.id === `tg_${cleanCh}_${item.messageId}`
+        (b.telegramChannel?.toLowerCase() === cleanCh && b.telegramMessageId === item.messageId) ||
+        b.id.toLowerCase() === `tg_${cleanCh}_${item.messageId}` ||
+        (itemTitle && sanitizeBookTitle(b.title).toLowerCase() === itemTitle)
     );
   };
 

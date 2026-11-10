@@ -56,11 +56,11 @@ function getSessionHeaders(): Record<string, string> {
 export function normalizeChannelInput(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return '';
-  const urlMatch = trimmed.match(/(?:https?:\/\/)?t\.me\/(?:s\/)?([a-zA-Z0-9_]+)/i);
+  const urlMatch = trimmed.match(/(?:https?:\/\/)?(?:t|telegram)\.me\/(?:s\/)?([a-zA-Z0-9_]+)/i);
   if (urlMatch && urlMatch[1]) {
-    return urlMatch[1];
+    return urlMatch[1].toLowerCase();
   }
-  return trimmed.replace(/^@/, '');
+  return trimmed.replace(/^@/, '').trim().toLowerCase();
 }
 
 export function normalizeMultipleChannels(raw: string): string[] {
@@ -73,6 +73,35 @@ export function normalizeMultipleChannels(raw: string): string[] {
         .filter(Boolean)
     )
   );
+}
+
+export function deduplicateTelegramPdfs(items: TelegramPdfItem[]): TelegramPdfItem[] {
+  const seenMsgKeys = new Set<string>();
+  const seenTitleKeys = new Set<string>();
+  const result: TelegramPdfItem[] = [];
+
+  for (const item of items) {
+    const ch = normalizeChannelInput(item.channelUsername);
+    const msgKey = `${ch}_${item.messageId}`;
+    const cleanTitle = sanitizeBookTitle(item.cleanTitle || item.fileName, item.channelTitle)
+      .toLowerCase()
+      .trim();
+    const titleKey = cleanTitle ? `${cleanTitle}_${item.fileSize || 0}` : msgKey;
+
+    if (seenMsgKeys.has(msgKey) || (cleanTitle && seenTitleKeys.has(cleanTitle)) || seenTitleKeys.has(titleKey)) {
+      continue;
+    }
+
+    seenMsgKeys.add(msgKey);
+    if (cleanTitle) seenTitleKeys.add(cleanTitle);
+    seenTitleKeys.add(titleKey);
+    result.push({
+      ...item,
+      channelUsername: ch,
+    });
+  }
+
+  return result;
 }
 
 export async function fetchTelegramStatus(): Promise<TelegramConfigStatus> {
@@ -130,7 +159,24 @@ export async function fetchExploreChannelFeed(
         allPdfs: [],
       };
     }
-    return await res.json();
+    const data: ExploreTelegramFeedResponse = await res.json();
+    const seenGroups = new Set<string>();
+    const dedupedGroups: ExploreChannelGroup[] = [];
+    for (const group of data.channels || []) {
+      const chKey = normalizeChannelInput(group.channel);
+      if (!chKey || seenGroups.has(chKey)) continue;
+      seenGroups.add(chKey);
+      dedupedGroups.push({
+        ...group,
+        channel: chKey,
+        pdfs: deduplicateTelegramPdfs(group.pdfs || []),
+      });
+    }
+    return {
+      ...data,
+      channels: dedupedGroups,
+      allPdfs: deduplicateTelegramPdfs(data.allPdfs || []),
+    };
   } catch {
     return {
       configured: false,

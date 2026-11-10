@@ -235,6 +235,94 @@ export function removeBookFromBooklist(list: Booklist, bookId: string): Booklist
   };
 }
 
+export function deduplicateBooks(books: Book[]): Book[] {
+  const result: Book[] = [];
+  const indexByKey = new Map<string, number>();
+
+  for (const rawBook of books) {
+    const cleanTitle = sanitizeBookTitle(rawBook.title);
+    const cleanAuthor = sanitizeBookAuthor(rawBook.author);
+    const cleanCh = rawBook.telegramChannel
+      ? rawBook.telegramChannel.replace(/^@/, '').trim().toLowerCase()
+      : undefined;
+    const normalizedId =
+      cleanCh && rawBook.telegramMessageId
+        ? `tg_${cleanCh}_${rawBook.telegramMessageId}`
+        : rawBook.id;
+
+    const book: Book = {
+      ...rawBook,
+      id: normalizedId,
+      title: cleanTitle,
+      author: cleanAuthor,
+      telegramChannel: cleanCh,
+      coverImage: undefined,
+    };
+
+    const keys: string[] = [
+      `id:${book.id.toLowerCase()}`,
+      `title:${cleanTitle.toLowerCase()}`,
+    ];
+    if (cleanCh && book.telegramMessageId) {
+      keys.push(`tg:${cleanCh}_${book.telegramMessageId}`);
+    }
+    if (book.fileName && book.fileSize) {
+      keys.push(`file:${ sanitizeBookTitle(book.fileName).toLowerCase() }_${book.fileSize}`);
+    }
+
+    let existingIdx: number | undefined;
+    for (const k of keys) {
+      const found = indexByKey.get(k);
+      if (found !== undefined) {
+        existingIdx = found;
+        break;
+      }
+    }
+
+    if (existingIdx !== undefined) {
+      const prev = result[existingIdx];
+      const mergedPage = Math.max(prev.currentPage || 1, book.currentPage || 1);
+      const mergedPageCount = Math.max(prev.pageCount || 1, book.pageCount || 1);
+      const mergedStatus: ReadingStatus =
+        prev.status === 'completed' || book.status === 'completed'
+          ? 'completed'
+          : prev.status === 'reading' || book.status === 'reading' || mergedPage > 1
+          ? 'reading'
+          : 'to-read';
+
+      result[existingIdx] = {
+        ...prev,
+        currentPage: mergedPage,
+        pageCount: mergedPageCount,
+        status: mergedStatus,
+        author: prev.author || book.author,
+        pdfBlobKey: prev.pdfBlobKey || book.pdfBlobKey,
+        telegramChannel: prev.telegramChannel || book.telegramChannel,
+        telegramMessageId: prev.telegramMessageId || book.telegramMessageId,
+        bookmarks:
+          (prev.bookmarks?.length || 0) >= (book.bookmarks?.length || 0)
+            ? prev.bookmarks
+            : book.bookmarks,
+        highlights: {
+          ...(book.highlights || {}),
+          ...(prev.highlights || {}),
+        },
+      };
+      for (const k of keys) {
+        indexByKey.set(k, existingIdx);
+      }
+    } else {
+      const newIdx = result.length;
+      result.push(book);
+      for (const k of keys) {
+        indexByKey.set(k, newIdx);
+      }
+    }
+  }
+
+  return result;
+}
+
 export function filterBooks(
   books: Book[],
   query: string,
