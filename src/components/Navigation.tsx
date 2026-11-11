@@ -4,8 +4,8 @@ import { PWAInstallButton } from './PWAInstallButton';
 import { Plus, Moon, Sun, Coffee, Send } from 'lucide-react';
 
 interface NavigationProps {
-  currentTab: 'library' | 'explore' | 'bookshelf';
-  onSelectTab: (tab: 'library' | 'explore' | 'bookshelf') => void;
+  currentTab: 'library' | 'explore' | 'bookshelf' | 'notes';
+  onSelectTab: (tab: 'library' | 'explore' | 'bookshelf' | 'notes') => void;
   onOpenImport: () => void;
   onOpenTelegramSync: () => void;
   telegramAutoSync?: boolean;

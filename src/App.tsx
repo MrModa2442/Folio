@@ -25,6 +25,7 @@ import { SpotifyPlayerBar } from './components/SpotifyPlayerBar';
 import { TelegramChannelModal } from './components/TelegramChannelModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { SyncProgressModal } from './components/SyncProgressModal';
+import { NotesHighlightsHub } from './components/NotesHighlightsHub';
 import {
   fetchExploreChannelFeed,
   downloadAndImportTelegramPdf,
@@ -73,7 +74,7 @@ export default function App() {
   });
 
   // Navigation State
-  const [currentTab, setCurrentTab] = useState<'library' | 'explore' | 'bookshelf'>('library');
+  const [currentTab, setCurrentTab] = useState<'library' | 'explore' | 'bookshelf' | 'notes'>('library');
   const [selectedListId, setSelectedListId] = useState<string | null>(null);
   const [selectedStatus, setSelectedStatus] = useState<ReadingStatus | 'all'>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -150,6 +151,13 @@ export default function App() {
 
   const readingBooksCount = books.filter(b => b.status === 'reading').length;
   const finishedBooksCount = books.filter(b => b.status === 'completed').length;
+  const annotationsCount = books.reduce((sum, b) => {
+    const pinsCount = b.bookmarks?.length || 0;
+    const hlPagesCount = Object.values(b.highlights || {}).filter(
+      strokes => Array.isArray(strokes) && strokes.length > 0
+    ).length;
+    return sum + pinsCount + hlPagesCount;
+  }, 0);
 
   // Handlers
   const handleSaveBook = (book: Book, targetListId?: string) => {
@@ -365,9 +373,11 @@ export default function App() {
           booklists={booklists}
           selectedListId={selectedListId}
           selectedStatus={selectedStatus}
+          isNotesHubActive={currentTab === 'notes'}
           totalBooksCount={books.length}
           readingBooksCount={readingBooksCount}
           finishedBooksCount={finishedBooksCount}
+          annotationsCount={annotationsCount}
           onSelectList={id => {
             setSelectedListId(id);
             setCurrentTab('library');
@@ -375,6 +385,10 @@ export default function App() {
           onSelectStatus={st => {
             setSelectedStatus(st);
             setCurrentTab('library');
+          }}
+          onSelectNotesHub={() => {
+            setSelectedListId(null);
+            setCurrentTab('notes');
           }}
           onOpenCreateList={() => setIsCreateListOpen(true)}
           onOpenSyncModal={() => setIsSyncModalOpen(true)}
@@ -387,6 +401,24 @@ export default function App() {
             isDark ? 'bg-[#121212]' : theme === 'nordic-light' ? 'bg-white' : 'bg-[#FAF8F4]'
           }`}
         >
+          {currentTab === 'notes' && (
+            <NotesHighlightsHub
+              books={books}
+              onOpenBookAtPage={(book, page) => {
+                const clamped = Math.max(1, Math.min(book.pageCount, page));
+                const updated: Book = {
+                  ...book,
+                  currentPage: clamped,
+                  status: clamped >= book.pageCount ? 'completed' : 'reading',
+                  lastRead: new Date().toISOString().split('T')[0],
+                };
+                handleSaveBook(updated);
+                handleStartReadingBook(updated);
+              }}
+              onUpdateBook={updated => handleSaveBook(updated)}
+              theme={theme}
+            />
+          )}
           {currentTab === 'bookshelf' && (
             <VirtualBookshelf
               books={books}
@@ -625,12 +657,14 @@ export default function App() {
       </div>
 
       {/* Spotify Bottom Now-Playing & Reading Bar */}
-      <SpotifyPlayerBar
-        currentBook={activeReadingBook}
-        onOpenReader={handleStartReadingBook}
-        onUpdateBookProgress={handleUpdateBookProgress}
-        theme={theme}
-      />
+      {currentTab !== 'notes' && (
+        <SpotifyPlayerBar
+          currentBook={activeReadingBook}
+          onOpenReader={handleStartReadingBook}
+          onUpdateBookProgress={handleUpdateBookProgress}
+          theme={theme}
+        />
+      )}
 
       {/* Modals & Fullscreen Reader */}
       <ImportPdfModal

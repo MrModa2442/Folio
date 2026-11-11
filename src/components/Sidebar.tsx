@@ -1,16 +1,19 @@
 import React from 'react';
-import { BookOpen, Bookmark, CheckCircle2, Lock, Globe, Plus, Smartphone } from 'lucide-react';
+import { BookOpen, Bookmark, CheckCircle2, Lock, Globe, Plus, Smartphone, Highlighter } from 'lucide-react';
 import { Booklist, ReadingStatus, AppTheme } from '../types/library';
 
 interface SidebarProps {
   booklists: Booklist[];
   selectedListId: string | null;
   selectedStatus: ReadingStatus | 'all';
+  isNotesHubActive?: boolean;
   totalBooksCount: number;
   readingBooksCount: number;
   finishedBooksCount: number;
+  annotationsCount: number;
   onSelectList: (id: string | null) => void;
   onSelectStatus: (status: ReadingStatus | 'all') => void;
+  onSelectNotesHub: () => void;
   onOpenCreateList: () => void;
   onOpenSyncModal: () => void;
   theme: AppTheme;
@@ -20,11 +23,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   booklists,
   selectedListId,
   selectedStatus,
+  isNotesHubActive = false,
   totalBooksCount,
   readingBooksCount,
   finishedBooksCount,
+  annotationsCount,
   onSelectList,
   onSelectStatus,
+  onSelectNotesHub,
   onOpenCreateList,
   onOpenSyncModal,
   theme,
@@ -49,7 +55,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onSelectStatus('all');
           }}
           className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-[13px] font-medium transition-all ${
-            selectedListId === null && selectedStatus === 'all'
+            !isNotesHubActive && selectedListId === null && selectedStatus === 'all'
               ? isDark ? 'bg-[#282828] text-white font-semibold shadow-xs' : 'bg-zinc-200/90 text-zinc-950 font-semibold'
               : isDark ? 'text-[#B3B3B3] hover:text-white hover:bg-[#1A1A1A]' : 'text-zinc-600 hover:text-zinc-950 hover:bg-zinc-100'
           }`}
@@ -60,7 +66,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </span>
           <span
             className={`text-xs px-2 py-0.5 rounded-full font-medium tabular-nums ${
-              selectedListId === null && selectedStatus === 'all'
+              !isNotesHubActive && selectedListId === null && selectedStatus === 'all'
                 ? isDark ? 'bg-white/10 text-white' : 'bg-zinc-300 text-zinc-900'
                 : isDark ? 'bg-white/5 text-[#A0A0A0]' : 'bg-zinc-200/60 text-zinc-600'
             }`}
@@ -75,7 +81,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onSelectStatus('reading');
           }}
           className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-[13px] font-medium transition-all ${
-            selectedListId === null && selectedStatus === 'reading'
+            !isNotesHubActive && selectedListId === null && selectedStatus === 'reading'
               ? isDark ? 'bg-[#282828] text-white font-semibold shadow-xs' : 'bg-zinc-200/90 text-zinc-950 font-semibold'
               : isDark ? 'text-[#B3B3B3] hover:text-white hover:bg-[#1A1A1A]' : 'text-zinc-600 hover:text-zinc-950 hover:bg-zinc-100'
           }`}
@@ -86,7 +92,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </span>
           <span
             className={`text-xs px-2 py-0.5 rounded-full font-medium tabular-nums ${
-              selectedListId === null && selectedStatus === 'reading'
+              !isNotesHubActive && selectedListId === null && selectedStatus === 'reading'
                 ? isDark ? 'bg-amber-500/20 text-amber-300' : 'bg-amber-100 text-amber-800'
                 : isDark ? 'bg-white/5 text-[#A0A0A0]' : 'bg-zinc-200/60 text-zinc-600'
             }`}
@@ -101,7 +107,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onSelectStatus('completed');
           }}
           className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-[13px] font-medium transition-all ${
-            selectedListId === null && selectedStatus === 'completed'
+            !isNotesHubActive && selectedListId === null && selectedStatus === 'completed'
               ? isDark ? 'bg-[#282828] text-white font-semibold shadow-xs' : 'bg-zinc-200/90 text-zinc-950 font-semibold'
               : isDark ? 'text-[#B3B3B3] hover:text-white hover:bg-[#1A1A1A]' : 'text-zinc-600 hover:text-zinc-950 hover:bg-zinc-100'
           }`}
@@ -112,12 +118,36 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </span>
           <span
             className={`text-xs px-2 py-0.5 rounded-full font-medium tabular-nums ${
-              selectedListId === null && selectedStatus === 'completed'
+              !isNotesHubActive && selectedListId === null && selectedStatus === 'completed'
                 ? isDark ? 'bg-[#1DB954]/20 text-[#1DB954]' : 'bg-emerald-100 text-emerald-800'
                 : isDark ? 'bg-white/5 text-[#A0A0A0]' : 'bg-zinc-200/60 text-zinc-600'
             }`}
           >
             {finishedBooksCount}
+          </span>
+        </button>
+
+        {/* Dedicated All Notes & Highlights Hub Tab */}
+        <button
+          onClick={onSelectNotesHub}
+          className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-[13px] font-medium transition-all ${
+            isNotesHubActive
+              ? isDark ? 'bg-[#282828] text-white font-semibold shadow-xs' : 'bg-zinc-200/90 text-zinc-950 font-semibold'
+              : isDark ? 'text-[#B3B3B3] hover:text-white hover:bg-[#1A1A1A]' : 'text-zinc-600 hover:text-zinc-950 hover:bg-zinc-100'
+          }`}
+        >
+          <span className="flex items-center gap-2.5 min-w-0">
+            <Highlighter className="w-4 h-4 text-yellow-400 shrink-0" />
+            <span className="tracking-tight truncate">Notes &amp; Highlights</span>
+          </span>
+          <span
+            className={`text-xs px-2 py-0.5 rounded-full font-medium tabular-nums shrink-0 ${
+              isNotesHubActive
+                ? isDark ? 'bg-yellow-400/20 text-yellow-300' : 'bg-yellow-100 text-yellow-800'
+                : isDark ? 'bg-white/5 text-[#A0A0A0]' : 'bg-zinc-200/60 text-zinc-600'
+            }`}
+          >
+            {annotationsCount}
           </span>
         </button>
       </div>
