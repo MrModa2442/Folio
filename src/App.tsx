@@ -135,12 +135,12 @@ export default function App() {
   const [isAddBooksModalOpen, setIsAddBooksModalOpen] = useState(false);
   const [fullscreenReaderBook, setFullscreenReaderBook] = useState<Book | null>(null);
 
-  // Telegram Channel Auto-Sync State
+  // Telegram Channel Auto-Sync State (defaults to @ocbooks)
   const [telegramChannel, setTelegramChannel] = useState<string>(() => {
     try {
-      return localStorage.getItem(STORAGE_TG_CHANNEL_KEY) || '';
+      return localStorage.getItem(STORAGE_TG_CHANNEL_KEY) || '@ocbooks';
     } catch {
-      return '';
+      return '@ocbooks';
     }
   });
 
@@ -440,7 +440,6 @@ export default function App() {
       }
     };
 
-    checkNewestFromChannels();
     const timer = setInterval(checkNewestFromChannels, 60000);
     return () => {
       cancelled = true;
@@ -828,6 +827,10 @@ export default function App() {
         onChangeTheme={setTheme}
         preferences={uiPreferences}
         onChangePreferences={setUiPreferences}
+        onOpenTelegramSync={() => {
+          setIsCustomizeOpen(false);
+          setIsTelegramSyncOpen(true);
+        }}
       />
 
       {/* Modals & Fullscreen Reader */}

@@ -15,6 +15,7 @@ import {
   CheckCircle2,
   Sparkles,
   PanelBottom,
+  Send,
 } from 'lucide-react';
 
 interface CustomizeAppearanceModalProps {
@@ -24,6 +25,7 @@ interface CustomizeAppearanceModalProps {
   onChangeTheme: (theme: AppTheme) => void;
   preferences: UiSectionPreferences;
   onChangePreferences: (next: UiSectionPreferences) => void;
+  onOpenTelegramSync?: () => void;
 }
 
 export const CustomizeAppearanceModal: React.FC<CustomizeAppearanceModalProps> = ({
@@ -33,6 +35,7 @@ export const CustomizeAppearanceModal: React.FC<CustomizeAppearanceModalProps> =
   onChangeTheme,
   preferences,
   onChangePreferences,
+  onOpenTelegramSync,
 }) => {
   if (!isOpen) return null;
 
@@ -400,6 +403,41 @@ export const CustomizeAppearanceModal: React.FC<CustomizeAppearanceModalProps> =
               })}
             </div>
           </div>
+
+          {/* 5. Server & Channel Sync (Admin / Vercel Setup) */}
+          {onOpenTelegramSync && (
+            <div className="space-y-2">
+              <label className={`block text-[11px] font-bold uppercase tracking-wider ${mutedText}`}>
+                Catalog Source &amp; Vercel Server Sync
+              </label>
+              <div className={`p-3 rounded-xl border flex items-center justify-between gap-3 ${innerCard}`}>
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-7 h-7 rounded-lg bg-[#1DB954]/15 text-[#1DB954] flex items-center justify-center shrink-0">
+                    <Send className="w-3.5 h-3.5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold">Telegram Channel Sync (@ocbooks)</div>
+                    <p className={`text-[11px] truncate ${mutedText}`}>
+                      Manage connected channels or generate a fresh session key for Vercel
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={onOpenTelegramSync}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold shrink-0 transition-colors ${
+                    isDark
+                      ? 'bg-[#282828] hover:bg-[#333333] text-white'
+                      : isWarm
+                      ? 'bg-[#E5DEC9] hover:bg-[#D8CEB5] text-[#292524]'
+                      : 'bg-zinc-200 hover:bg-zinc-300 text-zinc-900'
+                  }`}
+                >
+                  Configure
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Footer */}

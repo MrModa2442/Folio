@@ -341,6 +341,8 @@ export function parseChannelList(raw: string): string[] {
   return Array.from(new Set(items));
 }
 
+const DEFAULT_EXPLORE_CHANNELS = 'ocbooks';
+
 function getConfiguredServerChannels(extraQueryChannels = ''): string[] {
   loadArchiveFromDiskOnce();
   const archivedChannels = Array.from(persistentChannelArchive.keys()).join(',');
@@ -349,6 +351,7 @@ function getConfiguredServerChannels(extraQueryChannels = ''): string[] {
     process.env.TELEGRAM_CHANNEL || '',
     extraQueryChannels,
     archivedChannels,
+    DEFAULT_EXPLORE_CHANNELS,
   ].join(',');
   return parseChannelList(combined);
 }
@@ -605,10 +608,15 @@ export default async function handler(req: any, res: any) {
     if (pathname === 'explore-feed') {
       const extraChannels = String(req.query?.channels || '');
       const forceRefresh = req.query?.refresh === 'true';
+      if (forceRefresh) {
+        invalidatedSessions.clear();
+      }
       const channels = getConfiguredServerChannels(extraChannels);
+      const retryCandidateSession = candidateSessions.find(s => !invalidatedSessions.has(s)) || '';
+      const sessionToUse = retryCandidateSession || activeSession;
       const validEnvSession = Boolean(envSession && !invalidatedSessions.has(envSession));
 
-      if (!activeSession || channels.length === 0) {
+      if (!sessionToUse || channels.length === 0) {
         const archivedResponse = buildArchivedExploreResponse(
           channels,
           validEnvSession,
@@ -617,7 +625,7 @@ export default async function handler(req: any, res: any) {
         return res.status(200).json(archivedResponse);
       }
 
-      const cacheKey = `v2:${activeSession.slice(0, 12)}:${channels.join(',')}`;
+      const cacheKey = `v2:${sessionToUse.slice(0, 12)}:${channels.join(',')}`;
       const now = Date.now();
       if (
         !forceRefresh &&
@@ -633,10 +641,10 @@ export default async function handler(req: any, res: any) {
       let sessionFailedDuringScan = false;
 
       try {
-        client = await getConnectedClient(activeSession, apiId, apiHash);
+        client = await getConnectedClient(sessionToUse, apiId, apiHash);
       } catch (connErr) {
         if (isSessionInvalidError(connErr) || (connErr instanceof Error && connErr.message === 'TELEGRAM_SESSION_INVALIDATED')) {
-          markSessionInvalidated(activeSession, apiId);
+          markSessionInvalidated(sessionToUse, apiId);
           sessionFailedDuringScan = true;
         } else {
           // Even on transient network timeouts, serve the persistent archive cleanly
@@ -824,71 +832,10 @@ export default async function handler(req: any, res: any) {
         return res.status(200).json({ ok: true, coverUrl: cached });
       }
 
+      // Avoid opening concurrent TelegramClient connections on Vercel serverless cover requests
+      // (which triggers 406: AUTH_KEY_DUPLICATED when multiple book cards load simultaneously).
       let coverDataUrl: string | null = null;
-
-      if (activeSession && !invalidatedSessions.has(activeSession) && channel && (messageId > 0 || photoMsgId > 0)) {
-        try {
-          const client = await getConnectedClient(activeSession, apiId, apiHash);
-          const entity = await client.getEntity(channel);
-
-          // Step A: Try companion photo message or adjacent messages around messageId
-          const idsToFetch: number[] = [];
-          if (photoMsgId > 0) idsToFetch.push(photoMsgId);
-          if (messageId > 0) {
-            idsToFetch.push(messageId);
-            if (!photoMsgId) {
-              if (messageId > 1) idsToFetch.push(messageId - 1);
-              if (messageId > 2) idsToFetch.push(messageId - 2);
-              idsToFetch.push(messageId + 1);
-            }
-          }
-
-          const uniqueIds = Array.from(new Set(idsToFetch));
-          const msgs = await client.getMessages(entity, { ids: uniqueIds });
-          const validMsgs = (msgs || []).filter((m): m is Api.Message => m instanceof Api.Message);
-
-          // 1) Check explicit photoMsgId first, then adjacent photo messages
-          const targetPhotoMsg =
-            validMsgs.find(m => photoMsgId > 0 && m.id === photoMsgId && messageHasPhoto(m)) ||
-            validMsgs.find(m => m.id !== messageId && messageHasPhoto(m));
-
-          if (targetPhotoMsg) {
-            const buf = await client.downloadMedia(targetPhotoMsg, {});
-            if (buf && Buffer.isBuffer(buf) && buf.byteLength > 100) {
-              coverDataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
-            }
-          }
-
-          // 2) If no companion photo, check the PDF document's own embedded thumbnail
-          if (!coverDataUrl && messageId > 0) {
-            const pdfMsg = validMsgs.find(m => m.id === messageId);
-            if (
-              pdfMsg &&
-              pdfMsg.media instanceof Api.MessageMediaDocument &&
-              pdfMsg.media.document instanceof Api.Document
-            ) {
-              const doc = pdfMsg.media.document;
-              if (doc.thumbs && doc.thumbs.length > 0) {
-                const thumbObj = doc.thumbs[doc.thumbs.length - 1];
-                const thumbBuf = await client.downloadMedia(pdfMsg, {
-                  thumb: thumbObj as never,
-                });
-                if (thumbBuf && Buffer.isBuffer(thumbBuf) && thumbBuf.byteLength > 80) {
-                  coverDataUrl = `data:image/jpeg;base64,${thumbBuf.toString('base64')}`;
-                }
-              }
-            }
-          }
-        } catch (tgCoverErr) {
-          if (isSessionInvalidError(tgCoverErr)) {
-            markSessionInvalidated(activeSession, apiId);
-          }
-          // Fall back silently to Google Books cover lookup below
-        }
-      }
-
-      // Step B: Fallback to Google Books cover lookup by cleaned book title
-      if (!coverDataUrl && title) {
+      if (title) {
         coverDataUrl = await fetchExternalBookCoverDataUrl(title);
       }
 

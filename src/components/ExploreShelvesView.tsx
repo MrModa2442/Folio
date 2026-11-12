@@ -184,6 +184,7 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number } | null>(null);
   const [feedConfigured, setFeedConfigured] = useState(false);
+  const [sessionInvalidated, setSessionInvalidated] = useState(false);
 
   const isDark = theme === 'spotify-dark';
 
@@ -192,6 +193,7 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
     try {
       const feed = await fetchExploreChannelFeed(configuredChannels, forceRefresh);
       setFeedConfigured(feed.configured);
+      setSessionInvalidated(Boolean(feed.sessionInvalidated));
       setChannelGroups(feed.channels || []);
 
       // Also include any Telegram books already in the user's library so nothing ever vanishes
@@ -584,15 +586,23 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
               <h4 className="text-sm font-bold">
                 {searchQuery.trim() || selectedTopicFilter !== 'all'
                   ? 'No matching books found'
+                  : sessionInvalidated
+                  ? 'Telegram Session Needs Reconnection'
+                  : !feedConfigured
+                  ? 'Connect Telegram Session for @ocbooks'
                   : 'No books available right now'}
               </h4>
-              <p className={`text-xs ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
+              <p className={`text-xs leading-relaxed ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
                 {searchQuery.trim() || selectedTopicFilter !== 'all'
                   ? 'Try adjusting your search keywords or switching the topic filter above.'
+                  : sessionInvalidated
+                  ? 'Your previous Telegram session key was reset by Telegram (AUTH_KEY_DUPLICATED) because the same key was used on two servers at once. Reconnect once on Vercel to generate a dedicated session.'
+                  : !feedConfigured
+                  ? 'This deployment does not have an active TELEGRAM_SESSION connected yet. Connect once to load all books from @ocbooks.'
                   : 'Tap refresh to check for newly synced books in the Explore catalog.'}
               </p>
             </div>
-            {(searchQuery.trim() || selectedTopicFilter !== 'all') && (
+            {searchQuery.trim() || selectedTopicFilter !== 'all' ? (
               <button
                 type="button"
                 onClick={() => {
@@ -604,6 +614,29 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
               >
                 <span>Clear Filters</span>
               </button>
+            ) : (
+              <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={onOpenTelegramSetup}
+                  className="px-4 py-2 rounded-full text-xs font-bold bg-[#1DB954] text-black hover:bg-[#1ed760] inline-flex items-center gap-1.5 shadow-sm transition-colors"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>Connect Telegram Session (@ocbooks)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => loadExploreFeed(true, true)}
+                  className={`px-3.5 py-2 rounded-full text-xs font-semibold border inline-flex items-center gap-1.5 transition-colors ${
+                    isDark
+                      ? 'bg-[#242424] border-[#333333] text-white hover:bg-[#2E2E2E]'
+                      : 'bg-white border-zinc-300 text-zinc-800 hover:bg-zinc-100'
+                  }`}
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Retry Sync</span>
+                </button>
+              </div>
             )}
           </div>
         )}

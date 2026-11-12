@@ -226,21 +226,45 @@ export async function fetchTelegramStatus(): Promise<TelegramConfigStatus> {
   }
 }
 
+let inflightExploreFeedRequest: Promise<ExploreTelegramFeedResponse> | null = null;
+
 export async function fetchExploreChannelFeed(
   extraChannels = '',
   forceRefresh = false
 ): Promise<ExploreTelegramFeedResponse> {
-  try {
-    const cleanList = normalizeMultipleChannels(extraChannels).join(',');
-    const params = new URLSearchParams();
-    if (cleanList) params.set('channels', cleanList);
-    if (forceRefresh) params.set('refresh', 'true');
+  if (inflightExploreFeedRequest && !forceRefresh) {
+    return inflightExploreFeedRequest;
+  }
 
-    const res = await fetch(`/api/telegram/explore-feed?${params.toString()}`, {
-      headers: getSessionHeaders(),
-    });
-    const contentType = res.headers.get('content-type') || '';
-    if (!res.ok || !contentType.includes('application/json')) {
+  const requestPromise = (async (): Promise<ExploreTelegramFeedResponse> => {
+    try {
+      const cleanList = normalizeMultipleChannels(extraChannels || 'ocbooks').join(',');
+      const params = new URLSearchParams();
+      if (cleanList) params.set('channels', cleanList);
+      if (forceRefresh) params.set('refresh', 'true');
+
+      const res = await fetch(`/api/telegram/explore-feed?${params.toString()}`, {
+        headers: getSessionHeaders(),
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) {
+        const fallback = mergeExploreFeedWithLocalArchive([]);
+        return {
+          configured: fallback.allPdfs.length > 0,
+          serverHasSession: false,
+          channels: fallback.channels,
+          allPdfs: fallback.allPdfs,
+        };
+      }
+      const data: ExploreTelegramFeedResponse = await res.json();
+      const merged = mergeExploreFeedWithLocalArchive(data.channels || []);
+      return {
+        ...data,
+        configured: Boolean(data.configured || merged.allPdfs.length > 0),
+        channels: merged.channels,
+        allPdfs: merged.allPdfs,
+      };
+    } catch {
       const fallback = mergeExploreFeedWithLocalArchive([]);
       return {
         configured: fallback.allPdfs.length > 0,
@@ -248,27 +272,13 @@ export async function fetchExploreChannelFeed(
         channels: fallback.channels,
         allPdfs: fallback.allPdfs,
       };
+    } finally {
+      inflightExploreFeedRequest = null;
     }
-    const data: ExploreTelegramFeedResponse = await res.json();
-    if (data.sessionInvalidated) {
-      setStoredTelegramSession('');
-    }
-    const merged = mergeExploreFeedWithLocalArchive(data.channels || []);
-    return {
-      ...data,
-      configured: Boolean(data.configured || merged.allPdfs.length > 0),
-      channels: merged.channels,
-      allPdfs: merged.allPdfs,
-    };
-  } catch {
-    const fallback = mergeExploreFeedWithLocalArchive([]);
-    return {
-      configured: fallback.allPdfs.length > 0,
-      serverHasSession: false,
-      channels: fallback.channels,
-      allPdfs: fallback.allPdfs,
-    };
-  }
+  })();
+
+  inflightExploreFeedRequest = requestPromise;
+  return requestPromise;
 }
 
 export async function fetchTelegramBookCover(
