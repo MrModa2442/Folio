@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import telegramHandler, { normalizeTelegramChannel } from './api/telegram.js';
+import ocrHandler from './api/ocr.js';
 
 export { normalizeTelegramChannel };
 
@@ -16,11 +17,16 @@ const PORT = Number(process.env.PORT) || 3000;
 async function startServer() {
   const app = express();
   const httpServer = http.createServer(app);
-  app.use(express.json());
+  app.use(express.json({ limit: '25mb' }));
 
   // Delegate all /api/telegram/* requests to the unified Vercel/Express handler
   app.use('/api/telegram', (req, res) => {
     return telegramHandler(req, res);
+  });
+
+  // Fast Gemini Flash-Lite OCR endpoint for scanning PDF pages
+  app.use('/api/ocr', (req, res) => {
+    return ocrHandler(req, res);
   });
 
   // Mount Vite dev server or production static files

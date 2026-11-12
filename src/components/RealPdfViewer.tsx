@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PageBookmark, PageHighlightStroke } from '../types/library';
+import { loadCachedOcrPages, saveCachedOcrPages } from '../services/ocrCache';
 import {
   ChevronLeft,
   ChevronRight,
@@ -20,6 +21,7 @@ import {
   Undo2,
   Trash2,
   X,
+  Sparkles,
 } from 'lucide-react';
 
 // Configure the local worker script hosted in public/
@@ -64,7 +66,7 @@ interface CachedPageText {
  */
 function normalizePdfTextForSearch(input: string, stripSpaces = false): string {
   if (!input) return '';
-  let s = input
+  const s = input
     .normalize('NFKC')
     // Unify Arabic/Persian Yeh variants
     .replace(/[\u064A\u0649\u0626\u06CC\uFBFD\uFBFE\uFBFF\uFEF1\uFEF2\uFEF3\uFEF4]/g, 'ی')
@@ -91,6 +93,7 @@ function reverseRtlString(str: string): string {
 }
 
 interface RealPdfViewerProps {
+  bookId?: string;
   arrayBuffer: ArrayBuffer | null;
   initialPage?: number;
   onPageChange?: (page: number, totalPages: number) => void;
@@ -111,6 +114,7 @@ const HIGHLIGHT_COLORS = [
 ];
 
 export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
+  bookId,
   arrayBuffer,
   initialPage = 1,
   onPageChange,
@@ -144,7 +148,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [highlightColor, setHighlightColor] = useState<string>('#FACC15');
   const activeStrokeRef = useRef<Array<{ x: number; y: number }> | null>(null);
 
-  // In-PDF Full-Text Search state
+  // In-PDF Full-Text Search + AI Page OCR Scanner state
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [isSearching, setIsSearching] = useState<boolean>(false);
@@ -152,6 +156,14 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [searchResults, setSearchResults] = useState<PdfSearchHit[]>([]);
   const [activeHitIndex, setActiveHitIndex] = useState<number>(0);
   const [showAllSearchHits, setShowAllSearchHits] = useState<boolean>(false);
+
+  // AI OCR Page Scanner state (gemini-3.1-flash-lite)
+  const [isAiScanning, setIsAiScanning] = useState<boolean>(false);
+  const [aiScanProgress, setAiScanProgress] = useState<{ scanned: number; total: number } | null>(null);
+  const [aiCachedPageCount, setAiCachedPageCount] = useState<number>(0);
+  const [aiScanError, setAiScanError] = useState<string | null>(null);
+  const ocrPagesMapRef = useRef<Record<number, string[]>>({});
+  const aiScanAbortRef = useRef<number>(0);
 
   const pageTextCacheRef = useRef<Map<number, CachedPageText>>(new Map());
   const searchAbortRef = useRef<number>(0);
@@ -172,8 +184,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
 
   const currentBookmark = bookmarks.find(b => b.page === currentPage);
   const currentPageStrokes = highlights[currentPage] || [];
+  const docCacheKey = bookId || (arrayBuffer ? `pdf_bytes_${arrayBuffer.byteLength}` : 'default_pdf');
 
-  // Load PDF Document
+  // Load PDF Document + Cached AI OCR pages from IndexedDB
   useEffect(() => {
     if (!arrayBuffer) return;
 
@@ -184,6 +197,16 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     pageTextCacheRef.current.clear();
     setSearchResults([]);
     setActiveHitIndex(0);
+    aiScanAbortRef.current++;
+    setIsAiScanning(false);
+    setAiScanProgress(null);
+
+    loadCachedOcrPages(docCacheKey).then(cachedPages => {
+      if (!isMounted) return;
+      ocrPagesMapRef.current = cachedPages;
+      setAiCachedPageCount(Object.keys(cachedPages).length);
+      pageTextCacheRef.current.clear();
+    });
 
     const dataCopy = new Uint8Array(arrayBuffer.slice(0));
 
@@ -216,13 +239,14 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
 
     return () => {
       isMounted = false;
+      aiScanAbortRef.current++;
       try {
         loadingTask.destroy();
       } catch {
         // ignore
       }
     };
-  }, [arrayBuffer]);
+  }, [arrayBuffer, docCacheKey]);
 
   // Draw highlighter strokes AND active search match boxes on the transparent overlay canvas
   const drawHighlightOverlay = useCallback(
@@ -576,20 +600,94 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     }
   };
 
-  // Extract and cache page text + normalized bounding boxes for fast, accurate Persian & English search
+  // Render a single PDF page offscreen to a lightweight JPEG data URL for Gemini Flash-Lite OCR
+  const renderPageToJpegBase64 = useCallback(
+    async (pageNum: number): Promise<string | null> => {
+      if (!pdfDoc) return null;
+      try {
+        const page = await pdfDoc.getPage(pageNum);
+        const vp = page.getViewport({ scale: 0.9, rotation });
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = Math.max(1, Math.floor(vp.width));
+        offCanvas.height = Math.max(1, Math.floor(vp.height));
+        const ctx = offCanvas.getContext('2d');
+        if (!ctx) return null;
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, offCanvas.width, offCanvas.height);
+        await page.render({
+          canvas: offCanvas,
+          canvasContext: ctx,
+          viewport: vp,
+        }).promise;
+        return offCanvas.toDataURL('image/jpeg', 0.68);
+      } catch (err) {
+        console.warn(`Failed to render page ${pageNum} for OCR:`, err);
+        return null;
+      }
+    },
+    [pdfDoc, rotation]
+  );
+
+  // Extract and cache page text (combining AI-scanned OCR lines + native PDF text)
   const getOrExtractPageText = useCallback(
     async (pageNum: number): Promise<CachedPageText | null> => {
       if (!pdfDoc) return null;
       const cached = pageTextCacheRef.current.get(pageNum);
       if (cached) return cached;
 
+      const items: Array<
+        CachedPageItem & {
+          rtlNormStr: string;
+          rtlNormNoSpace: string;
+          isAiOcr?: boolean;
+          glyphs: Array<{
+            rawStr: string;
+            normStr: string;
+            normNoSpace: string;
+            box: PdfSearchBox;
+          }>;
+        }
+      > = [];
+
+      // 1. First, if AI OCR has scanned this page, convert its lines into clean searchable line items
+      const aiLines = ocrPagesMapRef.current[pageNum];
+      if (Array.isArray(aiLines) && aiLines.length > 0) {
+        const totalAiLines = aiLines.length;
+        aiLines.forEach((rawLine, idx) => {
+          const cleanLine = (rawLine || '').replace(/\s+/g, ' ').trim();
+          if (!cleanLine) return;
+          const normStr = normalizePdfTextForSearch(cleanLine, false);
+          const normNoSpace = normalizePdfTextForSearch(cleanLine, true);
+          if (!normStr && !normNoSpace) return;
+
+          const approxY = 0.06 + ((idx + 0.35) / Math.max(1, totalAiLines)) * 0.86;
+          const approxH = Math.max(0.024, Math.min(0.06, 0.84 / Math.max(8, totalAiLines)));
+
+          items.push({
+            rawStr: cleanLine,
+            normStr,
+            normNoSpace,
+            rtlNormStr: normStr,
+            rtlNormNoSpace: normNoSpace,
+            isAiOcr: true,
+            box: {
+              x: 0.07,
+              y: Math.max(0.02, Math.min(0.94, approxY)),
+              w: 0.86,
+              h: approxH,
+            },
+            glyphs: [],
+          });
+        });
+      }
+
+      // 2. Also extract native PDF text items (when the PDF has an embedded text layer)
       const page = await pdfDoc.getPage(pageNum);
       const vp = page.getViewport({ scale: 1, rotation });
       const pageW = Math.max(1, vp.width);
       const pageH = Math.max(1, vp.height);
       const content = await page.getTextContent();
 
-      // Group raw PDF text items into visual lines so split Persian/Arabic glyph runs rejoin cleanly
       interface RawGlyphItem {
         str: string;
         x: number;
@@ -631,76 +729,65 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         });
       }
 
-      // Group glyphs by line (similar Y coordinate) so each visual line becomes a clean searchable unit
-      const lines: RawGlyphItem[][] = [];
-      for (const g of rawGlyphs) {
-        const existingLine = lines.find(
-          line => Math.abs(line[0].y - g.y) <= Math.max(0.01, line[0].h * 0.65)
-        );
-        if (existingLine) {
-          existingLine.push(g);
-        } else {
-          lines.push([g]);
+      // Only add native PDF lines if AI OCR hasn't already provided clean lines for this page
+      if (!aiLines || aiLines.length === 0) {
+        const lines: RawGlyphItem[][] = [];
+        for (const g of rawGlyphs) {
+          const existingLine = lines.find(
+            line => Math.abs(line[0].y - g.y) <= Math.max(0.01, line[0].h * 0.65)
+          );
+          if (existingLine) {
+            existingLine.push(g);
+          } else {
+            lines.push([g]);
+          }
         }
-      }
 
-      lines.sort((a, b) => a[0].y - b[0].y);
+        lines.sort((a, b) => a[0].y - b[0].y);
 
-      const items: Array<
-        CachedPageItem & {
-          rtlNormStr: string;
-          rtlNormNoSpace: string;
-          glyphs: Array<{
-            rawStr: string;
-            normStr: string;
-            normNoSpace: string;
-            box: PdfSearchBox;
-          }>;
-        }
-      > = [];
+        for (const line of lines) {
+          const lineRaw = line.map(g => g.str).join(' ').replace(/\s+/g, ' ').trim();
+          const lineCompact = line.map(g => g.str).join('');
 
-      for (const line of lines) {
-        const lineRaw = line.map(g => g.str).join(' ').replace(/\s+/g, ' ').trim();
-        const lineCompact = line.map(g => g.str).join('');
+          const rtlSorted = [...line].sort((a, b) => b.x - a.x);
+          const rtlRaw = rtlSorted.map(g => g.str).join(' ').replace(/\s+/g, ' ').trim();
+          const rtlCompact = rtlSorted.map(g => g.str).join('');
 
-        // Also build right-to-left X-sorted string for PDFs that store RTL words in visual LTR order
-        const rtlSorted = [...line].sort((a, b) => b.x - a.x);
-        const rtlRaw = rtlSorted.map(g => g.str).join(' ').replace(/\s+/g, ' ').trim();
-        const rtlCompact = rtlSorted.map(g => g.str).join('');
+          const minX = Math.min(...line.map(g => g.x));
+          const maxX = Math.max(...line.map(g => g.x + g.w));
+          const minY = Math.min(...line.map(g => g.y));
+          const maxY = Math.max(...line.map(g => g.y + g.h));
 
-        const minX = Math.min(...line.map(g => g.x));
-        const maxX = Math.max(...line.map(g => g.x + g.w));
-        const minY = Math.min(...line.map(g => g.y));
-        const maxY = Math.max(...line.map(g => g.y + g.h));
+          const normStr = normalizePdfTextForSearch(lineRaw, false);
+          const normNoSpace = normalizePdfTextForSearch(lineCompact, true);
+          const rtlNormStr = normalizePdfTextForSearch(rtlRaw, false);
+          const rtlNormNoSpace = normalizePdfTextForSearch(rtlCompact, true);
 
-        const normStr = normalizePdfTextForSearch(lineRaw, false);
-        const normNoSpace = normalizePdfTextForSearch(lineCompact, true);
-        const rtlNormStr = normalizePdfTextForSearch(rtlRaw, false);
-        const rtlNormNoSpace = normalizePdfTextForSearch(rtlCompact, true);
+          const isRtlLine = /[\u0600-\u06FF\uFB50-\uFEFF]/.test(lineRaw);
+          const displayRaw =
+            isRtlLine && !lineRaw.includes(' ') && rtlRaw.includes(' ') ? rtlRaw : lineRaw;
 
-        const isRtlLine = /[\u0600-\u06FF\uFB50-\uFEFF]/.test(lineRaw);
-        const displayRaw = isRtlLine && !lineRaw.includes(' ') && rtlRaw.includes(' ') ? rtlRaw : lineRaw;
-
-        if (normStr || normNoSpace) {
-          items.push({
-            rawStr: displayRaw,
-            normStr,
-            normNoSpace,
-            rtlNormStr,
-            rtlNormNoSpace,
-            box: {
-              x: minX,
-              y: minY,
-              w: Math.max(0.02, maxX - minX),
-              h: Math.max(0.016, maxY - minY),
-            },
-            glyphs: line.map(g => ({
-              rawStr: g.str,
-              normStr: normalizePdfTextForSearch(g.str, false),
-              normNoSpace: normalizePdfTextForSearch(g.str, true),
-              box: { x: g.x, y: g.y, w: g.w, h: g.h },
-            })),
-          });
+          if (normStr || normNoSpace) {
+            items.push({
+              rawStr: displayRaw,
+              normStr,
+              normNoSpace,
+              rtlNormStr,
+              rtlNormNoSpace,
+              box: {
+                x: minX,
+                y: minY,
+                w: Math.max(0.02, maxX - minX),
+                h: Math.max(0.016, maxY - minY),
+              },
+              glyphs: line.map(g => ({
+                rawStr: g.str,
+                normStr: normalizePdfTextForSearch(g.str, false),
+                normNoSpace: normalizePdfTextForSearch(g.str, true),
+                box: { x: g.x, y: g.y, w: g.w, h: g.h },
+              })),
+            });
+          }
         }
       }
 
@@ -719,6 +806,89 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     [pdfDoc, rotation]
   );
 
+  // Match helper on a single page's CachedPageText
+  const findMatchesInPageData = useCallback(
+    (pageData: CachedPageText, rawQuery: string): PdfSearchHit[] => {
+      const qNorm = normalizePdfTextForSearch(rawQuery, false);
+      const qNoSpace = normalizePdfTextForSearch(rawQuery, true);
+      const qReversed = reverseRtlString(qNorm);
+      const qReversedNoSpace = reverseRtlString(qNoSpace);
+      const queryTokens = qNorm.split(/\s+/).filter(Boolean);
+
+      if (!qNorm) return [];
+
+      const pageHits: PdfSearchHit[] = [];
+      let pageMatchIdx = 0;
+      const p = pageData.page;
+
+      for (let lineIdx = 0; lineIdx < pageData.items.length; lineIdx++) {
+        const lineItem = pageData.items[lineIdx] as CachedPageItem & {
+          rtlNormStr?: string;
+          rtlNormNoSpace?: string;
+          glyphs?: Array<{
+            rawStr: string;
+            normStr: string;
+            normNoSpace: string;
+            box: PdfSearchBox;
+          }>;
+        };
+
+        const matchedSpaced =
+          lineItem.normStr.includes(qNorm) ||
+          (lineItem.rtlNormStr && lineItem.rtlNormStr.includes(qNorm)) ||
+          (qReversed.length >= 2 && lineItem.normStr.includes(qReversed));
+
+        const matchedCompact =
+          !matchedSpaced &&
+          qNoSpace.length >= 2 &&
+          (lineItem.normNoSpace.includes(qNoSpace) ||
+            (lineItem.rtlNormNoSpace && lineItem.rtlNormNoSpace.includes(qNoSpace)) ||
+            lineItem.normNoSpace.includes(qReversedNoSpace));
+
+        if (matchedSpaced || matchedCompact) {
+          let wordBoxes: PdfSearchBox[] = [];
+          if (lineItem.glyphs && lineItem.glyphs.length > 0) {
+            for (const g of lineItem.glyphs) {
+              if (!g.normNoSpace) continue;
+              const glyphMatches =
+                g.normStr.includes(qNorm) ||
+                g.normNoSpace.includes(qNoSpace) ||
+                (qReversedNoSpace.length >= 2 && g.normNoSpace.includes(qReversedNoSpace)) ||
+                queryTokens.some(
+                  tok =>
+                    tok.length >= 2 && (g.normStr.includes(tok) || g.normNoSpace.includes(tok))
+                );
+              if (glyphMatches) {
+                wordBoxes.push(g.box);
+              }
+            }
+          }
+
+          if (wordBoxes.length === 0) {
+            wordBoxes = [lineItem.box];
+          }
+
+          const prevLine = lineIdx > 0 ? pageData.items[lineIdx - 1].rawStr : '';
+          const nextLine =
+            lineIdx + 1 < pageData.items.length ? pageData.items[lineIdx + 1].rawStr : '';
+
+          pageHits.push({
+            id: `p${p}_m${pageMatchIdx++}_l${lineIdx}`,
+            page: p,
+            matchIndexOnPage: pageMatchIdx,
+            snippetBefore: prevLine ? `${prevLine.slice(-40)} ` : '',
+            snippetMatch: lineItem.rawStr,
+            snippetAfter: nextLine ? ` ${nextLine.slice(0, 45)}` : '',
+            boxes: wordBoxes,
+          });
+        }
+      }
+
+      return pageHits;
+    },
+    []
+  );
+
   const selectSearchHit = useCallback(
     (index: number, resultsList: PdfSearchHit[] = searchResults) => {
       if (resultsList.length === 0) return;
@@ -731,14 +901,148 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     [searchResults, goToPage]
   );
 
-  // Full-text search inside the open PDF with Persian/Arabic/Latin normalization & visual highlighting
+  // Background AI Page Scanner using Gemini Flash-Lite (/api/ocr)
+  const startAiPageScanner = useCallback(
+    async (activeQueryForLiveMatch = searchQuery, scanOnlyUnscanned = true) => {
+      if (!pdfDoc) return;
+      const scanId = ++aiScanAbortRef.current;
+      setIsAiScanning(true);
+      setAiScanError(null);
+
+      const total = pdfDoc.numPages;
+      // Order pages starting from currentPage outward so nearby pages are scanned first
+      const orderedPages: number[] = [];
+      for (let offset = 0; offset < total; offset++) {
+        const forward = currentPage + offset;
+        if (forward >= 1 && forward <= total) orderedPages.push(forward);
+        const backward = currentPage - offset;
+        if (offset > 0 && backward >= 1 && backward <= total) orderedPages.push(backward);
+      }
+
+      const pagesToScan = scanOnlyUnscanned
+        ? orderedPages.filter(p => !ocrPagesMapRef.current[p] || ocrPagesMapRef.current[p].length === 0)
+        : orderedPages;
+
+      if (pagesToScan.length === 0) {
+        setIsAiScanning(false);
+        setAiScanProgress(null);
+        return;
+      }
+
+      let scannedSoFar = Object.keys(ocrPagesMapRef.current).length;
+      setAiScanProgress({ scanned: scannedSoFar, total });
+      let jumpedToFirstAiHit = false;
+
+      try {
+        const batchSize = 3;
+        for (let i = 0; i < pagesToScan.length; i += batchSize) {
+          if (aiScanAbortRef.current !== scanId) return;
+          const batchPageNums = pagesToScan.slice(i, i + batchSize);
+
+          const renderedPages: Array<{ page: number; imageBase64: string; mimeType: string }> = [];
+          for (const pNum of batchPageNums) {
+            if (aiScanAbortRef.current !== scanId) return;
+            const b64 = await renderPageToJpegBase64(pNum);
+            if (b64) {
+              renderedPages.push({ page: pNum, imageBase64: b64, mimeType: 'image/jpeg' });
+            }
+          }
+
+          if (renderedPages.length === 0) continue;
+
+          const response = await fetch('/api/ocr', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pages: renderedPages }),
+          });
+
+          if (!response.ok) {
+            const errData = (await response.json().catch(() => ({}))) as { error?: string };
+            throw new Error(errData.error || `AI scan HTTP ${response.status}`);
+          }
+
+          const data = (await response.json()) as {
+            results?: Array<{ page: number; lines: string[]; error?: string }>;
+          };
+
+          if (aiScanAbortRef.current !== scanId) return;
+
+          const newEntries: Array<{ page: number; lines: string[] }> = [];
+          for (const res of data.results || []) {
+            if (Array.isArray(res.lines)) {
+              ocrPagesMapRef.current[res.page] = res.lines;
+              pageTextCacheRef.current.delete(res.page);
+              newEntries.push({ page: res.page, lines: res.lines });
+            }
+          }
+
+          if (newEntries.length > 0) {
+            await saveCachedOcrPages(docCacheKey, newEntries);
+            scannedSoFar = Object.keys(ocrPagesMapRef.current).length;
+            setAiCachedPageCount(scannedSoFar);
+            setAiScanProgress({ scanned: scannedSoFar, total });
+
+            // If user has a search query open, live-check the newly AI-scanned pages immediately!
+            const qClean = normalizePdfTextForSearch(activeQueryForLiveMatch, false);
+            if (qClean) {
+              const newlyFoundHits: PdfSearchHit[] = [];
+              for (const entry of newEntries) {
+                const updatedPageData = await getOrExtractPageText(entry.page);
+                if (updatedPageData) {
+                  const pHits = findMatchesInPageData(updatedPageData, activeQueryForLiveMatch);
+                  newlyFoundHits.push(...pHits);
+                }
+              }
+
+              if (newlyFoundHits.length > 0) {
+                setSearchResults(prev => {
+                  const filteredPrev = prev.filter(
+                    oldHit => !newEntries.some(ne => ne.page === oldHit.page)
+                  );
+                  const combined = [...filteredPrev, ...newlyFoundHits].sort(
+                    (a, b) => a.page - b.page || a.matchIndexOnPage - b.matchIndexOnPage
+                  );
+                  if (!jumpedToFirstAiHit && prev.length === 0 && combined.length > 0) {
+                    jumpedToFirstAiHit = true;
+                    const firstHit = combined[0];
+                    setTimeout(() => {
+                      goToPage(firstHit.page, firstHit.boxes[0]?.y);
+                    }, 20);
+                  }
+                  return combined;
+                });
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error('AI Page Scanner error:', err);
+        if (aiScanAbortRef.current === scanId) {
+          setAiScanError(err instanceof Error ? err.message : 'AI page scan encountered an error');
+        }
+      } finally {
+        if (aiScanAbortRef.current === scanId) {
+          setIsAiScanning(false);
+          setAiScanProgress(null);
+        }
+      }
+    },
+    [
+      pdfDoc,
+      currentPage,
+      searchQuery,
+      docCacheKey,
+      renderPageToJpegBase64,
+      getOrExtractPageText,
+      findMatchesInPageData,
+      goToPage,
+    ]
+  );
+
+  // Full-text search inside the open PDF with automatic fallback to Gemini Flash-Lite AI Page Scanner
   const executePdfSearch = useCallback(
     async (rawQuery: string) => {
       const qNorm = normalizePdfTextForSearch(rawQuery, false);
-      const qNoSpace = normalizePdfTextForSearch(rawQuery, true);
-      const qReversed = reverseRtlString(qNorm);
-      const qReversedNoSpace = reverseRtlString(qNoSpace);
-      const queryTokens = qNorm.split(/\s+/).filter(Boolean);
 
       if (!pdfDoc || !qNorm) {
         setSearchResults([]);
@@ -764,83 +1068,17 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           const pageData = await getOrExtractPageText(p);
           if (!pageData || pageData.items.length === 0) continue;
 
-          let pageMatchIdx = 0;
-
-          for (let lineIdx = 0; lineIdx < pageData.items.length; lineIdx++) {
-            const lineItem = pageData.items[lineIdx] as CachedPageItem & {
-              rtlNormStr?: string;
-              rtlNormNoSpace?: string;
-              glyphs?: Array<{
-                rawStr: string;
-                normStr: string;
-                normNoSpace: string;
-                box: PdfSearchBox;
-              }>;
-            };
-
-            const matchedSpaced =
-              lineItem.normStr.includes(qNorm) ||
-              (lineItem.rtlNormStr && lineItem.rtlNormStr.includes(qNorm)) ||
-              (qReversed.length >= 2 && lineItem.normStr.includes(qReversed));
-
-            const matchedCompact =
-              !matchedSpaced &&
-              qNoSpace.length >= 2 &&
-              (lineItem.normNoSpace.includes(qNoSpace) ||
-                (lineItem.rtlNormNoSpace && lineItem.rtlNormNoSpace.includes(qNoSpace)) ||
-                lineItem.normNoSpace.includes(qReversedNoSpace));
-
-            if (matchedSpaced || matchedCompact) {
-              // Pinpoint exact word glyph boxes on the line if possible
-              let wordBoxes: PdfSearchBox[] = [];
-              if (lineItem.glyphs && lineItem.glyphs.length > 0) {
-                for (const g of lineItem.glyphs) {
-                  if (!g.normNoSpace) continue;
-                  const glyphMatches =
-                    g.normStr.includes(qNorm) ||
-                    g.normNoSpace.includes(qNoSpace) ||
-                    (qReversedNoSpace.length >= 2 && g.normNoSpace.includes(qReversedNoSpace)) ||
-                    queryTokens.some(
-                      tok =>
-                        tok.length >= 2 &&
-                        (g.normStr.includes(tok) || g.normNoSpace.includes(tok))
-                    );
-                  if (glyphMatches) {
-                    wordBoxes.push(g.box);
-                  }
-                }
-              }
-
-              if (wordBoxes.length === 0) {
-                wordBoxes = [lineItem.box];
-              }
-
-              const prevLine = lineIdx > 0 ? pageData.items[lineIdx - 1].rawStr : '';
-              const nextLine =
-                lineIdx + 1 < pageData.items.length ? pageData.items[lineIdx + 1].rawStr : '';
-
-              hits.push({
-                id: `p${p}_m${pageMatchIdx++}_l${lineIdx}`,
-                page: p,
-                matchIndexOnPage: pageMatchIdx,
-                snippetBefore: prevLine ? `${prevLine.slice(-40)} ` : '',
-                snippetMatch: lineItem.rawStr,
-                snippetAfter: nextLine ? ` ${nextLine.slice(0, 45)}` : '',
-                boxes: wordBoxes,
-              });
-
-              if (hits.length >= 120) break;
-            }
+          const pageHits = findMatchesInPageData(pageData, rawQuery);
+          if (pageHits.length > 0) {
+            hits.push(...pageHits);
+            if (hits.length >= 120) break;
           }
-
-          if (hits.length >= 120) break;
         }
 
         if (searchAbortRef.current !== searchId) return;
         setSearchResults(hits);
 
         if (hits.length > 0) {
-          // Prefer jumping to the first match on or after currentPage
           const nearIdx = hits.findIndex(h => h.page >= currentPage);
           const initialIdx = nearIdx >= 0 ? nearIdx : 0;
           setActiveHitIndex(initialIdx);
@@ -848,6 +1086,12 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           goToPage(targetHit.page, targetHit.boxes[0]?.y);
         } else {
           setActiveHitIndex(0);
+          // If 0 matches were found in native text and not all pages have been AI-scanned yet,
+          // automatically start the Gemini Flash-Lite AI Page Scanner!
+          const alreadyScannedCount = Object.keys(ocrPagesMapRef.current).length;
+          if (alreadyScannedCount < total && !isAiScanning) {
+            startAiPageScanner(rawQuery, true);
+          }
         }
       } catch (searchErr) {
         console.warn('PDF text search error:', searchErr);
@@ -858,7 +1102,15 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         }
       }
     },
-    [pdfDoc, getOrExtractPageText, currentPage, goToPage]
+    [
+      pdfDoc,
+      getOrExtractPageText,
+      findMatchesInPageData,
+      currentPage,
+      goToPage,
+      isAiScanning,
+      startAiPageScanner,
+    ]
   );
 
   const handleRunPdfSearch = (e: React.FormEvent) => {
@@ -868,7 +1120,6 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       normalizePdfTextForSearch(searchQuery) !== '' &&
       !isSearching
     ) {
-      // If results are already loaded for this query, pressing Enter steps to the next match!
       selectSearchHit(activeHitIndex + 1);
       return;
     }
@@ -1194,12 +1445,12 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         </div>
       )}
 
-      {/* Non-Blocking Top Search Bar with On-Page Word Highlighting & Prev/Next Match Stepper */}
+      {/* Non-Blocking Top Search Bar with AI Page Scanner, On-Page Highlighting & Prev/Next Stepper */}
       {isSearchOpen && (
         <div className="bg-[#181818] text-white border-b border-[#333333] px-3 sm:px-4 py-2 shrink-0 z-20 space-y-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <form onSubmit={handleRunPdfSearch} className="flex items-center gap-2 flex-1 min-w-[240px] max-w-xl">
-              <div className="relative flex-1">
+            <form onSubmit={handleRunPdfSearch} className="flex flex-wrap items-center gap-2 flex-1 min-w-[240px] max-w-2xl">
+              <div className="relative flex-1 min-w-[180px]">
                 <Search className="w-3.5 h-3.5 opacity-50 absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
                   type="text"
@@ -1249,6 +1500,45 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                     : 'Scanning...'
                   : 'Find'}
               </button>
+
+              {/* AI Page Scanner Button (Gemini Flash-Lite OCR) */}
+              {isAiScanning ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    aiScanAbortRef.current++;
+                    setIsAiScanning(false);
+                    setAiScanProgress(null);
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-amber-400/20 border border-amber-400/50 text-amber-300 font-semibold text-xs flex items-center gap-1.5 hover:bg-amber-400/30 shrink-0"
+                  title="Stop AI page scanning"
+                >
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>
+                    AI Reading {aiScanProgress ? `${aiScanProgress.scanned}/${aiScanProgress.total}` : '...'} (Stop)
+                  </span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() =>
+                    startAiPageScanner(searchQuery, aiCachedPageCount < totalPages)
+                  }
+                  className={`px-3 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 transition-colors shrink-0 ${
+                    aiCachedPageCount >= totalPages
+                      ? 'bg-[#1DB954]/15 border-[#1DB954]/40 text-[#1DB954] hover:bg-[#1DB954]/25'
+                      : 'bg-[#242424] border-[#383838] text-amber-300 hover:bg-[#2E2E2E]'
+                  }`}
+                  title="Use lightweight AI OCR (Gemini Flash-Lite) to scan pages and index every word"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>
+                    {aiCachedPageCount >= totalPages
+                      ? `AI Indexed (${totalPages}/${totalPages})`
+                      : `AI Scan Pages (${aiCachedPageCount}/${totalPages})`}
+                  </span>
+                </button>
+              )}
             </form>
 
             {/* Match Counter + Prev / Next Match Buttons */}
@@ -1293,6 +1583,14 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                     {showAllSearchHits ? 'Hide List' : `All (${searchResults.length})`}
                   </button>
                 </>
+              ) : isAiScanning ? (
+                <span className="text-xs text-amber-300 font-medium flex items-center gap-1.5">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>
+                    AI scanning pages for &ldquo;{searchQuery.trim()}&rdquo; (
+                    {aiScanProgress ? `${aiScanProgress.scanned}/${aiScanProgress.total}` : '...'})
+                  </span>
+                </span>
               ) : (
                 searchQuery.trim() &&
                 !isSearching && (
@@ -1315,6 +1613,19 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               </button>
             </div>
           </div>
+
+          {aiScanError && (
+            <div className="text-[11px] text-rose-400 flex items-center justify-between bg-rose-500/10 border border-rose-500/30 rounded-lg px-2.5 py-1">
+              <span>{aiScanError}</span>
+              <button
+                type="button"
+                onClick={() => setAiScanError(null)}
+                className="text-rose-300 hover:text-white"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
 
           {/* Optional Expandable Match Snippets Drawer */}
           {showAllSearchHits && searchResults.length > 0 && (

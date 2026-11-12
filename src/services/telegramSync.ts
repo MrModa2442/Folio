@@ -13,6 +13,7 @@ const PALETTE = [
 ];
 
 const STORAGE_TG_SESSION_KEY = 'folio_tg_session_v1';
+const STORAGE_EXPLORE_ARCHIVE_KEY = 'folio_explore_pdf_archive_v1';
 const inflightCoverRequests = new Map<string, Promise<string | null>>();
 
 export interface ExploreChannelGroup {
@@ -26,6 +27,88 @@ export interface ExploreTelegramFeedResponse {
   serverHasSession: boolean;
   channels: ExploreChannelGroup[];
   allPdfs: TelegramPdfItem[];
+}
+
+function loadLocalExploreArchive(): ExploreChannelGroup[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_EXPLORE_ARCHIVE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalExploreArchive(groups: ExploreChannelGroup[]): void {
+  try {
+    localStorage.setItem(STORAGE_EXPLORE_ARCHIVE_KEY, JSON.stringify(groups));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function mergeExploreFeedWithLocalArchive(
+  incomingGroups: ExploreChannelGroup[]
+): { channels: ExploreChannelGroup[]; allPdfs: TelegramPdfItem[] } {
+  const archivedGroups = loadLocalExploreArchive();
+  const groupMap = new Map<string, { channel: string; channelTitle: string; items: TelegramPdfItem[] }>();
+
+  // 1. Seed with existing local archive first
+  for (const grp of archivedGroups) {
+    const chKey = normalizeChannelInput(grp.channel);
+    if (!chKey) continue;
+    groupMap.set(chKey, {
+      channel: chKey,
+      channelTitle: grp.channelTitle || `@${chKey}`,
+      items: [...(grp.pdfs || [])],
+    });
+  }
+
+  // 2. Merge incoming groups on top (newest items first, keeping all older items)
+  for (const grp of incomingGroups) {
+    const chKey = normalizeChannelInput(grp.channel);
+    if (!chKey) continue;
+    const existing = groupMap.get(chKey);
+    if (existing) {
+      if (grp.channelTitle) existing.channelTitle = grp.channelTitle;
+      existing.items = [...(grp.pdfs || []), ...existing.items];
+    } else {
+      groupMap.set(chKey, {
+        channel: chKey,
+        channelTitle: grp.channelTitle || `@${chKey}`,
+        items: [...(grp.pdfs || [])],
+      });
+    }
+  }
+
+  const mergedGroups: ExploreChannelGroup[] = [];
+  const combinedAll: TelegramPdfItem[] = [];
+
+  for (const entry of groupMap.values()) {
+    const dedupedPdfs = deduplicateTelegramPdfs(entry.items).sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
+    );
+    mergedGroups.push({
+      channel: entry.channel,
+      channelTitle: entry.channelTitle,
+      pdfs: dedupedPdfs,
+    });
+    combinedAll.push(...dedupedPdfs);
+  }
+
+  const finalAllPdfs = deduplicateTelegramPdfs(combinedAll).sort(
+    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
+  );
+
+  if (mergedGroups.length > 0) {
+    saveLocalExploreArchive(mergedGroups);
+  }
+
+  return {
+    channels: mergedGroups,
+    allPdfs: finalAllPdfs,
+  };
 }
 
 export function getStoredTelegramSession(): string {
@@ -152,37 +235,29 @@ export async function fetchExploreChannelFeed(
     });
     const contentType = res.headers.get('content-type') || '';
     if (!res.ok || !contentType.includes('application/json')) {
+      const fallback = mergeExploreFeedWithLocalArchive([]);
       return {
-        configured: false,
+        configured: fallback.allPdfs.length > 0,
         serverHasSession: false,
-        channels: [],
-        allPdfs: [],
+        channels: fallback.channels,
+        allPdfs: fallback.allPdfs,
       };
     }
     const data: ExploreTelegramFeedResponse = await res.json();
-    const seenGroups = new Set<string>();
-    const dedupedGroups: ExploreChannelGroup[] = [];
-    for (const group of data.channels || []) {
-      const chKey = normalizeChannelInput(group.channel);
-      if (!chKey || seenGroups.has(chKey)) continue;
-      seenGroups.add(chKey);
-      dedupedGroups.push({
-        ...group,
-        channel: chKey,
-        pdfs: deduplicateTelegramPdfs(group.pdfs || []),
-      });
-    }
+    const merged = mergeExploreFeedWithLocalArchive(data.channels || []);
     return {
       ...data,
-      channels: dedupedGroups,
-      allPdfs: deduplicateTelegramPdfs(data.allPdfs || []),
+      configured: Boolean(data.configured || merged.allPdfs.length > 0),
+      channels: merged.channels,
+      allPdfs: merged.allPdfs,
     };
   } catch {
+    const fallback = mergeExploreFeedWithLocalArchive([]);
     return {
-      configured: false,
+      configured: fallback.allPdfs.length > 0,
       serverHasSession: false,
-      channels: [],
-      allPdfs: [],
+      channels: fallback.channels,
+      allPdfs: fallback.allPdfs,
     };
   }
 }

@@ -14,7 +14,7 @@
     "test": "node --test --import tsx src/utils/library.test.ts src/utils/pdfParser.test.ts src/utils/ambientAudioMath.test.ts"
   },
   "dependencies": {
-    "@google/genai": "^2.4.0",
+    "@google/genai": "^3.2.0",
     "@tailwindcss/vite": "^4.3.3",
     "@vitejs/plugin-react": "^6.1.1",
     "dotenv": "^17.2.3",

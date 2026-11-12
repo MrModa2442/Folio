@@ -1,6 +1,8 @@
 import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { Logger } from 'telegram/extensions/index.js';
+import fs from 'fs';
+import path from 'path';
 
 const DEFAULT_API_ID = 2040;
 const DEFAULT_API_HASH = 'b18441a1ff607e10a989891a5462e627';
@@ -47,7 +49,133 @@ async function getConnectedClient(
   return client;
 }
 
-// 90-second in-memory cache for the public Explore multi-channel feed
+type ExtractedTelegramPdf = NonNullable<ReturnType<typeof extractPdfFromMessage>>;
+
+// Permanent cumulative archive of all discovered PDFs per channel so older PDFs never disappear
+const ARCHIVE_FILE_PATHS = [
+  path.resolve(process.cwd(), '.folio-explore-archive.json'),
+  '/tmp/folio-explore-archive.json',
+];
+
+const persistentChannelArchive = new Map<
+  string,
+  {
+    channelTitle: string;
+    pdfsByMsgId: Map<number, ExtractedTelegramPdf>;
+  }
+>();
+let archiveLoadedFromDisk = false;
+
+function loadArchiveFromDiskOnce() {
+  if (archiveLoadedFromDisk) return;
+  archiveLoadedFromDisk = true;
+  for (const filePath of ARCHIVE_FILE_PATHS) {
+    try {
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, 'utf-8');
+        const parsed = JSON.parse(raw) as Record<
+          string,
+          { channelTitle: string; pdfs: ExtractedTelegramPdf[] }
+        >;
+        for (const [ch, entry] of Object.entries(parsed || {})) {
+          const cleanCh = ch.toLowerCase().trim();
+          if (!cleanCh || !entry || !Array.isArray(entry.pdfs)) continue;
+          const existing = persistentChannelArchive.get(cleanCh) || {
+            channelTitle: entry.channelTitle || `@${cleanCh}`,
+            pdfsByMsgId: new Map<number, ExtractedTelegramPdf>(),
+          };
+          for (const pdf of entry.pdfs) {
+            if (pdf && typeof pdf.messageId === 'number') {
+              existing.pdfsByMsgId.set(pdf.messageId, {
+                ...pdf,
+                channelUsername: cleanCh,
+              });
+            }
+          }
+          persistentChannelArchive.set(cleanCh, existing);
+        }
+        break;
+      }
+    } catch {
+      // ignore disk read errors
+    }
+  }
+}
+
+function saveArchiveToDisk() {
+  const serialized: Record<string, { channelTitle: string; pdfs: ExtractedTelegramPdf[] }> = {};
+  for (const [ch, entry] of persistentChannelArchive.entries()) {
+    serialized[ch] = {
+      channelTitle: entry.channelTitle,
+      pdfs: Array.from(entry.pdfsByMsgId.values()),
+    };
+  }
+  const json = JSON.stringify(serialized);
+  for (const filePath of ARCHIVE_FILE_PATHS) {
+    try {
+      fs.writeFileSync(filePath, json, 'utf-8');
+      break;
+    } catch {
+      // try next path (e.g. /tmp on read-only serverless fs)
+    }
+  }
+}
+
+function mergeChannelPdfsIntoArchive(
+  channel: string,
+  channelTitle: string,
+  incomingPdfs: ExtractedTelegramPdf[]
+): ExtractedTelegramPdf[] {
+  loadArchiveFromDiskOnce();
+  const cleanCh = channel.toLowerCase().trim();
+  const existing = persistentChannelArchive.get(cleanCh) || {
+    channelTitle: channelTitle || `@${cleanCh}`,
+    pdfsByMsgId: new Map<number, ExtractedTelegramPdf>(),
+  };
+  if (channelTitle) {
+    existing.channelTitle = channelTitle;
+  }
+
+  let changed = false;
+  for (const pdf of incomingPdfs) {
+    if (!pdf || typeof pdf.messageId !== 'number') continue;
+    const prev = existing.pdfsByMsgId.get(pdf.messageId);
+    if (!prev) {
+      changed = true;
+    }
+    existing.pdfsByMsgId.set(pdf.messageId, {
+      ...pdf,
+      channelUsername: cleanCh,
+    });
+  }
+
+  persistentChannelArchive.set(cleanCh, existing);
+  if (changed) {
+    saveArchiveToDisk();
+  }
+
+  // Deduplicate by title across the channel while keeping newest first
+  const allForChannel = Array.from(existing.pdfsByMsgId.values()).sort(
+    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
+  );
+
+  const seenTitles = new Set<string>();
+  const deduped: ExtractedTelegramPdf[] = [];
+  for (const item of allForChannel) {
+    const titleKey = (item.cleanTitle || item.fileName).toLowerCase().trim();
+    const uniqueKey = `${titleKey}_${item.fileSize || 0}`;
+    if (seenTitles.has(uniqueKey) || (titleKey && seenTitles.has(titleKey))) {
+      continue;
+    }
+    seenTitles.add(uniqueKey);
+    if (titleKey) seenTitles.add(titleKey);
+    deduped.push(item);
+  }
+
+  return deduped;
+}
+
+// 60-second in-memory response cache for the public Explore multi-channel feed
 let exploreCache: {
   timestamp: number;
   key: string;
@@ -57,9 +185,9 @@ let exploreCache: {
     channels: Array<{
       channel: string;
       channelTitle: string;
-      pdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[];
+      pdfs: ExtractedTelegramPdf[];
     }>;
-    allPdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[];
+    allPdfs: ExtractedTelegramPdf[];
   };
 } | null = null;
 
@@ -366,14 +494,15 @@ export default async function handler(req: any, res: any) {
         return res.status(200).json(exploreCache.data);
       }
 
+      loadArchiveFromDiskOnce();
       const client = await getConnectedClient(activeSession, apiId, apiHash);
 
       const channelResults: Array<{
         channel: string;
         channelTitle: string;
-        pdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[];
+        pdfs: ExtractedTelegramPdf[];
       }> = [];
-      const allPdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[] = [];
+      const allPdfs: ExtractedTelegramPdf[] = [];
       const seenEntityIds = new Set<string>();
       const seenGlobalPdfKeys = new Set<string>();
 
@@ -389,38 +518,94 @@ export default async function handler(req: any, res: any) {
 
           const channelTitle =
             (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || `@${ch}`;
-          const messages = await client.getMessages(entity, { limit: 45 });
-          const pdfs: NonNullable<ReturnType<typeof extractPdfFromMessage>>[] = [];
-          const seenChannelTitles = new Set<string>();
 
-          for (let i = 0; i < messages.length; i++) {
-            const msg = messages[i];
-            if (msg instanceof Api.Message) {
-              const extracted = extractPdfFromMessage(msg, ch, channelTitle, i, messages);
-              if (extracted) {
-                const titleKey = (extracted.cleanTitle || extracted.fileName).toLowerCase().trim();
-                const uniqueKey = `${titleKey}_${extracted.fileSize || 0}`;
-                if (!seenChannelTitles.has(uniqueKey) && !seenChannelTitles.has(titleKey)) {
-                  seenChannelTitles.add(uniqueKey);
-                  seenChannelTitles.add(titleKey);
-                  pdfs.push(extracted);
-                }
-                if (!seenGlobalPdfKeys.has(uniqueKey) && !seenGlobalPdfKeys.has(titleKey)) {
-                  seenGlobalPdfKeys.add(uniqueKey);
-                  seenGlobalPdfKeys.add(titleKey);
-                  allPdfs.push(extracted);
+          // Fetch document messages using InputMessagesFilterDocument.
+          // On initial archive build (or forceRefresh), paginate backward through the channel's entire document history
+          // so there is NO 250-book limit; on normal quick checks, fetch the latest 100 documents and merge into the permanent archive.
+          const existingChannelArchive = persistentChannelArchive.get(ch.toLowerCase().trim());
+          const hasExistingArchive = Boolean(existingChannelArchive && existingChannelArchive.pdfsByMsgId.size > 0);
+          const maxPagesToWalk = !hasExistingArchive || forceRefresh ? 20 : 1; // up to 20 * 100 = 2,000+ existing books on full scan, plus unlimited cumulative archive forever
+
+          const freshlyExtracted: ExtractedTelegramPdf[] = [];
+          let offsetId = 0;
+
+          for (let pageIdx = 0; pageIdx < maxPagesToWalk; pageIdx++) {
+            let docMessages: Api.TypeMessage[] = [];
+            try {
+              docMessages = await client.getMessages(entity, {
+                limit: 100,
+                offsetId,
+                filter: new Api.InputMessagesFilterDocument(),
+              });
+            } catch {
+              docMessages = await client.getMessages(entity, {
+                limit: 100,
+                offsetId,
+              });
+            }
+
+            if (!docMessages || docMessages.length === 0) break;
+
+            for (let i = 0; i < docMessages.length; i++) {
+              const msg = docMessages[i];
+              if (msg instanceof Api.Message) {
+                const extracted = extractPdfFromMessage(msg, ch, channelTitle, i, docMessages);
+                if (extracted) {
+                  freshlyExtracted.push(extracted);
                 }
               }
+            }
+
+            const lastMsg = docMessages[docMessages.length - 1];
+            const lastId = lastMsg && 'id' in lastMsg && typeof lastMsg.id === 'number' ? lastMsg.id : 0;
+            if (!lastId || lastId === offsetId || docMessages.length < 100) {
+              break;
+            }
+            offsetId = lastId;
+          }
+
+          // Merge into permanent cumulative archive so older PDFs stay forever
+          const cumulativeChannelPdfs = mergeChannelPdfsIntoArchive(
+            ch,
+            channelTitle,
+            freshlyExtracted
+          );
+
+          for (const item of cumulativeChannelPdfs) {
+            const titleKey = (item.cleanTitle || item.fileName).toLowerCase().trim();
+            const uniqueKey = `${titleKey}_${item.fileSize || 0}`;
+            if (!seenGlobalPdfKeys.has(uniqueKey) && !seenGlobalPdfKeys.has(titleKey)) {
+              seenGlobalPdfKeys.add(uniqueKey);
+              seenGlobalPdfKeys.add(titleKey);
+              allPdfs.push(item);
             }
           }
 
           channelResults.push({
             channel: ch,
             channelTitle,
-            pdfs,
+            pdfs: cumulativeChannelPdfs,
           });
         } catch (chErr) {
           console.warn(`[/api/telegram/explore-feed] Could not read channel @${ch}:`, chErr);
+          // Even if Telegram temporarily fails, return all previously archived PDFs for this channel
+          const fallbackArchived = mergeChannelPdfsIntoArchive(ch, `@${ch}`, []);
+          if (fallbackArchived.length > 0) {
+            for (const item of fallbackArchived) {
+              const titleKey = (item.cleanTitle || item.fileName).toLowerCase().trim();
+              const uniqueKey = `${titleKey}_${item.fileSize || 0}`;
+              if (!seenGlobalPdfKeys.has(uniqueKey) && !seenGlobalPdfKeys.has(titleKey)) {
+                seenGlobalPdfKeys.add(uniqueKey);
+                seenGlobalPdfKeys.add(titleKey);
+                allPdfs.push(item);
+              }
+            }
+            channelResults.push({
+              channel: ch,
+              channelTitle: `@${ch}`,
+              pdfs: fallbackArchived,
+            });
+          }
         }
       }
 
@@ -661,8 +846,17 @@ export default async function handler(req: any, res: any) {
       const channelTitle =
         (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || `@${channel}`;
 
-      const messages = await client.getMessages(entity, { limit });
-      const pdfItems = [];
+      let messages: Api.TypeMessage[] = [];
+      try {
+        messages = await client.getMessages(entity, {
+          limit: Math.max(limit, 200),
+          filter: new Api.InputMessagesFilterDocument(),
+        });
+      } catch {
+        messages = await client.getMessages(entity, { limit: Math.max(limit, 120) });
+      }
+
+      const pdfItems: ExtractedTelegramPdf[] = [];
 
       for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
@@ -674,10 +868,12 @@ export default async function handler(req: any, res: any) {
         }
       }
 
+      const cumulativePdfs = mergeChannelPdfsIntoArchive(channel, channelTitle, pdfItems);
+
       return res.status(200).json({
         channel,
         channelTitle,
-        pdfs: pdfItems,
+        pdfs: cumulativePdfs,
       });
     }
 

@@ -187,25 +187,57 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
 
   const isDark = theme === 'spotify-dark';
 
-  const loadExploreFeed = async (forceRefresh = false) => {
-    setIsLoadingFeed(true);
+  const loadExploreFeed = async (forceRefresh = false, showSpinner = false) => {
+    if (showSpinner) setIsLoadingFeed(true);
     try {
       const feed = await fetchExploreChannelFeed(configuredChannels, forceRefresh);
       setFeedConfigured(feed.configured);
       setChannelGroups(feed.channels || []);
-      setAllChannelPdfs(feed.allPdfs || []);
+
+      // Also include any Telegram books already in the user's library so nothing ever vanishes
+      const libraryTelegramItems: TelegramPdfItem[] = existingBooks
+        .filter(b => b.telegramChannel && b.telegramMessageId)
+        .map(b => ({
+          messageId: b.telegramMessageId!,
+          fileName: b.fileName || `${b.title}.pdf`,
+          cleanTitle: b.title,
+          author: b.author,
+          fileSize: b.fileSize || 0,
+          date: b.dateAdded || new Date().toISOString(),
+          caption: b.notes || '',
+          channelTitle: '',
+          channelUsername: normalizeChannelInput(b.telegramChannel!),
+        }));
+
+      const combined = [...(feed.allPdfs || []), ...libraryTelegramItems];
+      const seenTitles = new Set<string>();
+      const seenMsgIds = new Set<string>();
+      const mergedList: TelegramPdfItem[] = [];
+      for (const item of combined) {
+        const ch = normalizeChannelInput(item.channelUsername);
+        const msgKey = `${ch}_${item.messageId}`;
+        const titleKey = sanitizeBookTitle(item.cleanTitle || item.fileName, item.channelTitle)
+          .toLowerCase()
+          .trim();
+        if (seenMsgIds.has(msgKey) || (titleKey && seenTitles.has(titleKey))) continue;
+        seenMsgIds.add(msgKey);
+        if (titleKey) seenTitles.add(titleKey);
+        mergedList.push({ ...item, channelUsername: ch });
+      }
+
+      setAllChannelPdfs(mergedList);
     } finally {
       setIsLoadingFeed(false);
     }
   };
 
   useEffect(() => {
-    loadExploreFeed(false);
+    loadExploreFeed(false, allChannelPdfs.length === 0);
     const interval = setInterval(() => {
-      loadExploreFeed(false);
+      loadExploreFeed(false, false);
     }, 60000);
     return () => clearInterval(interval);
-  }, [configuredChannels]);
+  }, [configuredChannels, existingBooks.length]);
 
   const filteredLists = searchPublicBooklists(publicBooklists, searchQuery);
 
