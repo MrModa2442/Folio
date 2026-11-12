@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Book, Booklist, CoverPattern } from '../types/library';
+import { AppTheme, Book, Booklist, CoverPattern } from '../types/library';
 import { extractPdfMetadata } from '../utils/pdfParser';
 import { storePdfBlob, storeBookCover } from '../services/db';
 import { X, Upload, Loader2, Trash2 } from 'lucide-react';
@@ -11,6 +11,7 @@ interface ImportPdfModalProps {
   onDeleteBook?: (bookId: string) => void;
   booklists: Booklist[];
   editingBook?: Book | null;
+  theme?: AppTheme;
 }
 
 const PALETTE = [
@@ -28,7 +29,10 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
   onBookImported,
   onDeleteBook,
   editingBook,
+  theme = 'spotify-dark',
 }) => {
+  const isDark = theme === 'spotify-dark';
+  const isWarm = theme === 'warm-minimal';
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -132,10 +136,26 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xs select-none">
-      <div className="bg-[#181818] text-white w-full max-w-md rounded-xl shadow-2xl border border-[#282828] overflow-hidden flex flex-col">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-xs select-none">
+      <div
+        className={`w-full max-w-md rounded-xl shadow-2xl border overflow-hidden flex flex-col transition-colors ${
+          isDark
+            ? 'bg-[#181818] text-white border-[#282828]'
+            : isWarm
+            ? 'bg-[#FAF6EE] text-[#292524] border-[#E2D9C5]'
+            : 'bg-white text-zinc-900 border-zinc-200'
+        }`}
+      >
         {/* Header */}
-        <div className="px-5 py-3.5 bg-[#1F1F1F] border-b border-[#282828] flex items-center justify-between">
+        <div
+          className={`px-5 py-3.5 border-b flex items-center justify-between ${
+            isDark
+              ? 'bg-[#1F1F1F] border-[#282828]'
+              : isWarm
+              ? 'bg-[#F2EBDD] border-[#E2D9C5]'
+              : 'bg-zinc-50 border-zinc-200'
+          }`}
+        >
           <h2 className="text-sm font-bold tracking-tight">
             {editingBook ? 'Edit Book Info' : 'Import PDF Book'}
           </h2>
@@ -162,7 +182,13 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
                   required
                   value={editTitle}
                   onChange={e => setEditTitle(e.target.value)}
-                  className="w-full text-xs px-3 py-2 rounded bg-[#242424] border border-[#333333] focus:outline-hidden focus:border-white"
+                  className={`w-full text-xs px-3 py-2 rounded border focus:outline-hidden ${
+                    isDark
+                      ? 'bg-[#242424] border-[#333333] text-white focus:border-white'
+                      : isWarm
+                      ? 'bg-white border-[#D5C9B8] text-[#292524] focus:border-[#3D2817]'
+                      : 'bg-white border-zinc-300 text-zinc-900 focus:border-zinc-900'
+                  }`}
                 />
               </div>
 
@@ -174,7 +200,13 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
                   type="text"
                   value={editAuthor}
                   onChange={e => setEditAuthor(e.target.value)}
-                  className="w-full text-xs px-3 py-2 rounded bg-[#242424] border border-[#333333] focus:outline-hidden focus:border-white"
+                  className={`w-full text-xs px-3 py-2 rounded border focus:outline-hidden ${
+                    isDark
+                      ? 'bg-[#242424] border-[#333333] text-white focus:border-white'
+                      : isWarm
+                      ? 'bg-white border-[#D5C9B8] text-[#292524] focus:border-[#3D2817]'
+                      : 'bg-white border-zinc-300 text-zinc-900 focus:border-zinc-900'
+                  }`}
                 />
               </div>
 
@@ -186,7 +218,7 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
                       onDeleteBook(editingBook.id);
                       onClose();
                     }}
-                    className="px-3 py-1.5 rounded-full text-xs font-semibold bg-rose-500/15 text-rose-400 hover:bg-rose-500/25 flex items-center gap-1.5 transition-colors"
+                    className="px-3 py-1.5 rounded-full text-xs font-semibold bg-rose-500/15 text-rose-500 hover:bg-rose-500/25 flex items-center gap-1.5 transition-colors"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                     <span>Remove from Library</span>
@@ -203,7 +235,13 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
                   </button>
                   <button
                     type="submit"
-                    className="px-4 py-1.5 text-xs font-semibold bg-[#1DB954] text-black rounded-full"
+                    className={`px-4 py-1.5 text-xs font-semibold rounded-full ${
+                      isDark
+                        ? 'bg-[#1DB954] text-black'
+                        : isWarm
+                        ? 'bg-[#3D2817] text-amber-100'
+                        : 'bg-zinc-900 text-white'
+                    }`}
                   >
                     Save
                   </button>
@@ -231,14 +269,22 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
                     ? 'border-[#1DB954] bg-[#1DB954]/5 cursor-wait'
                     : isDragging
                     ? 'border-[#1DB954] bg-[#1DB954]/10'
-                    : 'border-[#333333] hover:border-[#555555] bg-[#121212]'
+                    : isDark
+                    ? 'border-[#333333] hover:border-[#555555] bg-[#121212]'
+                    : isWarm
+                    ? 'border-[#D5C9B8] hover:border-[#3D2817] bg-[#F3EDE0]'
+                    : 'border-zinc-300 hover:border-zinc-500 bg-zinc-50'
                 }`}
               >
                 <div
                   className={`w-12 h-12 rounded-full flex items-center justify-center transition-colors ${
                     isProcessing
                       ? 'bg-[#1DB954]/20 text-[#1DB954]'
-                      : 'bg-[#242424] text-white'
+                      : isDark
+                      ? 'bg-[#242424] text-white'
+                      : isWarm
+                      ? 'bg-[#E5DEC9] text-[#292524]'
+                      : 'bg-zinc-200 text-zinc-800'
                   }`}
                 >
                   {isProcessing ? (
@@ -262,10 +308,18 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
                     <p className="text-sm font-semibold mb-1">
                       Drop your PDF file here
                     </p>
-                    <p className="text-xs opacity-50 mb-3">
+                    <p className="text-xs opacity-60 mb-3">
                       or click to browse from your computer
                     </p>
-                    <span className="inline-block px-4 py-1.5 rounded-full text-xs font-semibold bg-white text-black hover:bg-zinc-200 transition-colors shadow-xs">
+                    <span
+                      className={`inline-block px-4 py-1.5 rounded-full text-xs font-semibold transition-colors shadow-xs ${
+                        isDark
+                          ? 'bg-white text-black hover:bg-zinc-200'
+                          : isWarm
+                          ? 'bg-[#3D2817] text-amber-100 hover:bg-[#2B1B0E]'
+                          : 'bg-zinc-900 text-white hover:bg-zinc-800'
+                      }`}
+                    >
                       Select PDF
                     </span>
                   </div>
@@ -273,7 +327,7 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
               </div>
 
               <div className="mt-4 text-center">
-                <p className="text-[11px] opacity-40">
+                <p className="text-[11px] opacity-60">
                   Writer, title, and page count are detected automatically from your PDF.
                 </p>
               </div>

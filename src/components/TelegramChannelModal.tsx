@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Book, TelegramConfigStatus, TelegramPdfItem } from '../types/library';
+import { AppTheme, Book, TelegramConfigStatus, TelegramPdfItem } from '../types/library';
 import {
   fetchTelegramStatus,
   fetchExploreChannelFeed,
@@ -36,6 +36,7 @@ interface TelegramChannelModalProps {
   onToggleAutoSync: (enabled: boolean) => void;
   existingBooks: Book[];
   onBookImported: (book: Book) => void;
+  theme?: AppTheme;
 }
 
 export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
@@ -47,7 +48,52 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
   onToggleAutoSync,
   existingBooks,
   onBookImported,
+  theme = 'spotify-dark',
 }) => {
+  const isDark = theme === 'spotify-dark';
+  const isWarm = theme === 'warm-minimal';
+
+  const modalShell = isDark
+    ? 'bg-[#181818] text-white border-[#282828]'
+    : isWarm
+    ? 'bg-[#FAF6EE] text-[#292524] border-[#E2D9C5]'
+    : 'bg-white text-zinc-900 border-zinc-200';
+
+  const modalHeader = isDark
+    ? 'bg-[#1F1F1F] border-[#282828]'
+    : isWarm
+    ? 'bg-[#F2EBDD] border-[#E2D9C5]'
+    : 'bg-zinc-50 border-zinc-200';
+
+  const innerCard = isDark
+    ? 'bg-[#121212] border-[#282828]'
+    : isWarm
+    ? 'bg-[#F3EDE0] border-[#E2D9C5]'
+    : 'bg-zinc-50 border-zinc-200';
+
+  const inputClass = isDark
+    ? 'bg-[#121212] border-[#333333] text-white placeholder-zinc-500 focus:border-[#1DB954]'
+    : isWarm
+    ? 'bg-white border-[#D5C9B8] text-[#292524] placeholder-[#8A7968] focus:border-[#3D2817]'
+    : 'bg-white border-zinc-300 text-zinc-900 placeholder-zinc-400 focus:border-zinc-900';
+
+  const mutedText = isDark
+    ? 'text-[#B3B3B3]'
+    : isWarm
+    ? 'text-[#78716C]'
+    : 'text-zinc-500';
+
+  const primaryBtn = isDark
+    ? 'bg-[#1DB954] text-black hover:bg-[#1ed760]'
+    : isWarm
+    ? 'bg-[#3D2817] text-amber-100 hover:bg-[#2B1B0E]'
+    : 'bg-zinc-900 text-white hover:bg-zinc-800';
+
+  const secondaryBtn = isDark
+    ? 'bg-[#282828] hover:bg-[#333333] text-white'
+    : isWarm
+    ? 'bg-[#E5DEC9] hover:bg-[#D8CEB5] text-[#292524]'
+    : 'bg-zinc-200 hover:bg-zinc-300 text-zinc-900';
   const [status, setStatus] = useState<TelegramConfigStatus>(() => ({
     configured: Boolean(getStoredTelegramSession()),
     hasApiId: true,
@@ -309,10 +355,10 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
   const localSessionString = getStoredTelegramSession();
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xs select-none">
-      <div className="bg-[#181818] text-white w-full max-w-xl rounded-2xl shadow-2xl border border-[#282828] overflow-hidden flex flex-col max-h-[88vh]">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-xs select-none">
+      <div className={`w-full max-w-xl rounded-2xl shadow-2xl border overflow-hidden flex flex-col max-h-[88vh] transition-colors ${modalShell}`}>
         {/* Header */}
-        <div className="px-5 py-4 bg-[#1F1F1F] border-b border-[#282828] flex items-center justify-between">
+        <div className={`px-5 py-4 border-b flex items-center justify-between ${modalHeader}`}>
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-xl bg-[#1DB954]/15 text-[#1DB954] flex items-center justify-center">
               <Send className="w-4 h-4" />
@@ -321,7 +367,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
               <h2 className="text-sm font-bold tracking-tight flex items-center gap-2">
                 <span>Multi-Channel Telegram Sync &amp; Explore Server</span>
               </h2>
-              <p className="text-[11px] text-[#B3B3B3]">
+              <p className={`text-[11px] ${mutedText}`}>
                 Connect multiple book channels so all PDFs appear automatically in Explore for every user
               </p>
             </div>
@@ -329,7 +375,9 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
 
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg opacity-60 hover:opacity-100 hover:bg-[#282828] transition-all"
+            className={`p-1.5 rounded-lg opacity-60 hover:opacity-100 transition-all ${
+              isDark ? 'hover:bg-[#282828]' : 'hover:bg-black/5'
+            }`}
             aria-label="Close Telegram Sync modal"
           >
             <X className="w-4 h-4" />
@@ -340,12 +388,12 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
         <div className="p-5 overflow-y-auto space-y-4 flex-1">
           {/* Step 1: In-App Phone Sign-In */}
           {!status.configured ? (
-            <div className="p-4 rounded-xl bg-[#121212] border border-[#282828] space-y-3">
+            <div className={`p-4 rounded-xl border space-y-3 ${innerCard}`}>
               <div className="flex items-center gap-2 text-xs font-semibold text-[#1DB954]">
                 <Smartphone className="w-4 h-4" />
                 <span>Step 1: Sign In with Your Server Telegram Account</span>
               </div>
-              <p className="text-[11px] text-[#B3B3B3] leading-relaxed">
+              <p className={`text-[11px] leading-relaxed ${mutedText}`}>
                 Sign in once with the Telegram account that has joined your book channels:
               </p>
 
@@ -356,12 +404,12 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                     value={phoneNumber}
                     onChange={e => setPhoneNumber(e.target.value)}
                     placeholder="+1 234 567 8900 (with country code)"
-                    className="flex-1 text-xs px-3.5 py-2.5 rounded-xl bg-[#181818] border border-[#333333] text-white placeholder-zinc-500 focus:outline-hidden focus:border-[#1DB954]"
+                    className={`flex-1 text-xs px-3.5 py-2.5 rounded-xl border focus:outline-hidden ${inputClass}`}
                   />
                   <button
                     type="submit"
                     disabled={isAuthBusy}
-                    className="px-4 py-2.5 rounded-xl text-xs font-semibold bg-[#1DB954] text-black hover:bg-[#1ed760] flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                    className={`px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors disabled:opacity-50 ${primaryBtn}`}
                   >
                     {isAuthBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
                     <span>Send Login Code</span>
@@ -375,12 +423,12 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                       value={phoneCode}
                       onChange={e => setPhoneCode(e.target.value)}
                       placeholder="5-digit code from Telegram app"
-                      className="flex-1 text-xs px-3.5 py-2.5 rounded-xl bg-[#181818] border border-[#333333] text-white placeholder-zinc-500 focus:outline-hidden focus:border-[#1DB954]"
+                      className={`flex-1 text-xs px-3.5 py-2.5 rounded-xl border focus:outline-hidden ${inputClass}`}
                     />
                     <button
                       type="submit"
                       disabled={isAuthBusy}
-                      className="px-4 py-2.5 rounded-xl text-xs font-semibold bg-[#1DB954] text-black hover:bg-[#1ed760] flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                      className={`px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors disabled:opacity-50 ${primaryBtn}`}
                     >
                       {isAuthBusy ? (
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -397,7 +445,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                       value={twoFaPassword}
                       onChange={e => setTwoFaPassword(e.target.value)}
                       placeholder="Telegram 2-Step Verification (2FA) Password"
-                      className="w-full text-xs px-3.5 py-2.5 rounded-xl bg-[#181818] border border-amber-500/50 text-white placeholder-zinc-500 focus:outline-hidden focus:border-[#1DB954]"
+                      className={`w-full text-xs px-3.5 py-2.5 rounded-xl border focus:outline-hidden ${inputClass}`}
                     />
                   )}
 
@@ -407,7 +455,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                       setCodeSent(false);
                       setNeedsPassword(false);
                     }}
-                    className="text-[11px] text-[#B3B3B3] hover:text-white underline"
+                    className={`text-[11px] underline ${mutedText}`}
                   >
                     Change phone number
                   </button>
@@ -424,35 +472,33 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                 <button
                   type="button"
                   onClick={handleLogout}
-                  className="text-[11px] text-[#B3B3B3] hover:text-white flex items-center gap-1 px-2 py-1 rounded hover:bg-white/10 transition-colors"
+                  className={`text-[11px] flex items-center gap-1 px-2 py-1 rounded hover:bg-black/10 transition-colors ${mutedText}`}
                 >
                   <LogOut className="w-3 h-3" />
                   <span>Disconnect</span>
                 </button>
               </div>
 
-              {/* Server Owner Config Box: Lets owner make this global for ALL users on Vercel */}
               {localSessionString && (
-                <div className="p-3 rounded-lg bg-[#121212] border border-[#282828] space-y-2 text-[11px]">
+                <div className={`p-3 rounded-lg border space-y-2 text-[11px] ${innerCard}`}>
                   <div className="flex items-center justify-between gap-2">
-                    <span className="font-semibold text-white flex items-center gap-1.5">
+                    <span className="font-semibold flex items-center gap-1.5">
                       <Server className="w-3.5 h-3.5 text-[#1DB954]" />
                       <span>Make Global for All New Users (Vercel Env Vars):</span>
                     </span>
                     <button
                       type="button"
                       onClick={handleCopySessionForServer}
-                      className="px-2.5 py-1 rounded bg-[#1DB954] text-black font-semibold flex items-center gap-1 hover:bg-[#1ed760] transition-colors"
+                      className={`px-2.5 py-1 rounded font-semibold flex items-center gap-1 transition-colors ${primaryBtn}`}
                     >
                       {copiedSession ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
                       <span>{copiedSession ? 'Copied Session!' : 'Copy TELEGRAM_SESSION'}</span>
                     </button>
                   </div>
-                  <p className="text-[#B3B3B3] leading-relaxed">
+                  <p className={`${mutedText} leading-relaxed`}>
                     To let <strong>every visitor</strong> see your channels in <strong>Explore</strong> without logging in: paste this copied value as{' '}
-                    <code className="text-emerald-400">TELEGRAM_SESSION</code> and your channel list as{' '}
-                    <code className="text-emerald-400">TELEGRAM_CHANNELS</code> (e.g.{' '}
-                    <code className="text-white">@channel1,@channel2</code>) in your Vercel Project → Settings → Environment Variables.
+                    <code className="text-emerald-600 font-semibold">TELEGRAM_SESSION</code> and your channel list as{' '}
+                    <code className="text-emerald-600 font-semibold">TELEGRAM_CHANNELS</code> in your environment variables.
                   </p>
                 </div>
               )}
@@ -461,7 +507,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
 
           {/* Multi-Channel Input */}
           <form onSubmit={handleScanChannel} className="space-y-2">
-            <label className="block text-xs font-semibold text-[#B3B3B3]">
+            <label className={`block text-xs font-semibold ${mutedText}`}>
               Telegram Book Channels (comma-separated for multiple channels)
             </label>
             <div className="flex gap-2">
@@ -470,12 +516,12 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                 value={channelInput}
                 onChange={e => setChannelInput(e.target.value)}
                 placeholder="@SciFiBooks, @HistoryPDFs, @PhilosophyClub"
-                className="flex-1 text-xs px-3.5 py-2.5 rounded-xl bg-[#121212] border border-[#333333] text-white placeholder-zinc-500 focus:outline-hidden focus:border-[#1DB954]"
+                className={`flex-1 text-xs px-3.5 py-2.5 rounded-xl border focus:outline-hidden ${inputClass}`}
               />
               <button
                 type="submit"
                 disabled={isLoadingList || isSyncingNewest}
-                className="px-4 py-2.5 rounded-xl text-xs font-semibold bg-[#282828] hover:bg-[#333333] text-white flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                className={`px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors disabled:opacity-50 ${secondaryBtn}`}
               >
                 {isLoadingList ? (
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -488,7 +534,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
           </form>
 
           {/* Auto-Sync Toggle + 1-Click Fetch Newest */}
-          <div className="p-3.5 rounded-xl bg-[#121212] border border-[#282828] flex flex-wrap items-center justify-between gap-3">
+          <div className={`p-3.5 rounded-xl border flex flex-wrap items-center justify-between gap-3 ${innerCard}`}>
             <label className="flex items-center gap-2.5 cursor-pointer">
               <input
                 type="checkbox"
@@ -500,13 +546,13 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                 }}
                 className="sr-only peer"
               />
-              <div className="w-9 h-5 bg-[#282828] peer-checked:bg-[#1DB954] rounded-full relative transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-4" />
+              <div className="w-9 h-5 bg-zinc-400/50 peer-checked:bg-[#1DB954] rounded-full relative transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-4" />
               <div>
                 <div className="text-xs font-semibold flex items-center gap-1.5">
                   <Radio className={`w-3.5 h-3.5 ${autoSync ? 'text-[#1DB954] animate-pulse' : 'opacity-50'}`} />
                   <span>Auto-Download Newest PDF</span>
                 </div>
-                <p className="text-[11px] text-[#B3B3B3]">
+                <p className={`text-[11px] ${mutedText}`}>
                   Automatically pulls the newest PDF from all listed channels
                 </p>
               </div>
@@ -516,7 +562,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
               type="button"
               onClick={handleSyncNewestPdfNow}
               disabled={isSyncingNewest || isLoadingList}
-              className="px-4 py-2 rounded-full text-xs font-semibold bg-[#1DB954] text-black hover:bg-[#1ed760] flex items-center gap-1.5 transition-all shadow-xs disabled:opacity-50"
+              className={`px-4 py-2 rounded-full text-xs font-semibold flex items-center gap-1.5 transition-all shadow-xs disabled:opacity-50 ${primaryBtn}`}
             >
               {isSyncingNewest ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -529,15 +575,15 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
 
           {/* Feedback Banners */}
           {errorMessage && (
-            <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-200 text-xs flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+            <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-500 text-xs flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
               <span>{errorMessage}</span>
             </div>
           )}
 
           {successBanner && (
-            <div className="p-3 rounded-xl bg-[#1DB954]/15 border border-[#1DB954]/40 text-emerald-200 text-xs flex items-start gap-2">
-              <CheckCircle2 className="w-4 h-4 text-[#1DB954] shrink-0 mt-0.5" />
+            <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-600 text-xs flex items-start gap-2">
+              <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
               <span>{successBanner}</span>
             </div>
           )}
@@ -545,7 +591,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
           {/* Multi-Channel PDF Feed */}
           {pdfs.length > 0 && (
             <div className="space-y-2">
-              <div className="flex items-center justify-between text-xs text-[#B3B3B3] px-1">
+              <div className={`flex items-center justify-between text-xs px-1 ${mutedText}`}>
                 <span>Recent PDFs across connected channels</span>
                 <span className="font-mono text-[11px]">{pdfs.length} PDFs found</span>
               </div>
@@ -559,10 +605,10 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                   return (
                     <div
                       key={key}
-                      className="p-3 rounded-xl bg-[#121212] border border-[#242424] hover:border-[#333333] flex items-center justify-between gap-3 transition-colors"
+                      className={`p-3 rounded-xl border flex items-center justify-between gap-3 transition-colors ${innerCard}`}
                     >
                       <div className="flex items-center gap-3 min-w-0">
-                        <div className="w-8 h-8 rounded-lg bg-[#242424] flex items-center justify-center shrink-0 text-[#1DB954]">
+                        <div className="w-8 h-8 rounded-lg bg-[#1DB954]/15 flex items-center justify-center shrink-0 text-[#1DB954]">
                           <FileText className="w-4 h-4" />
                         </div>
                         <div className="min-w-0">
@@ -576,7 +622,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                               {item.cleanTitle || item.fileName.replace(/\.pdf$/i, '')}
                             </p>
                           </div>
-                          <p className="text-[11px] text-[#B3B3B3] truncate">
+                          <p className={`text-[11px] truncate ${mutedText}`}>
                             {formatBytes(item.fileSize)} · {new Date(item.date).toLocaleDateString()}
                             {item.caption ? ` · ${item.caption}` : ''}
                           </p>
@@ -584,7 +630,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                       </div>
 
                       {imported ? (
-                        <span className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-white/5 text-[#1DB954] flex items-center gap-1 shrink-0">
+                        <span className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-[#1DB954]/15 text-[#1DB954] flex items-center gap-1 shrink-0">
                           <CheckCircle2 className="w-3.5 h-3.5" />
                           <span>In Library</span>
                         </span>
@@ -593,7 +639,7 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
                           type="button"
                           onClick={() => handleImportSinglePdf(item)}
                           disabled={isDownloading}
-                          className="px-3 py-1.5 rounded-full text-xs font-semibold bg-white text-black hover:bg-zinc-200 flex items-center gap-1.5 shrink-0 transition-colors disabled:opacity-50"
+                          className={`px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-colors disabled:opacity-50 ${primaryBtn}`}
                         >
                           {isDownloading ? (
                             <Loader2 className="w-3.5 h-3.5 animate-spin" />

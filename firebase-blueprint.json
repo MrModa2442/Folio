@@ -1,0 +1,190 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Public reader profile for cross-device library sync.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Reader display name.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Avatar photo URL.",
+          "minLength": 0,
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was last updated."
+        }
+      },
+      "required": ["uid", "displayName", "photoURL", "createdAt", "updatedAt"]
+    },
+    "ReadingProgress": {
+      "title": "ReadingProgress",
+      "description": "Real-time per-book reading position and annotation counters synced via Firestore.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "bookId": {
+          "type": "string",
+          "description": "Normalized book identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Book title.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "author": {
+          "type": "string",
+          "description": "Book author.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "currentPage": {
+          "type": "integer",
+          "description": "Current page number (1-indexed)."
+        },
+        "totalPages": {
+          "type": "integer",
+          "description": "Total page count."
+        },
+        "bookmarkCount": {
+          "type": "integer",
+          "description": "Count of pinned bookmarks in this book."
+        },
+        "highlightCount": {
+          "type": "integer",
+          "description": "Count of highlighted pages in this book."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "bookId",
+        "title",
+        "author",
+        "currentPage",
+        "totalPages",
+        "bookmarkCount",
+        "highlightCount",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PinnedNote": {
+      "title": "PinnedNote",
+      "description": "Individual pinned page note synced in real-time via Firestore.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "noteId": {
+          "type": "string",
+          "description": "Unique identifier for the pinned note.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "bookId": {
+          "type": "string",
+          "description": "Normalized book identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "bookTitle": {
+          "type": "string",
+          "description": "Title of the book.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "page": {
+          "type": "integer",
+          "description": "1-indexed page number."
+        },
+        "note": {
+          "type": "string",
+          "description": "Reader study note or saved dictionary definition.",
+          "minLength": 0,
+          "maxLength": 2000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "noteId",
+        "bookId",
+        "bookTitle",
+        "page",
+        "note",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Stores reader profile document keyed by Firebase Auth UID."
+    },
+    "/users/{userId}/readingProgress/{bookId}": {
+      "schema": { "$ref": "#/entities/ReadingProgress" },
+      "description": "Stores real-time reading position and annotation counters per book."
+    },
+    "/users/{userId}/pinnedNotes/{noteId}": {
+      "schema": { "$ref": "#/entities/PinnedNote" },
+      "description": "Stores real-time pinned page notes and saved vocabulary notes."
+    }
+  }
+}

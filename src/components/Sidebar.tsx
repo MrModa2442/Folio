@@ -1,5 +1,6 @@
 import React from 'react';
-import { BookOpen, Bookmark, CheckCircle2, Lock, Globe, Plus, Smartphone, Highlighter } from 'lucide-react';
+import { BookOpen, Bookmark, CheckCircle2, Lock, Globe, Plus, Highlighter, Cloud } from 'lucide-react';
+import type { User } from 'firebase/auth';
 import { Booklist, ReadingStatus, AppTheme } from '../types/library';
 
 interface SidebarProps {
@@ -11,6 +12,7 @@ interface SidebarProps {
   readingBooksCount: number;
   finishedBooksCount: number;
   annotationsCount: number;
+  currentUser?: User | null;
   onSelectList: (id: string | null) => void;
   onSelectStatus: (status: ReadingStatus | 'all') => void;
   onSelectNotesHub: () => void;
@@ -28,6 +30,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   readingBooksCount,
   finishedBooksCount,
   annotationsCount,
+  currentUser = null,
   onSelectList,
   onSelectStatus,
   onSelectNotesHub,
@@ -222,20 +225,35 @@ export const Sidebar: React.FC<SidebarProps> = ({
         )}
       </div>
 
-      {/* Device Sync Button */}
+      {/* Sign In & Cloud Sync Button */}
       <div className="p-2.5">
         <button
           type="button"
           onClick={onOpenSyncModal}
-          className={`w-full flex items-center justify-center gap-1.5 py-2 rounded-xl text-xs font-semibold border transition-colors ${
+          className={`w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-semibold border transition-colors ${
             isDark
-              ? 'bg-[#181818] border-[#282828] text-white/90 hover:bg-[#242424]'
+              ? 'bg-[#181818] border-[#282828] text-white/95 hover:bg-[#242424]'
               : 'bg-white border-zinc-200 text-zinc-800 hover:bg-zinc-100'
           }`}
-          title="Sync reading progress, bookmarks, and highlights across iPad & phone"
+          title={
+            currentUser
+              ? `Signed in as ${currentUser.email || currentUser.displayName} · Click to manage Cloud Sync`
+              : 'Sign in with Google to back up & sync your books, notes, and highlights'
+          }
         >
-          <Smartphone className="w-3.5 h-3.5 text-[#1DB954]" />
-          <span>Sync Progress & Pins</span>
+          {currentUser ? (
+            <>
+              <span className="w-2 h-2 rounded-full bg-[#1DB954] shrink-0" />
+              <span className="truncate">
+                {currentUser.displayName || currentUser.email?.split('@')[0] || 'Account'} · Synced
+              </span>
+            </>
+          ) : (
+            <>
+              <Cloud className="w-4 h-4 text-[#1DB954] shrink-0" />
+              <span>Sign In &amp; Cloud Sync</span>
+            </>
+          )}
         </button>
       </div>
     </aside>

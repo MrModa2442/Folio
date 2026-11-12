@@ -1,13 +1,14 @@
 import React, { useState } from 'react';
-import { Booklist, Collaborator } from '../types/library';
+import { AppTheme, Booklist } from '../types/library';
 import { addCollaborator, removeCollaborator, toggleBooklistPrivacy } from '../utils/library';
-import { X, Lock, Globe, Copy, Check, UserPlus, Users, Trash2, Shield, Eye, Edit3 } from 'lucide-react';
+import { X, Lock, Globe, Copy, Check, UserPlus, Users, Trash2 } from 'lucide-react';
 
 interface CollaboratorsModalProps {
   isOpen: boolean;
   onClose: () => void;
   booklist: Booklist;
   onUpdateBooklist: (updated: Booklist) => void;
+  theme?: AppTheme;
 }
 
 export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
@@ -15,6 +16,7 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
   onClose,
   booklist,
   onUpdateBooklist,
+  theme = 'spotify-dark',
 }) => {
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<'editor' | 'viewer'>('editor');
@@ -22,6 +24,45 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
   const [copiedCode, setCopiedCode] = useState(false);
 
   if (!isOpen) return null;
+
+  const isDark = theme === 'spotify-dark';
+  const isWarm = theme === 'warm-minimal';
+
+  const modalShell = isDark
+    ? 'bg-[#181818] text-white border-[#282828]'
+    : isWarm
+    ? 'bg-[#FAF7F0] text-[#2B1E16] border-[#E5DECF]'
+    : 'bg-white text-zinc-900 border-zinc-200';
+
+  const modalHeader = isDark
+    ? 'bg-[#1F1F1F] border-[#282828]'
+    : isWarm
+    ? 'bg-[#F2EBDE] border-[#E5DECF]'
+    : 'bg-zinc-50 border-zinc-200';
+
+  const innerCard = isDark
+    ? 'bg-[#121212] border-[#282828]'
+    : isWarm
+    ? 'bg-[#F5EFE6] border-[#E5DECF]'
+    : 'bg-zinc-50 border-zinc-200';
+
+  const inputClass = isDark
+    ? 'border-[#333333] bg-[#242424] text-white'
+    : isWarm
+    ? 'border-[#D5C9B8] bg-white text-[#2B1E16]'
+    : 'border-zinc-300 bg-white text-zinc-900';
+
+  const mutedText = isDark
+    ? 'text-[#B3B3B3]'
+    : isWarm
+    ? 'text-[#7A6B5C]'
+    : 'text-zinc-500';
+
+  const primaryBtn = isDark
+    ? 'bg-[#1DB954] text-black hover:bg-[#1ed760]'
+    : isWarm
+    ? 'bg-[#3D2817] text-amber-100 hover:bg-[#25170C]'
+    : 'bg-zinc-900 text-white hover:bg-zinc-800';
 
   const handleCopyLink = () => {
     const url = `${window.location.origin}/?shelf=${booklist.id}&invite=${booklist.inviteCode}`;
@@ -66,22 +107,22 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
-      <div className="bg-[#FAF7F0] w-full max-w-lg rounded-xl shadow-2xl border border-[#E5DECF] overflow-hidden flex flex-col max-h-[90vh]">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
+      <div className={`w-full max-w-lg rounded-xl shadow-2xl border overflow-hidden flex flex-col max-h-[90vh] transition-colors ${modalShell}`}>
         {/* Header */}
-        <div className="px-6 py-4 bg-[#F2EBDE] border-b border-[#E5DECF] flex items-center justify-between">
+        <div className={`px-6 py-4 border-b flex items-center justify-between ${modalHeader}`}>
           <div>
-            <h2 className="font-serif text-xl font-bold text-[#2B1E16] flex items-center gap-2">
-              <Users className="w-5 h-5 text-amber-900" />
+            <h2 className="font-serif text-xl font-bold flex items-center gap-2">
+              <Users className={`w-5 h-5 ${isDark ? 'text-[#1DB954]' : isWarm ? 'text-amber-900' : 'text-zinc-800'}`} />
               <span>Shelf Access &amp; Collaboration</span>
             </h2>
-            <p className="text-xs text-[#7A6B5C]">
+            <p className={`text-xs ${mutedText}`}>
               Manage who can see and curate &ldquo;{booklist.title}&rdquo;
             </p>
           </div>
           <button
             onClick={onClose}
-            className="p-1 rounded hover:bg-[#E2D8C7] text-[#6B5E51] transition-colors"
+            className="p-1 rounded opacity-70 hover:opacity-100 transition-opacity"
             aria-label="Close modal"
           >
             <X className="w-5 h-5" />
@@ -90,8 +131,8 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
 
         <div className="p-6 overflow-y-auto space-y-6">
           {/* Privacy Toggle Card */}
-          <div className="p-4 bg-[#F5EFE6] rounded-lg border border-[#E5DECF]">
-            <span className="text-xs font-mono uppercase tracking-wider text-[#7A6B5C] font-semibold block mb-2">
+          <div className={`p-4 rounded-lg border ${innerCard}`}>
+            <span className={`text-xs font-mono uppercase tracking-wider font-semibold block mb-2 ${mutedText}`}>
               Shelf Visibility Mode
             </span>
             <div className="grid grid-cols-2 gap-3">
@@ -100,15 +141,19 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
                 onClick={() => handleTogglePrivacy(false)}
                 className={`p-3 rounded-md border text-left transition-all ${
                   !booklist.isPublic
-                    ? 'bg-amber-100/70 border-amber-400 text-amber-950 font-medium'
-                    : 'bg-white border-[#D5C9B8] text-[#6B5E51] hover:bg-[#FAF7F0]'
+                    ? isDark
+                      ? 'bg-[#282828] border-amber-400 text-white font-medium'
+                      : 'bg-amber-100/70 border-amber-400 text-amber-950 font-medium'
+                    : isDark
+                    ? 'bg-[#181818] border-[#333333] text-[#B3B3B3]'
+                    : 'bg-white border-zinc-200 text-zinc-600'
                 }`}
               >
                 <div className="flex items-center gap-1.5 text-xs font-semibold mb-1">
-                  <Lock className="w-3.5 h-3.5 text-amber-900" />
+                  <Lock className="w-3.5 h-3.5 text-amber-500" />
                   <span>Private (Invite Only)</span>
                 </div>
-                <p className="text-[11px] text-[#7A6B5C]">
+                <p className={`text-[11px] ${mutedText}`}>
                   Only you and readers with invitations can view this shelf.
                 </p>
               </button>
@@ -118,15 +163,19 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
                 onClick={() => handleTogglePrivacy(true)}
                 className={`p-3 rounded-md border text-left transition-all ${
                   booklist.isPublic
-                    ? 'bg-emerald-100/70 border-emerald-400 text-emerald-950 font-medium'
-                    : 'bg-white border-[#D5C9B8] text-[#6B5E51] hover:bg-[#FAF7F0]'
+                    ? isDark
+                      ? 'bg-[#282828] border-[#1DB954] text-white font-medium'
+                      : 'bg-emerald-100/70 border-emerald-400 text-emerald-950 font-medium'
+                    : isDark
+                    ? 'bg-[#181818] border-[#333333] text-[#B3B3B3]'
+                    : 'bg-white border-zinc-200 text-zinc-600'
                 }`}
               >
                 <div className="flex items-center gap-1.5 text-xs font-semibold mb-1">
-                  <Globe className="w-3.5 h-3.5 text-emerald-800" />
+                  <Globe className="w-3.5 h-3.5 text-emerald-500" />
                   <span>Public Community</span>
                 </div>
-                <p className="text-[11px] text-[#7A6B5C]">
+                <p className={`text-[11px] ${mutedText}`}>
                   Discoverable by everyone in the Explore Shelves feed.
                 </p>
               </button>
@@ -135,7 +184,7 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
 
           {/* Share Links & Invite Code */}
           <div>
-            <span className="text-xs font-semibold text-[#3D2817] block mb-2">
+            <span className="text-xs font-semibold block mb-2">
               {booklist.isPublic ? 'Public Share Link' : 'Secret Invite Link & Passcode'}
             </span>
             <div className="space-y-2">
@@ -144,28 +193,28 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
                   type="text"
                   readOnly
                   value={`${window.location.origin}/?shelf=${booklist.id}${!booklist.isPublic ? `&invite=${booklist.inviteCode}` : ''}`}
-                  className="flex-1 text-xs px-3 py-2 rounded border border-[#D5C9B8] bg-white font-mono text-[#5C4F42]"
+                  className={`flex-1 text-xs px-3 py-2 rounded border font-mono ${inputClass}`}
                 />
                 <button
                   onClick={handleCopyLink}
-                  className="px-3.5 py-2 text-xs font-medium bg-[#3D2817] text-amber-100 hover:bg-[#25170C] rounded transition-colors flex items-center gap-1.5 whitespace-nowrap"
+                  className={`px-3.5 py-2 text-xs font-medium rounded transition-colors flex items-center gap-1.5 whitespace-nowrap ${primaryBtn}`}
                 >
-                  {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                  {copiedLink ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                   <span>{copiedLink ? 'Copied Link!' : 'Copy Link'}</span>
                 </button>
               </div>
 
               {!booklist.isPublic && (
-                <div className="flex items-center justify-between p-2.5 bg-[#F5EFE6] rounded border border-[#E5DECF] text-xs">
+                <div className={`flex items-center justify-between p-2.5 rounded border text-xs ${innerCard}`}>
                   <div>
-                    <span className="text-[#7A6B5C] mr-2">Secret Invite Code:</span>
-                    <span className="font-mono font-bold text-amber-900 bg-amber-100/80 px-2 py-0.5 rounded">
+                    <span className={`${mutedText} mr-2`}>Secret Invite Code:</span>
+                    <span className="font-mono font-bold text-amber-500 bg-amber-500/15 px-2 py-0.5 rounded">
                       {booklist.inviteCode}
                     </span>
                   </div>
                   <button
                     onClick={handleCopyCode}
-                    className="text-xs text-amber-900 hover:underline flex items-center gap-1 font-medium"
+                    className="text-xs text-amber-500 hover:underline flex items-center gap-1 font-medium"
                   >
                     {copiedCode ? 'Copied!' : 'Copy Code'}
                   </button>
@@ -176,7 +225,7 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
 
           {/* Invite Reader by Email */}
           <div>
-            <span className="text-xs font-semibold text-[#3D2817] block mb-2">
+            <span className="text-xs font-semibold block mb-2">
               Invite Reading Partner by Email
             </span>
             <form onSubmit={handleAddCollaborator} className="flex gap-2">
@@ -185,20 +234,20 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
                 required
                 value={inviteEmail}
                 onChange={e => setInviteEmail(e.target.value)}
-                placeholder="reader@bookclub.org or IAmMrModa@gmail.com"
-                className="flex-1 text-xs px-3 py-2 rounded border border-[#D5C9B8] bg-white focus:outline-hidden"
+                placeholder="reader@bookclub.org"
+                className={`flex-1 text-xs px-3 py-2 rounded border focus:outline-hidden ${inputClass}`}
               />
               <select
                 value={inviteRole}
                 onChange={e => setInviteRole(e.target.value as 'editor' | 'viewer')}
-                className="text-xs px-2.5 py-2 rounded border border-[#D5C9B8] bg-white"
+                className={`text-xs px-2.5 py-2 rounded border ${inputClass}`}
               >
                 <option value="editor">Can Add Books (Editor)</option>
                 <option value="viewer">Can Only Read (Viewer)</option>
               </select>
               <button
                 type="submit"
-                className="px-3.5 py-2 text-xs font-semibold bg-[#3D2817] text-amber-100 hover:bg-[#25170C] rounded transition-colors flex items-center gap-1"
+                className={`px-3.5 py-2 text-xs font-semibold rounded transition-colors flex items-center gap-1 ${primaryBtn}`}
               >
                 <UserPlus className="w-3.5 h-3.5" />
                 <span>Invite</span>
@@ -209,26 +258,26 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
           {/* Current Collaborators List */}
           <div>
             <div className="flex items-center justify-between mb-2">
-              <span className="text-xs font-mono uppercase tracking-wider text-[#7A6B5C] font-semibold">
+              <span className={`text-xs font-mono uppercase tracking-wider font-semibold ${mutedText}`}>
                 Readers with Access ({1 + booklist.collaborators.length})
               </span>
             </div>
 
-            <div className="divide-y divide-[#EAE2D4] border border-[#E5DECF] rounded-lg bg-white overflow-hidden text-xs">
+            <div className={`divide-y border rounded-lg overflow-hidden text-xs ${innerCard} ${isDark ? 'divide-[#242424]' : 'divide-zinc-200'}`}>
               {/* Shelf Owner */}
               <div className="p-3 flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <div className="w-7 h-7 rounded-full bg-[#3D2817] text-amber-200 flex items-center justify-center font-serif text-xs font-bold">
+                  <div className="w-7 h-7 rounded-full bg-amber-900 text-amber-100 flex items-center justify-center font-serif text-xs font-bold">
                     {booklist.ownerName.charAt(0)}
                   </div>
                   <div>
-                    <p className="font-semibold text-[#2B1E16]">
-                      {booklist.ownerName} <span className="text-[#8A7968] font-normal">(Creator)</span>
+                    <p className="font-semibold">
+                      {booklist.ownerName} <span className={`${mutedText} font-normal`}>(Creator)</span>
                     </p>
-                    <p className="text-[11px] text-[#8A7968]">{booklist.ownerEmail}</p>
+                    <p className={`text-[11px] ${mutedText}`}>{booklist.ownerEmail}</p>
                   </div>
                 </div>
-                <span className="text-[10px] font-mono uppercase bg-amber-100 text-amber-900 px-2 py-0.5 rounded font-semibold">
+                <span className="text-[10px] font-mono uppercase bg-amber-500/20 text-amber-500 px-2 py-0.5 rounded font-semibold">
                   Owner
                 </span>
               </div>
@@ -244,18 +293,18 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
                       {c.name.charAt(0)}
                     </div>
                     <div>
-                      <p className="font-semibold text-[#2B1E16]">{c.name}</p>
-                      <p className="text-[11px] text-[#8A7968]">{c.email}</p>
+                      <p className="font-semibold">{c.name}</p>
+                      <p className={`text-[11px] ${mutedText}`}>{c.email}</p>
                     </div>
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-mono uppercase bg-[#F3EDE2] text-[#5C4F42] px-2 py-0.5 rounded capitalize">
+                    <span className={`text-[10px] font-mono uppercase px-2 py-0.5 rounded capitalize ${mutedText}`}>
                       {c.role}
                     </span>
                     <button
                       onClick={() => handleRemoveCollaborator(c.id)}
-                      className="p-1 rounded hover:bg-rose-100 text-rose-700 transition-colors"
+                      className="p-1 rounded hover:bg-rose-500/15 text-rose-500 transition-colors"
                       title="Revoke access"
                       aria-label={`Revoke access for ${c.name}`}
                     >
@@ -266,7 +315,7 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
               ))}
 
               {booklist.collaborators.length === 0 && (
-                <div className="p-4 text-center text-[#8A7968] text-xs italic">
+                <div className={`p-4 text-center text-xs italic ${mutedText}`}>
                   No other collaborators yet. Invite reading companions above or share the secret link.
                 </div>
               )}
@@ -275,10 +324,10 @@ export const CollaboratorsModal: React.FC<CollaboratorsModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="px-6 py-3 bg-[#F2EBDE] border-t border-[#E5DECF] flex justify-end">
+        <div className={`px-6 py-3 border-t flex justify-end ${modalHeader}`}>
           <button
             onClick={onClose}
-            className="px-5 py-2 text-xs font-semibold text-amber-100 bg-[#3D2817] hover:bg-[#25170C] rounded shadow-sm transition-colors"
+            className={`px-5 py-2 text-xs font-semibold rounded shadow-sm transition-colors ${primaryBtn}`}
           >
             Done
           </button>

@@ -6,6 +6,13 @@ import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import telegramHandler, { normalizeTelegramChannel } from './api/telegram.js';
 import ocrHandler from './api/ocr.js';
+import dictionaryHandler from './api/dictionary.js';
+import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
+import {
+  getUserLibraryFromSql,
+  syncUserLibraryToSql,
+  saveVocabularyToSql,
+} from './src/db/users.ts';
 
 export { normalizeTelegramChannel };
 
@@ -24,9 +31,70 @@ async function startServer() {
     return telegramHandler(req, res);
   });
 
-  // Fast Gemini Flash-Lite OCR endpoint for scanning PDF pages
+  // Fast Gemini OCR endpoint for scanning PDF pages
   app.use('/api/ocr', (req, res) => {
     return ocrHandler(req, res);
+  });
+
+  // Instant On-Page Dictionary, Word Translator & Literary Explainer endpoint
+  app.use('/api/dictionary', (req, res) => {
+    return dictionaryHandler(req, res);
+  });
+
+  // Authenticated Cloud SQL (PostgreSQL) endpoints
+  app.get('/api/cloudsql/library', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user?.uid || '';
+      const email = req.user?.email || 'reader@folio.app';
+      const displayName = req.user?.name || email.split('@')[0] || 'Reader';
+      const data = await getUserLibraryFromSql(uid, email, displayName);
+      res.json(data);
+    } catch (error) {
+      console.error('Failed to fetch Cloud SQL library:', error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to fetch Cloud SQL library',
+      });
+    }
+  });
+
+  app.post('/api/cloudsql/sync', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user?.uid || '';
+      const email = req.user?.email || 'reader@folio.app';
+      const displayName =
+        String(req.body?.displayName || req.user?.name || email.split('@')[0] || 'Reader');
+      const booksInput = Array.isArray(req.body?.books) ? req.body.books : [];
+      const notesInput = Array.isArray(req.body?.notes) ? req.body.notes : [];
+      const data = await syncUserLibraryToSql(uid, email, displayName, booksInput, notesInput);
+      res.json(data);
+    } catch (error) {
+      console.error('Failed to sync library to Cloud SQL:', error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to sync library to Cloud SQL',
+      });
+    }
+  });
+
+  app.post('/api/cloudsql/vocabulary', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user?.uid || '';
+      const email = req.user?.email || 'reader@folio.app';
+      const saved = await saveVocabularyToSql(uid, email, {
+        word: String(req.body?.word || ''),
+        partOfSpeech: String(req.body?.partOfSpeech || ''),
+        persianMeaning: String(req.body?.persianMeaning || ''),
+        englishMeaning: String(req.body?.englishMeaning || ''),
+        contextExplanation: String(req.body?.contextExplanation || ''),
+        bookTitle: String(req.body?.bookTitle || ''),
+        page: Number(req.body?.page) || 1,
+      });
+      res.json({ entry: saved });
+    } catch (error) {
+      console.error('Failed to save vocabulary to Cloud SQL:', error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to save vocabulary to Cloud SQL',
+      });
+    }
   });
 
   // Mount Vite dev server or production static files

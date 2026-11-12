@@ -32,6 +32,14 @@ import {
   normalizeChannelInput,
 } from './services/telegramSync';
 import { deletePdfBlob } from './services/db';
+import {
+  subscribeToAuthChanges,
+  subscribeToFirestoreReadingProgress,
+  syncBookToFirestore,
+  syncBooksWithCloudSql,
+  sanitizeFirestoreId,
+} from './services/cloudSync';
+import type { User } from 'firebase/auth';
 import { Search, LayoutGrid, List as ListIcon, Plus, Send, ArrowUpDown } from 'lucide-react';
 
 // Use clean v3 storage keys to ensure a complete fresh zero-state first-time experience
@@ -114,6 +122,44 @@ export default function App() {
   });
 
   const [autoSyncedNotice, setAutoSyncedNotice] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+
+  // Firebase Auth listener + Real-time Firestore readingProgress subscription
+  useEffect(() => {
+    let unsubFirestore: (() => void) | null = null;
+    const unsubAuth = subscribeToAuthChanges(user => {
+      setCurrentUser(user);
+      if (unsubFirestore) {
+        unsubFirestore();
+        unsubFirestore = null;
+      }
+      if (user) {
+        unsubFirestore = subscribeToFirestoreReadingProgress(user, progressDocs => {
+          if (progressDocs.length === 0) return;
+          setBooks(prev =>
+            prev.map(b => {
+              const safeId = sanitizeFirestoreId(b.id || b.title);
+              const match = progressDocs.find(
+                d =>
+                  d.bookId === safeId ||
+                  d.title.toLowerCase() === b.title.toLowerCase()
+              );
+              if (!match || match.currentPage <= b.currentPage) return b;
+              return {
+                ...b,
+                currentPage: match.currentPage,
+                status: match.currentPage >= b.pageCount ? 'completed' : b.status,
+              };
+            })
+          );
+        });
+      }
+    });
+    return () => {
+      unsubAuth();
+      if (unsubFirestore) unsubFirestore();
+    };
+  }, []);
 
   // Sync to localStorage
   useEffect(() => {
@@ -196,6 +242,11 @@ export default function App() {
           return list;
         })
       );
+    }
+
+    if (currentUser) {
+      syncBookToFirestore(currentUser, book).catch(() => {});
+      syncBooksWithCloudSql([book, ...books.filter(b => b.id !== book.id)]).catch(() => {});
     }
   };
 
@@ -392,6 +443,7 @@ export default function App() {
           }}
           onOpenCreateList={() => setIsCreateListOpen(true)}
           onOpenSyncModal={() => setIsSyncModalOpen(true)}
+          currentUser={currentUser}
           theme={theme}
         />
 
@@ -677,6 +729,7 @@ export default function App() {
         onDeleteBook={handleDeleteBook}
         booklists={booklists}
         editingBook={editingBook}
+        theme={theme}
       />
 
       <TelegramChannelModal
@@ -688,12 +741,14 @@ export default function App() {
         onToggleAutoSync={setTelegramAutoSync}
         existingBooks={books}
         onBookImported={handleSaveBook}
+        theme={theme}
       />
 
       <CreateBooklistModal
         isOpen={isCreateListOpen}
         onClose={() => setIsCreateListOpen(false)}
         onCreateList={handleCreateList}
+        theme={theme}
       />
 
       <SyncProgressModal
@@ -701,6 +756,8 @@ export default function App() {
         onClose={() => setIsSyncModalOpen(false)}
         books={books}
         booklists={booklists}
+        currentUser={currentUser}
+        theme={theme}
         onApplySyncPayload={({ booksProgress, booklists: syncedLists }) => {
           setBooks(prev =>
             prev.map(book => {
@@ -738,6 +795,7 @@ export default function App() {
             onClose={() => setIsShareModalOpen(false)}
             booklist={currentBooklist}
             onUpdateBooklist={handleUpdateBooklist}
+            theme={theme}
           />
 
           <AddBooksToListModal
@@ -746,6 +804,7 @@ export default function App() {
             booklist={currentBooklist}
             allBooks={books}
             onUpdateBooklist={handleUpdateBooklist}
+            theme={theme}
           />
         </>
       )}

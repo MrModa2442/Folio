@@ -319,6 +319,8 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
         ) : (
           <RealPdfViewer
             bookId={book.id}
+            bookTitle={book.title}
+            bookAuthor={book.author}
             arrayBuffer={arrayBuffer}
             initialPage={currentPage}
             onPageChange={handlePageChange}

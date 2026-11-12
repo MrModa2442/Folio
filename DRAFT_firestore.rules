@@ -1,0 +1,214 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Primitives
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function hasValidParentUser(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId)) &&
+        get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+    }
+
+    // Validation Blueprint: UserProfile
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'photoURL', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'photoURL', 'createdAt', 'updatedAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid == request.auth.uid &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        data.photoURL is string && data.photoURL.size() >= 0 && data.photoURL.size() <= 500 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: ReadingProgress
+    function isValidReadingProgress(data) {
+      return data.keys().hasAll([
+          'uid',
+          'bookId',
+          'title',
+          'author',
+          'currentPage',
+          'totalPages',
+          'bookmarkCount',
+          'highlightCount',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'bookId',
+          'title',
+          'author',
+          'currentPage',
+          'totalPages',
+          'bookmarkCount',
+          'highlightCount',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid == request.auth.uid &&
+        data.bookId is string && data.bookId.size() >= 1 && data.bookId.size() <= 128 && data.bookId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+        data.author is string && data.author.size() >= 1 && data.author.size() <= 200 &&
+        data.currentPage is int && data.currentPage >= 1 && data.currentPage <= 50000 &&
+        data.totalPages is int && data.totalPages >= 1 && data.totalPages <= 50000 &&
+        data.bookmarkCount is int && data.bookmarkCount >= 0 && data.bookmarkCount <= 10000 &&
+        data.highlightCount is int && data.highlightCount >= 0 && data.highlightCount <= 50000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: PinnedNote
+    function isValidPinnedNote(data) {
+      return data.keys().hasAll([
+          'uid',
+          'noteId',
+          'bookId',
+          'bookTitle',
+          'page',
+          'note',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'noteId',
+          'bookId',
+          'bookTitle',
+          'page',
+          'note',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid == request.auth.uid &&
+        data.noteId is string && data.noteId.size() >= 1 && data.noteId.size() <= 128 && data.noteId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.bookId is string && data.bookId.size() >= 1 && data.bookId.size() <= 128 && data.bookId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.bookTitle is string && data.bookTitle.size() >= 1 && data.bookTitle.size() <= 200 &&
+        data.page is int && data.page >= 1 && data.page <= 50000 &&
+        data.note is string && data.note.size() >= 0 && data.note.size() <= 2000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Collection: /users/{userId}
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if isOwner(userId) && existing().uid == request.auth.uid;
+
+      allow create: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(userId);
+
+      // Subcollection: /users/{userId}/readingProgress/{bookId}
+      match /readingProgress/{bookId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(bookId) && hasValidParentUser(userId);
+        allow list: if isOwner(userId) && existing().uid == request.auth.uid;
+
+        allow create: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(bookId) &&
+          isValidReadingProgress(incoming()) &&
+          incoming().uid == userId &&
+          incoming().bookId == bookId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+
+        allow update: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(bookId) &&
+          isValidReadingProgress(incoming()) &&
+          incoming().uid == existing().uid &&
+          incoming().bookId == existing().bookId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'author',
+            'currentPage',
+            'totalPages',
+            'bookmarkCount',
+            'highlightCount',
+            'updatedAt'
+          ]) &&
+          hasValidParentUser(userId);
+
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(bookId) && hasValidParentUser(userId);
+      }
+
+      // Subcollection: /users/{userId}/pinnedNotes/{noteId}
+      match /pinnedNotes/{noteId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(noteId) && hasValidParentUser(userId);
+        allow list: if isOwner(userId) && existing().uid == request.auth.uid;
+
+        allow create: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(noteId) &&
+          isValidPinnedNote(incoming()) &&
+          incoming().uid == userId &&
+          incoming().noteId == noteId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          hasValidParentUser(userId);
+
+        allow update: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(noteId) &&
+          isValidPinnedNote(incoming()) &&
+          incoming().uid == existing().uid &&
+          incoming().noteId == existing().noteId &&
+          incoming().bookId == existing().bookId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'bookTitle',
+            'page',
+            'note',
+            'updatedAt'
+          ]) &&
+          hasValidParentUser(userId);
+
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(noteId) && hasValidParentUser(userId);
+      }
+    }
+  }
+}

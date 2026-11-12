@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PageBookmark, PageHighlightStroke } from '../types/library';
 import { loadCachedOcrPages, saveCachedOcrPages } from '../services/ocrCache';
+import { auth } from '../lib/firebase';
 import {
   ChevronLeft,
   ChevronRight,
@@ -22,6 +23,8 @@ import {
   Trash2,
   X,
   Sparkles,
+  Languages,
+  Check,
 } from 'lucide-react';
 
 // Configure the local worker script hosted in public/
@@ -92,8 +95,20 @@ function reverseRtlString(str: string): string {
   return Array.from(str).reverse().join('');
 }
 
+interface DictionaryEntryResult {
+  word: string;
+  pronunciation: string;
+  partOfSpeech: string;
+  persianMeaning: string;
+  englishMeaning: string;
+  contextExplanation: string;
+  isAiEnhanced?: boolean;
+}
+
 interface RealPdfViewerProps {
   bookId?: string;
+  bookTitle?: string;
+  bookAuthor?: string;
   arrayBuffer: ArrayBuffer | null;
   initialPage?: number;
   onPageChange?: (page: number, totalPages: number) => void;
@@ -115,6 +130,8 @@ const HIGHLIGHT_COLORS = [
 
 export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   bookId,
+  bookTitle,
+  bookAuthor,
   arrayBuffer,
   initialPage = 1,
   onPageChange,
@@ -177,6 +194,16 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   // Bookmarks & Notes Drawer state
   const [isBookmarksDrawerOpen, setIsBookmarksDrawerOpen] = useState<boolean>(false);
   const [bookmarkNoteDraft, setBookmarkNoteDraft] = useState<string>('');
+
+  // Instant On-Page Dictionary / Word Translator & Explainer state
+  const [isDictionaryOpen, setIsDictionaryOpen] = useState<boolean>(false);
+  const [dictQuery, setDictQuery] = useState<string>('');
+  const [isDictLoading, setIsDictLoading] = useState<boolean>(false);
+  const [isDictAiEnhancing, setIsDictAiEnhancing] = useState<boolean>(false);
+  const [dictError, setDictError] = useState<string | null>(null);
+  const [dictResult, setDictResult] = useState<DictionaryEntryResult | null>(null);
+  const [dictHistory, setDictHistory] = useState<DictionaryEntryResult[]>([]);
+  const [savedDictToPin, setSavedDictToPin] = useState<boolean>(false);
 
   const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
   const rawPageDimensionsRef = useRef<{ width: number; height: number } | null>(null);
@@ -1126,6 +1153,202 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     executePdfSearch(searchQuery);
   };
 
+  const dictCacheMapRef = useRef<Map<string, DictionaryEntryResult>>(new Map());
+  const dictInflightMapRef = useRef<Map<string, Promise<DictionaryEntryResult>>>(new Map());
+  const activeLookupWordRef = useRef<string>('');
+
+  const fetchDictEntryFast = useCallback(
+    async (
+      cleanTerm: string,
+      mode: 'instant' | 'ai' = 'ai'
+    ): Promise<DictionaryEntryResult> => {
+      const baseKey = cleanTerm.toLowerCase();
+      const cached = dictCacheMapRef.current.get(baseKey);
+      if (cached && (mode === 'instant' || cached.isAiEnhanced)) {
+        return cached;
+      }
+
+      const inflightKey = `${mode}:${baseKey}`;
+      const existingPromise = dictInflightMapRef.current.get(inflightKey);
+      if (existingPromise) return existingPromise;
+
+      const syncCachedText =
+        pageTextCacheRef.current.get(currentPage)?.fullRawText ||
+        (ocrPagesMapRef.current[currentPage] || []).join(' ') ||
+        '';
+
+      const promise = (async () => {
+        try {
+          const res = await fetch('/api/dictionary', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              term: cleanTerm,
+              bookTitle,
+              bookAuthor,
+              pageContext: syncCachedText.slice(0, 600),
+              mode,
+            }),
+          });
+          const data = (await res.json()) as { result?: DictionaryEntryResult; error?: string };
+          if (!res.ok || !data.result) {
+            throw new Error(data.error || 'Could not define or translate this word.');
+          }
+          const currentCached = dictCacheMapRef.current.get(baseKey);
+          if (!currentCached || !currentCached.isAiEnhanced || data.result.isAiEnhanced) {
+            dictCacheMapRef.current.set(baseKey, data.result);
+          }
+          return data.result;
+        } finally {
+          dictInflightMapRef.current.delete(inflightKey);
+        }
+      })();
+
+      dictInflightMapRef.current.set(inflightKey, promise);
+      return promise;
+    },
+    [currentPage, bookTitle, bookAuthor]
+  );
+
+  // Auto-prefetch / progressive lookup after 240ms of typing so both instant and deep AI meanings are ready
+  useEffect(() => {
+    if (!isDictionaryOpen) return;
+    const clean = dictQuery.trim();
+    if (clean.length < 2) return;
+    const timer = setTimeout(() => {
+      const key = clean.toLowerCase();
+      const cached = dictCacheMapRef.current.get(key);
+      if (cached?.isAiEnhanced) {
+        setDictResult(prev => (dictQuery.trim() === clean ? cached : prev));
+        return;
+      }
+
+      // Stage 1: Instant bilingual preview (~150ms)
+      fetchDictEntryFast(clean, 'instant')
+        .then(instantRes => {
+          setDictResult(prev => {
+            if (dictQuery.trim() !== clean) return prev;
+            // Don't overwrite if the full AI result already arrived
+            if (prev && prev.word.toLowerCase() === key && prev.isAiEnhanced) return prev;
+            return instantRes;
+          });
+        })
+        .catch(() => {});
+
+      // Stage 2: Strong Gemini 3.8 Flash literary & lexicographical analysis
+      setIsDictAiEnhancing(true);
+      fetchDictEntryFast(clean, 'ai')
+        .then(aiRes => {
+          setDictResult(prev => (dictQuery.trim() === clean ? aiRes : prev));
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (dictQuery.trim() === clean) {
+            setIsDictAiEnhancing(false);
+          }
+        });
+    }, 240);
+    return () => clearTimeout(timer);
+  }, [dictQuery, isDictionaryOpen, fetchDictEntryFast]);
+
+  // Look up a word or phrase in the Instant On-Page Dictionary (/api/dictionary) with two-stage progressive AI
+  const handleDictionaryLookup = async (termToLookup: string) => {
+    const cleanTerm = termToLookup.trim();
+    if (!cleanTerm) return;
+    const key = cleanTerm.toLowerCase();
+    activeLookupWordRef.current = key;
+    setDictQuery(cleanTerm);
+    setDictError(null);
+    setSavedDictToPin(false);
+
+    const cached = dictCacheMapRef.current.get(key);
+    if (cached?.isAiEnhanced) {
+      setDictResult(cached);
+      setIsDictAiEnhancing(false);
+      return;
+    }
+
+    setIsDictLoading(true);
+    setIsDictAiEnhancing(true);
+
+    // Fire both Instant (~150ms) and Strong AI (Gemini 3.8 Flash) concurrently
+    const instantPromise = fetchDictEntryFast(cleanTerm, 'instant');
+    const aiPromise = fetchDictEntryFast(cleanTerm, 'ai');
+
+    instantPromise
+      .then(instantResult => {
+        if (activeLookupWordRef.current !== key) return;
+        setDictResult(prev => {
+          if (prev && prev.word.toLowerCase() === key && prev.isAiEnhanced) return prev;
+          return instantResult;
+        });
+        setIsDictLoading(false);
+      })
+      .catch(() => {});
+
+    try {
+      const aiResult = await aiPromise;
+      if (activeLookupWordRef.current !== key) return;
+      setDictResult(aiResult);
+      setDictHistory(prev => {
+        const filtered = prev.filter(
+          item => item.word.toLowerCase() !== aiResult.word.toLowerCase()
+        );
+        return [aiResult, ...filtered].slice(0, 8);
+      });
+    } catch (err) {
+      if (activeLookupWordRef.current !== key) return;
+      // Only show error if instant fallback also failed
+      const fallback = dictCacheMapRef.current.get(key);
+      if (!fallback) {
+        setDictError(err instanceof Error ? err.message : 'Dictionary lookup failed.');
+      }
+    } finally {
+      if (activeLookupWordRef.current === key) {
+        setIsDictLoading(false);
+        setIsDictAiEnhancing(false);
+      }
+    }
+  };
+
+  const handleSaveDefinitionToPageNote = () => {
+    if (!dictResult || !onToggleBookmark) return;
+    const summaryNote = `${dictResult.word} (${dictResult.partOfSpeech}): ${dictResult.persianMeaning} | ${dictResult.englishMeaning}`;
+    const existingNote = currentBookmark?.note ? `${currentBookmark.note}\n• ${summaryNote}` : `• ${summaryNote}`;
+    if (currentBookmark && onUpdateBookmarkNote) {
+      onUpdateBookmarkNote(currentBookmark.id, existingNote);
+    } else {
+      onToggleBookmark(currentPage, existingNote);
+    }
+
+    if (auth.currentUser) {
+      auth.currentUser
+        .getIdToken()
+        .then(token =>
+          fetch('/api/cloudsql/vocabulary', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              word: dictResult.word,
+              partOfSpeech: dictResult.partOfSpeech,
+              persianMeaning: dictResult.persianMeaning,
+              englishMeaning: dictResult.englishMeaning,
+              contextExplanation: dictResult.contextExplanation,
+              bookTitle: bookTitle || '',
+              page: currentPage,
+            }),
+          })
+        )
+        .catch(() => {});
+    }
+
+    setSavedDictToPin(true);
+    setTimeout(() => setSavedDictToPin(false), 2500);
+  };
+
   // Zoom presets
   const handleFitWidth = () => {
     if (!containerRef.current || !rawPageDimensionsRef.current) return;
@@ -1321,6 +1544,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             onClick={() => {
               setIsSearchOpen(v => !v);
               setIsBookmarksDrawerOpen(false);
+              setIsDictionaryOpen(false);
             }}
             className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
               isSearchOpen
@@ -1331,6 +1555,24 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           >
             <Search className="w-3.5 h-3.5" />
             <span className="hidden md:inline">Find in PDF</span>
+          </button>
+
+          {/* Instant On-Page Dictionary / Word Translator & Explainer Toggle */}
+          <button
+            type="button"
+            onClick={() => {
+              setIsDictionaryOpen(v => !v);
+              setIsBookmarksDrawerOpen(false);
+            }}
+            className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
+              isDictionaryOpen
+                ? 'bg-sky-400 text-black'
+                : 'bg-white/10 hover:bg-white/20 text-white'
+            }`}
+            title="Instant On-Page Dictionary, Word Translator & Literary Explainer"
+          >
+            <Languages className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Dictionary</span>
           </button>
         </div>
 
@@ -1657,6 +1899,184 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                   </button>
                 );
               })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Instant On-Page Dictionary / Word Translator & Explainer Drawer */}
+      {isDictionaryOpen && (
+        <div className="w-full sm:w-96 sm:right-4 sm:top-12 sm:absolute z-30 bg-[#181818] text-white border border-[#333333] sm:rounded-2xl shadow-2xl p-4 space-y-3.5 max-h-[80vh] overflow-y-auto">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="w-6 h-6 rounded-lg bg-sky-400/15 text-sky-400 flex items-center justify-center">
+                <Languages className="w-3.5 h-3.5" />
+              </span>
+              <div>
+                <h4 className="text-xs font-bold">On-Page Dictionary &amp; Explainer</h4>
+                <p className="text-[10px] text-[#B3B3B3]">
+                  Persian · Arabic · English · Page {currentPage} Context
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsDictionaryOpen(false)}
+              className="p-1 rounded-lg hover:bg-white/10 text-[#B3B3B3] hover:text-white"
+              title="Close Dictionary"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Word or Phrase Input Form */}
+          <form
+            onSubmit={e => {
+              e.preventDefault();
+              handleDictionaryLookup(dictQuery);
+            }}
+            className="flex items-center gap-1.5"
+          >
+            <input
+              type="text"
+              dir="auto"
+              value={dictQuery}
+              onChange={e => setDictQuery(e.target.value)}
+              placeholder="Type a Persian, Arabic, or English word/phrase..."
+              className="flex-1 text-xs px-3 py-2 rounded-lg bg-[#242424] border border-[#383838] text-white focus:outline-hidden focus:border-sky-400"
+              autoFocus
+            />
+            <button
+              type="submit"
+              disabled={isDictLoading || !dictQuery.trim()}
+              className="px-3.5 py-2 rounded-lg bg-sky-400 text-black font-bold text-xs hover:bg-sky-300 disabled:opacity-50 shrink-0 flex items-center gap-1"
+            >
+              {isDictLoading ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>...</span>
+                </>
+              ) : (
+                <span>Define</span>
+              )}
+            </button>
+          </form>
+
+          {dictError && (
+            <div className="text-xs text-rose-400 bg-rose-500/10 border border-rose-500/30 rounded-lg p-2.5">
+              {dictError}
+            </div>
+          )}
+
+          {/* Dictionary Definition & Translation Result Card */}
+          {dictResult && (
+            <div className="p-3.5 rounded-xl bg-[#242424] border border-sky-400/30 space-y-3">
+              <div className="flex items-start justify-between gap-2 border-b border-white/10 pb-2.5">
+                <div dir="auto">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h5 className="text-base font-bold text-white">{dictResult.word}</h5>
+                    {dictResult.partOfSpeech && (
+                      <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-sky-400/20 text-sky-300">
+                        {dictResult.partOfSpeech}
+                      </span>
+                    )}
+                  </div>
+                  {dictResult.pronunciation && (
+                    <p className="text-[11px] font-mono text-[#B3B3B3] mt-0.5">
+                      {dictResult.pronunciation}
+                    </p>
+                  )}
+                </div>
+
+                {onToggleBookmark && (
+                  <button
+                    type="button"
+                    onClick={handleSaveDefinitionToPageNote}
+                    className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-amber-400/20 text-amber-300 hover:bg-amber-400 hover:text-black transition-colors flex items-center gap-1 shrink-0"
+                    title={`Save this word definition to Page ${currentPage} notes`}
+                  >
+                    {savedDictToPin ? (
+                      <>
+                        <Check className="w-3 h-3" />
+                        <span>Saved!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Bookmark className="w-3 h-3" />
+                        <span>Pin to p.{currentPage}</span>
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+
+              {/* Persian Meaning */}
+              {dictResult.persianMeaning && (
+                <div className="space-y-0.5" dir="rtl">
+                  <div className="text-[10px] font-bold text-sky-400">معنی و توضیح فارسی:</div>
+                  <p className="text-xs leading-relaxed text-white/95">
+                    {dictResult.persianMeaning}
+                  </p>
+                </div>
+              )}
+
+              {/* English Meaning */}
+              {dictResult.englishMeaning && (
+                <div className="space-y-0.5" dir="ltr">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-sky-400">
+                    English Meaning:
+                  </div>
+                  <p className="text-xs leading-relaxed text-white/95">
+                    {dictResult.englishMeaning}
+                  </p>
+                </div>
+              )}
+
+              {/* Literary / Page Context Explanation */}
+              {dictResult.contextExplanation ? (
+                <div className="p-2.5 rounded-lg bg-black/35 border border-white/5 space-y-1" dir="auto">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-amber-300 flex items-center gap-1">
+                    <Sparkles className="w-3 h-3" />
+                    <span>Literary &amp; Page Context</span>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-white/85">
+                    {dictResult.contextExplanation}
+                  </p>
+                </div>
+              ) : isDictAiEnhancing ? (
+                <div className="px-2.5 py-2 rounded-lg bg-black/25 border border-white/5 flex items-center gap-2 text-[11px] text-amber-300/90">
+                  <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                  <span>Analyzing deep meaning &amp; literary context with AI...</span>
+                </div>
+              ) : null}
+            </div>
+          )}
+
+          {/* Session Lookup History */}
+          {dictHistory.length > 1 && (
+            <div className="pt-2 border-t border-white/10 space-y-1.5">
+              <span className="text-[10px] uppercase tracking-wider text-[#B3B3B3] font-semibold">
+                Recent Lookups
+              </span>
+              <div className="flex flex-wrap gap-1.5" dir="auto">
+                {dictHistory.map(item => (
+                  <button
+                    key={item.word}
+                    type="button"
+                    onClick={() => {
+                      setDictResult(item);
+                      setDictQuery(item.word);
+                    }}
+                    className={`px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors ${
+                      dictResult?.word === item.word
+                        ? 'bg-sky-400 text-black font-bold'
+                        : 'bg-[#242424] text-[#B3B3B3] hover:text-white'
+                    }`}
+                  >
+                    {item.word}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </div>
