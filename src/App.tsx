@@ -1,5 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { Book, Booklist, ReadingStatus, ViewMode, SortOption, AppTheme } from './types/library';
+import {
+  Book,
+  Booklist,
+  ReadingStatus,
+  ViewMode,
+  SortOption,
+  AppTheme,
+  SavedVocabularyItem,
+  UiSectionPreferences,
+  DEFAULT_UI_PREFERENCES,
+} from './types/library';
 import { INITIAL_BOOKS, INITIAL_BOOKLISTS } from './data/initialData';
 import {
   filterBooks,
@@ -26,6 +36,8 @@ import { TelegramChannelModal } from './components/TelegramChannelModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { SyncProgressModal } from './components/SyncProgressModal';
 import { NotesHighlightsHub } from './components/NotesHighlightsHub';
+import { VocabularyHub } from './components/VocabularyHub';
+import { CustomizeAppearanceModal } from './components/CustomizeAppearanceModal';
 import {
   fetchExploreChannelFeed,
   downloadAndImportTelegramPdf,
@@ -37,8 +49,14 @@ import {
   subscribeToFirestoreReadingProgress,
   syncBookToFirestore,
   syncBooksWithCloudSql,
+  fetchCloudSqlLibrary,
   sanitizeFirestoreId,
 } from './services/cloudSync';
+import {
+  loadSavedVocabulary,
+  mergeCloudVocabularyIntoLocal,
+  subscribeToVocabularyUpdates,
+} from './services/vocabularyStore';
 import type { User } from 'firebase/auth';
 import { Search, LayoutGrid, List as ListIcon, Plus, Send, ArrowUpDown } from 'lucide-react';
 
@@ -48,6 +66,7 @@ const STORAGE_BOOKLISTS_KEY = 'folio_booklists_v3_zero';
 const STORAGE_THEME_KEY = 'folio_theme_v3';
 const STORAGE_TG_CHANNEL_KEY = 'folio_tg_channel_v1';
 const STORAGE_TG_AUTOSYNC_KEY = 'folio_tg_autosync_v1';
+const STORAGE_UI_PREFS_KEY = 'folio_ui_prefs_v1';
 
 export default function App() {
   // Theme state: defaults to spotify-dark
@@ -57,6 +76,16 @@ export default function App() {
       return (stored as AppTheme) || 'spotify-dark';
     } catch {
       return 'spotify-dark';
+    }
+  });
+
+  // UI Section & Layout Preferences
+  const [uiPreferences, setUiPreferences] = useState<UiSectionPreferences>(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_UI_PREFS_KEY);
+      return stored ? { ...DEFAULT_UI_PREFERENCES, ...JSON.parse(stored) } : DEFAULT_UI_PREFERENCES;
+    } catch {
+      return DEFAULT_UI_PREFERENCES;
     }
   });
 
@@ -82,12 +111,13 @@ export default function App() {
   });
 
   // Navigation State
-  const [currentTab, setCurrentTab] = useState<'library' | 'explore' | 'bookshelf' | 'notes'>('library');
+  const [currentTab, setCurrentTab] = useState<'library' | 'explore' | 'bookshelf' | 'notes' | 'vocabulary'>('library');
   const [selectedListId, setSelectedListId] = useState<string | null>(null);
   const [selectedStatus, setSelectedStatus] = useState<ReadingStatus | 'all'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [viewMode, setViewMode] = useState<ViewMode>('table');
   const [sortBy, setSortBy] = useState<SortOption>('recently-added');
+  const [vocabulary, setVocabulary] = useState<SavedVocabularyItem[]>(() => loadSavedVocabulary());
 
   // Currently Playing / Reading Book (for Spotify Bottom Bar)
   const [activeReadingBook, setActiveReadingBook] = useState<Book | null>(() => {
@@ -98,6 +128,7 @@ export default function App() {
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [isTelegramSyncOpen, setIsTelegramSyncOpen] = useState(false);
   const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
+  const [isCustomizeOpen, setIsCustomizeOpen] = useState(false);
   const [editingBook, setEditingBook] = useState<Book | null>(null);
   const [isCreateListOpen, setIsCreateListOpen] = useState(false);
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
@@ -124,7 +155,14 @@ export default function App() {
   const [autoSyncedNotice, setAutoSyncedNotice] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
 
-  // Firebase Auth listener + Real-time Firestore readingProgress subscription
+  // Listen for local vocabulary updates (e.g. when looking up words inside the PDF reader)
+  useEffect(() => {
+    return subscribeToVocabularyUpdates(() => {
+      setVocabulary(loadSavedVocabulary());
+    });
+  }, []);
+
+  // Firebase Auth listener + Real-time Firestore readingProgress subscription + Cloud SQL Vocabulary sync
   useEffect(() => {
     let unsubFirestore: (() => void) | null = null;
     const unsubAuth = subscribeToAuthChanges(user => {
@@ -134,6 +172,15 @@ export default function App() {
         unsubFirestore = null;
       }
       if (user) {
+        fetchCloudSqlLibrary()
+          .then(res => {
+            if (res.vocabulary && res.vocabulary.length > 0) {
+              const merged = mergeCloudVocabularyIntoLocal(res.vocabulary);
+              setVocabulary(merged);
+            }
+          })
+          .catch(() => {});
+
         unsubFirestore = subscribeToFirestoreReadingProgress(user, progressDocs => {
           if (progressDocs.length === 0) return;
           setBooks(prev =>
@@ -165,6 +212,32 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_THEME_KEY, theme);
   }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_UI_PREFS_KEY, JSON.stringify(uiPreferences));
+    // If the currently active tab or filter was just hidden, return cleanly to All Books
+    if (!uiPreferences.showVocabularyHub && currentTab === 'vocabulary') {
+      setCurrentTab('library');
+    }
+    if (!uiPreferences.showNotesHub && currentTab === 'notes') {
+      setCurrentTab('library');
+    }
+    if (!uiPreferences.showBookshelfTab && currentTab === 'bookshelf') {
+      setCurrentTab('library');
+    }
+    if (!uiPreferences.showExploreTab && currentTab === 'explore') {
+      setCurrentTab('library');
+    }
+    if (!uiPreferences.showReadingTab && selectedStatus === 'reading') {
+      setSelectedStatus('all');
+    }
+    if (!uiPreferences.showFinishedTab && selectedStatus === 'completed') {
+      setSelectedStatus('all');
+    }
+    if (!uiPreferences.showPlaylistsSection && selectedListId) {
+      setSelectedListId(null);
+    }
+  }, [uiPreferences, currentTab, selectedStatus, selectedListId]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_BOOKS_KEY, JSON.stringify(books));
@@ -406,6 +479,8 @@ export default function App() {
         }}
         theme={theme}
         onChangeTheme={setTheme}
+        uiPreferences={uiPreferences}
+        onOpenCustomize={() => setIsCustomizeOpen(true)}
       />
 
       <OfflineIndicator />
@@ -425,10 +500,12 @@ export default function App() {
           selectedListId={selectedListId}
           selectedStatus={selectedStatus}
           isNotesHubActive={currentTab === 'notes'}
+          isVocabularyHubActive={currentTab === 'vocabulary'}
           totalBooksCount={books.length}
           readingBooksCount={readingBooksCount}
           finishedBooksCount={finishedBooksCount}
           annotationsCount={annotationsCount}
+          vocabularyCount={vocabulary.length}
           onSelectList={id => {
             setSelectedListId(id);
             setCurrentTab('library');
@@ -441,10 +518,16 @@ export default function App() {
             setSelectedListId(null);
             setCurrentTab('notes');
           }}
+          onSelectVocabularyHub={() => {
+            setSelectedListId(null);
+            setCurrentTab('vocabulary');
+          }}
           onOpenCreateList={() => setIsCreateListOpen(true)}
           onOpenSyncModal={() => setIsSyncModalOpen(true)}
           currentUser={currentUser}
           theme={theme}
+          uiPreferences={uiPreferences}
+          onOpenCustomize={() => setIsCustomizeOpen(true)}
         />
 
         {/* Center Main View Area */}
@@ -468,6 +551,25 @@ export default function App() {
                 handleStartReadingBook(updated);
               }}
               onUpdateBook={updated => handleSaveBook(updated)}
+              theme={theme}
+            />
+          )}
+          {currentTab === 'vocabulary' && (
+            <VocabularyHub
+              vocabulary={vocabulary}
+              books={books}
+              onOpenBookAtPage={(book, page) => {
+                const clamped = Math.max(1, Math.min(book.pageCount, page));
+                const updated: Book = {
+                  ...book,
+                  currentPage: clamped,
+                  status: clamped >= book.pageCount ? 'completed' : 'reading',
+                  lastRead: new Date().toISOString().split('T')[0],
+                };
+                handleSaveBook(updated);
+                handleStartReadingBook(updated);
+              }}
+              onVocabularyChange={setVocabulary}
               theme={theme}
             />
           )}
@@ -709,7 +811,7 @@ export default function App() {
       </div>
 
       {/* Spotify Bottom Now-Playing & Reading Bar */}
-      {currentTab !== 'notes' && (
+      {uiPreferences.showBottomPlayerBar && currentTab !== 'notes' && currentTab !== 'vocabulary' && (
         <SpotifyPlayerBar
           currentBook={activeReadingBook}
           onOpenReader={handleStartReadingBook}
@@ -717,6 +819,16 @@ export default function App() {
           theme={theme}
         />
       )}
+
+      {/* Customize App Design & Visible Sections Modal */}
+      <CustomizeAppearanceModal
+        isOpen={isCustomizeOpen}
+        onClose={() => setIsCustomizeOpen(false)}
+        theme={theme}
+        onChangeTheme={setTheme}
+        preferences={uiPreferences}
+        onChangePreferences={setUiPreferences}
+      />
 
       {/* Modals & Fullscreen Reader */}
       <ImportPdfModal

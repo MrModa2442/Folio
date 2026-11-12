@@ -7,46 +7,114 @@ import path from 'path';
 const DEFAULT_API_ID = 2040;
 const DEFAULT_API_HASH = 'b18441a1ff607e10a989891a5462e627';
 
-// Suppress GramJS background update/ping TIMEOUT unhandled rejections
+// Suppress GramJS background update/ping TIMEOUT and invalidated session unhandled rejections
 if (typeof process !== 'undefined' && process.on) {
   process.on('unhandledRejection', (reason: unknown) => {
     const msg = reason instanceof Error ? reason.message : String(reason);
-    if (msg.includes('TIMEOUT') || msg.includes('Not connected')) {
-      // Ignore benign GramJS background socket idle timeout
+    if (
+      msg.includes('TIMEOUT') ||
+      msg.includes('Not connected') ||
+      msg.includes('AUTH_KEY_DUPLICATED') ||
+      msg.includes('AUTH_KEY_UNREGISTERED') ||
+      msg.includes('SESSION_REVOKED')
+    ) {
+      // Ignore benign GramJS background socket timeout or evicted session notices
       return;
     }
-    console.warn('[UnhandledRejection]', reason);
   });
 }
 
-// Reusable connected client cache so we don't connect/disconnect on every request
+// Reusable connected client cache + in-flight connection lock so parallel requests
+// never open duplicate TCP sockets with the same StringSession (which causes 406: AUTH_KEY_DUPLICATED)
 const clientPool = new Map<string, TelegramClient>();
+const clientConnectingPool = new Map<string, Promise<TelegramClient>>();
+const invalidatedSessions = new Set<string>();
+
+function getSessionPoolKey(sessionStr: string, apiId: number): string {
+  return `${apiId}:${sessionStr.slice(0, 48)}`;
+}
+
+function isSessionInvalidError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  const errCodeMsg =
+    typeof err === 'object' && err !== null && 'errorMessage' in err
+      ? String((err as { errorMessage?: unknown }).errorMessage || '')
+      : '';
+  const combined = `${msg} ${errCodeMsg}`;
+  return (
+    combined.includes('AUTH_KEY_DUPLICATED') ||
+    combined.includes('AUTH_KEY_UNREGISTERED') ||
+    combined.includes('AUTH_KEY_INVALID') ||
+    combined.includes('SESSION_REVOKED') ||
+    combined.includes('USER_DEACTIVATED')
+  );
+}
+
+function markSessionInvalidated(sessionStr: string, apiId: number): void {
+  if (!sessionStr) return;
+  invalidatedSessions.add(sessionStr);
+  const key = getSessionPoolKey(sessionStr, apiId);
+  clientConnectingPool.delete(key);
+  const existing = clientPool.get(key);
+  if (existing) {
+    clientPool.delete(key);
+    existing.disconnect().catch(() => {});
+  }
+}
 
 async function getConnectedClient(
   sessionStr: string,
   apiId: number,
   apiHash: string
 ): Promise<TelegramClient> {
-  const key = `${apiId}:${sessionStr.slice(0, 32)}`;
+  if (sessionStr && invalidatedSessions.has(sessionStr)) {
+    throw new Error('TELEGRAM_SESSION_INVALIDATED');
+  }
+
+  const key = getSessionPoolKey(sessionStr, apiId);
   const existing = clientPool.get(key);
   if (existing && existing.connected) {
     return existing;
   }
 
-  const silentLogger = new Logger('none' as never);
-  const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
-    connectionRetries: 2,
-    retryDelay: 500,
-    timeout: 10,
-    autoReconnect: false,
-    baseLogger: silentLogger,
-  });
-
-  await client.connect();
-  if (sessionStr) {
-    clientPool.set(key, client);
+  const inflight = clientConnectingPool.get(key);
+  if (inflight) {
+    return inflight;
   }
-  return client;
+
+  const connectPromise = (async () => {
+    const silentLogger = new Logger('none' as never);
+    const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
+      connectionRetries: 2,
+      retryDelay: 500,
+      timeout: 10,
+      autoReconnect: false,
+      baseLogger: silentLogger,
+    });
+
+    try {
+      await client.connect();
+      if (sessionStr) {
+        clientPool.set(key, client);
+      }
+      return client;
+    } catch (connErr) {
+      if (isSessionInvalidError(connErr)) {
+        markSessionInvalidated(sessionStr, apiId);
+        throw new Error('TELEGRAM_SESSION_INVALIDATED');
+      }
+      throw connErr;
+    } finally {
+      clientConnectingPool.delete(key);
+    }
+  })();
+
+  if (sessionStr) {
+    clientConnectingPool.set(key, connectPromise);
+  }
+
+  return connectPromise;
 }
 
 type ExtractedTelegramPdf = NonNullable<ReturnType<typeof extractPdfFromMessage>>;
@@ -132,8 +200,10 @@ function mergeChannelPdfsIntoArchive(
     channelTitle: channelTitle || `@${cleanCh}`,
     pdfsByMsgId: new Map<number, ExtractedTelegramPdf>(),
   };
-  if (channelTitle) {
+  if (channelTitle && !channelTitle.startsWith('@')) {
     existing.channelTitle = channelTitle;
+  } else if (!existing.channelTitle) {
+    existing.channelTitle = channelTitle || `@${cleanCh}`;
   }
 
   let changed = false;
@@ -175,6 +245,57 @@ function mergeChannelPdfsIntoArchive(
   return deduped;
 }
 
+function buildArchivedExploreResponse(
+  channels: string[],
+  serverHasSession: boolean,
+  sessionInvalidated: boolean
+) {
+  loadArchiveFromDiskOnce();
+  const targetChannels =
+    channels.length > 0 ? channels : Array.from(persistentChannelArchive.keys());
+
+  const channelResults: Array<{
+    channel: string;
+    channelTitle: string;
+    pdfs: ExtractedTelegramPdf[];
+  }> = [];
+  const allPdfs: ExtractedTelegramPdf[] = [];
+  const seenGlobalPdfKeys = new Set<string>();
+
+  for (const ch of targetChannels) {
+    const cleanCh = ch.toLowerCase().trim();
+    const archivedEntry = persistentChannelArchive.get(cleanCh);
+    const channelTitle = archivedEntry?.channelTitle || `@${cleanCh}`;
+    const archivedPdfs = mergeChannelPdfsIntoArchive(cleanCh, channelTitle, []);
+    if (archivedPdfs.length > 0) {
+      for (const item of archivedPdfs) {
+        const titleKey = (item.cleanTitle || item.fileName).toLowerCase().trim();
+        const uniqueKey = `${titleKey}_${item.fileSize || 0}`;
+        if (!seenGlobalPdfKeys.has(uniqueKey) && !seenGlobalPdfKeys.has(titleKey)) {
+          seenGlobalPdfKeys.add(uniqueKey);
+          seenGlobalPdfKeys.add(titleKey);
+          allPdfs.push(item);
+        }
+      }
+      channelResults.push({
+        channel: cleanCh,
+        channelTitle,
+        pdfs: archivedPdfs,
+      });
+    }
+  }
+
+  allPdfs.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+  return {
+    configured: allPdfs.length > 0 || serverHasSession,
+    serverHasSession,
+    sessionInvalidated,
+    channels: channelResults,
+    allPdfs,
+  };
+}
+
 // 60-second in-memory response cache for the public Explore multi-channel feed
 let exploreCache: {
   timestamp: number;
@@ -182,6 +303,7 @@ let exploreCache: {
   data: {
     configured: boolean;
     serverHasSession: boolean;
+    sessionInvalidated?: boolean;
     channels: Array<{
       channel: string;
       channelTitle: string;
@@ -220,10 +342,13 @@ export function parseChannelList(raw: string): string[] {
 }
 
 function getConfiguredServerChannels(extraQueryChannels = ''): string[] {
+  loadArchiveFromDiskOnce();
+  const archivedChannels = Array.from(persistentChannelArchive.keys()).join(',');
   const combined = [
     process.env.TELEGRAM_CHANNELS || '',
     process.env.TELEGRAM_CHANNEL || '',
     extraQueryChannels,
+    archivedChannels,
   ].join(',');
   return parseChannelList(combined);
 }
@@ -448,7 +573,13 @@ export default async function handler(req: any, res: any) {
   const headerSession = String(req.headers?.['x-telegram-session'] || '').trim();
   const querySession = String(req.query?.session || '').trim();
   const envSession = (process.env.TELEGRAM_SESSION || '').trim();
-  const activeSession = envSession || headerSession || querySession;
+
+  // Pick a valid session that hasn't been invalidated by AUTH_KEY_DUPLICATED
+  const candidateSessions = [envSession, headerSession, querySession].filter(Boolean);
+  const validCandidateSession = candidateSessions.find(s => !invalidatedSessions.has(s)) || '';
+  const wasSessionInvalidated =
+    candidateSessions.length > 0 && !validCandidateSession;
+  const activeSession = validCandidateSession;
 
   const { apiId, apiHash } = getApiCredentials();
 
@@ -457,12 +588,14 @@ export default async function handler(req: any, res: any) {
     if (pathname === 'status' || pathname === '') {
       const serverChannels = getConfiguredServerChannels();
       const defaultChannel = serverChannels[0] || '';
+      const validEnvSession = Boolean(envSession && !invalidatedSessions.has(envSession));
       return res.status(200).json({
         configured: Boolean(activeSession),
-        serverConfigured: Boolean(envSession),
+        serverConfigured: validEnvSession,
         hasApiId: true,
         hasApiHash: true,
         hasSession: Boolean(activeSession),
+        sessionInvalidated: wasSessionInvalidated,
         defaultChannel,
         serverChannels,
       });
@@ -473,14 +606,15 @@ export default async function handler(req: any, res: any) {
       const extraChannels = String(req.query?.channels || '');
       const forceRefresh = req.query?.refresh === 'true';
       const channels = getConfiguredServerChannels(extraChannels);
+      const validEnvSession = Boolean(envSession && !invalidatedSessions.has(envSession));
 
       if (!activeSession || channels.length === 0) {
-        return res.status(200).json({
-          configured: Boolean(activeSession),
-          serverHasSession: Boolean(envSession),
-          channels: [],
-          allPdfs: [],
-        });
+        const archivedResponse = buildArchivedExploreResponse(
+          channels,
+          validEnvSession,
+          wasSessionInvalidated
+        );
+        return res.status(200).json(archivedResponse);
       }
 
       const cacheKey = `v2:${activeSession.slice(0, 12)}:${channels.join(',')}`;
@@ -495,7 +629,26 @@ export default async function handler(req: any, res: any) {
       }
 
       loadArchiveFromDiskOnce();
-      const client = await getConnectedClient(activeSession, apiId, apiHash);
+      let client: TelegramClient | null = null;
+      let sessionFailedDuringScan = false;
+
+      try {
+        client = await getConnectedClient(activeSession, apiId, apiHash);
+      } catch (connErr) {
+        if (isSessionInvalidError(connErr) || (connErr instanceof Error && connErr.message === 'TELEGRAM_SESSION_INVALIDATED')) {
+          markSessionInvalidated(activeSession, apiId);
+          sessionFailedDuringScan = true;
+        } else {
+          // Even on transient network timeouts, serve the persistent archive cleanly
+          const archivedResponse = buildArchivedExploreResponse(channels, validEnvSession, false);
+          return res.status(200).json(archivedResponse);
+        }
+      }
+
+      if (sessionFailedDuringScan || !client) {
+        const archivedResponse = buildArchivedExploreResponse(channels, false, true);
+        return res.status(200).json(archivedResponse);
+      }
 
       const channelResults: Array<{
         channel: string;
@@ -507,24 +660,45 @@ export default async function handler(req: any, res: any) {
       const seenGlobalPdfKeys = new Set<string>();
 
       for (const ch of channels) {
+        const cleanCh = ch.toLowerCase().trim();
+        const archivedEntry = persistentChannelArchive.get(cleanCh);
+        const archivedTitle = archivedEntry?.channelTitle || `@${cleanCh}`;
+
+        if (sessionFailedDuringScan) {
+          const fallbackArchived = mergeChannelPdfsIntoArchive(cleanCh, archivedTitle, []);
+          if (fallbackArchived.length > 0) {
+            for (const item of fallbackArchived) {
+              const titleKey = (item.cleanTitle || item.fileName).toLowerCase().trim();
+              const uniqueKey = `${titleKey}_${item.fileSize || 0}`;
+              if (!seenGlobalPdfKeys.has(uniqueKey) && !seenGlobalPdfKeys.has(titleKey)) {
+                seenGlobalPdfKeys.add(uniqueKey);
+                seenGlobalPdfKeys.add(titleKey);
+                allPdfs.push(item);
+              }
+            }
+            channelResults.push({
+              channel: cleanCh,
+              channelTitle: archivedTitle,
+              pdfs: fallbackArchived,
+            });
+          }
+          continue;
+        }
+
         try {
           const entity = await client.getEntity(ch);
           const entityIdStr =
-            entity && 'id' in entity && entity.id ? String(entity.id) : ch.toLowerCase();
+            entity && 'id' in entity && entity.id ? String(entity.id) : cleanCh;
           if (seenEntityIds.has(entityIdStr)) {
             continue;
           }
           seenEntityIds.add(entityIdStr);
 
           const channelTitle =
-            (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || `@${ch}`;
+            (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || archivedTitle;
 
-          // Fetch document messages using InputMessagesFilterDocument.
-          // On initial archive build (or forceRefresh), paginate backward through the channel's entire document history
-          // so there is NO 250-book limit; on normal quick checks, fetch the latest 100 documents and merge into the permanent archive.
-          const existingChannelArchive = persistentChannelArchive.get(ch.toLowerCase().trim());
-          const hasExistingArchive = Boolean(existingChannelArchive && existingChannelArchive.pdfsByMsgId.size > 0);
-          const maxPagesToWalk = !hasExistingArchive || forceRefresh ? 20 : 1; // up to 20 * 100 = 2,000+ existing books on full scan, plus unlimited cumulative archive forever
+          const hasExistingArchive = Boolean(archivedEntry && archivedEntry.pdfsByMsgId.size > 0);
+          const maxPagesToWalk = !hasExistingArchive || forceRefresh ? 20 : 1;
 
           const freshlyExtracted: ExtractedTelegramPdf[] = [];
           let offsetId = 0;
@@ -537,7 +711,10 @@ export default async function handler(req: any, res: any) {
                 offsetId,
                 filter: new Api.InputMessagesFilterDocument(),
               });
-            } catch {
+            } catch (msgErr) {
+              if (isSessionInvalidError(msgErr)) {
+                throw msgErr;
+              }
               docMessages = await client.getMessages(entity, {
                 limit: 100,
                 offsetId,
@@ -549,7 +726,7 @@ export default async function handler(req: any, res: any) {
             for (let i = 0; i < docMessages.length; i++) {
               const msg = docMessages[i];
               if (msg instanceof Api.Message) {
-                const extracted = extractPdfFromMessage(msg, ch, channelTitle, i, docMessages);
+                const extracted = extractPdfFromMessage(msg, cleanCh, channelTitle, i, docMessages);
                 if (extracted) {
                   freshlyExtracted.push(extracted);
                 }
@@ -566,7 +743,7 @@ export default async function handler(req: any, res: any) {
 
           // Merge into permanent cumulative archive so older PDFs stay forever
           const cumulativeChannelPdfs = mergeChannelPdfsIntoArchive(
-            ch,
+            cleanCh,
             channelTitle,
             freshlyExtracted
           );
@@ -582,14 +759,17 @@ export default async function handler(req: any, res: any) {
           }
 
           channelResults.push({
-            channel: ch,
+            channel: cleanCh,
             channelTitle,
             pdfs: cumulativeChannelPdfs,
           });
         } catch (chErr) {
-          console.warn(`[/api/telegram/explore-feed] Could not read channel @${ch}:`, chErr);
-          // Even if Telegram temporarily fails, return all previously archived PDFs for this channel
-          const fallbackArchived = mergeChannelPdfsIntoArchive(ch, `@${ch}`, []);
+          if (isSessionInvalidError(chErr)) {
+            markSessionInvalidated(activeSession, apiId);
+            sessionFailedDuringScan = true;
+          }
+          // Return all previously archived PDFs for this channel without logging scary RPCErrors
+          const fallbackArchived = mergeChannelPdfsIntoArchive(cleanCh, archivedTitle, []);
           if (fallbackArchived.length > 0) {
             for (const item of fallbackArchived) {
               const titleKey = (item.cleanTitle || item.fileName).toLowerCase().trim();
@@ -601,8 +781,8 @@ export default async function handler(req: any, res: any) {
               }
             }
             channelResults.push({
-              channel: ch,
-              channelTitle: `@${ch}`,
+              channel: cleanCh,
+              channelTitle: archivedTitle,
               pdfs: fallbackArchived,
             });
           }
@@ -612,17 +792,20 @@ export default async function handler(req: any, res: any) {
       allPdfs.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
       const responseData = {
-        configured: true,
-        serverHasSession: Boolean(envSession),
+        configured: !sessionFailedDuringScan || allPdfs.length > 0,
+        serverHasSession: Boolean(envSession && !invalidatedSessions.has(envSession)),
+        sessionInvalidated: sessionFailedDuringScan || wasSessionInvalidated,
         channels: channelResults,
         allPdfs,
       };
 
-      exploreCache = {
-        timestamp: now,
-        key: cacheKey,
-        data: responseData,
-      };
+      if (!sessionFailedDuringScan) {
+        exploreCache = {
+          timestamp: now,
+          key: cacheKey,
+          data: responseData,
+        };
+      }
 
       return res.status(200).json(responseData);
     }
@@ -643,7 +826,7 @@ export default async function handler(req: any, res: any) {
 
       let coverDataUrl: string | null = null;
 
-      if (activeSession && channel && (messageId > 0 || photoMsgId > 0)) {
+      if (activeSession && !invalidatedSessions.has(activeSession) && channel && (messageId > 0 || photoMsgId > 0)) {
         try {
           const client = await getConnectedClient(activeSession, apiId, apiHash);
           const entity = await client.getEntity(channel);
@@ -654,7 +837,6 @@ export default async function handler(req: any, res: any) {
           if (messageId > 0) {
             idsToFetch.push(messageId);
             if (!photoMsgId) {
-              // Also check immediately preceding/succeeding message IDs for a cover photo post
               if (messageId > 1) idsToFetch.push(messageId - 1);
               if (messageId > 2) idsToFetch.push(messageId - 2);
               idsToFetch.push(messageId + 1);
@@ -698,7 +880,10 @@ export default async function handler(req: any, res: any) {
             }
           }
         } catch (tgCoverErr) {
-          console.warn('[/api/telegram/cover] Telegram media thumb notice:', tgCoverErr);
+          if (isSessionInvalidError(tgCoverErr)) {
+            markSessionInvalidated(activeSession, apiId);
+          }
+          // Fall back silently to Google Books cover lookup below
         }
       }
 
@@ -743,7 +928,7 @@ export default async function handler(req: any, res: any) {
 
       const result = await client.sendCode({ apiId, apiHash }, phoneNumber);
       const pendingSession = (client.session.save() as unknown as string) || '';
-      clientPool.set(`${apiId}:${pendingSession.slice(0, 32)}`, client);
+      clientPool.set(getSessionPoolKey(pendingSession, apiId), client);
 
       return res.status(200).json({
         ok: true,
@@ -808,7 +993,8 @@ export default async function handler(req: any, res: any) {
       }
 
       const sessionString = (client.session.save() as unknown as string) || '';
-      clientPool.set(`${apiId}:${sessionString.slice(0, 32)}`, client);
+      invalidatedSessions.delete(sessionString);
+      clientPool.set(getSessionPoolKey(sessionString, apiId), client);
 
       return res.status(200).json({
         ok: true,
@@ -819,7 +1005,11 @@ export default async function handler(req: any, res: any) {
 
     // 4. POST /api/telegram/auth/logout
     if (pathname === 'auth/logout') {
+      for (const client of clientPool.values()) {
+        client.disconnect().catch(() => {});
+      }
       clientPool.clear();
+      clientConnectingPool.clear();
       return res.status(200).json({ ok: true });
     }
 
@@ -835,46 +1025,82 @@ export default async function handler(req: any, res: any) {
         });
       }
 
+      loadArchiveFromDiskOnce();
+      const archivedEntry = persistentChannelArchive.get(channel);
+      const archivedTitle = archivedEntry?.channelTitle || `@${channel}`;
+
       if (!activeSession) {
+        const archivedPdfs = mergeChannelPdfsIntoArchive(channel, archivedTitle, []);
+        if (archivedPdfs.length > 0) {
+          return res.status(200).json({
+            channel,
+            channelTitle: archivedTitle,
+            pdfs: archivedPdfs,
+            sessionInvalidated: wasSessionInvalidated,
+          });
+        }
         return res.status(401).json({
-          error: 'Please sign in with your phone number above first to connect to Telegram.',
+          sessionInvalidated: wasSessionInvalidated,
+          error: wasSessionInvalidated
+            ? 'Your Telegram session was reset because it was active in two places simultaneously. Please sign in with your phone number above to connect a fresh session.'
+            : 'Please sign in with your phone number above first to connect to Telegram.',
         });
       }
 
-      const client = await getConnectedClient(activeSession, apiId, apiHash);
-      const entity = await client.getEntity(channel);
-      const channelTitle =
-        (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || `@${channel}`;
-
-      let messages: Api.TypeMessage[] = [];
       try {
-        messages = await client.getMessages(entity, {
-          limit: Math.max(limit, 200),
-          filter: new Api.InputMessagesFilterDocument(),
-        });
-      } catch {
-        messages = await client.getMessages(entity, { limit: Math.max(limit, 120) });
-      }
+        const client = await getConnectedClient(activeSession, apiId, apiHash);
+        const entity = await client.getEntity(channel);
+        const channelTitle =
+          (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || archivedTitle;
 
-      const pdfItems: ExtractedTelegramPdf[] = [];
+        let messages: Api.TypeMessage[] = [];
+        try {
+          messages = await client.getMessages(entity, {
+            limit: Math.max(limit, 200),
+            filter: new Api.InputMessagesFilterDocument(),
+          });
+        } catch (innerErr) {
+          if (isSessionInvalidError(innerErr)) {
+            throw innerErr;
+          }
+          messages = await client.getMessages(entity, { limit: Math.max(limit, 120) });
+        }
 
-      for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
-        if (msg instanceof Api.Message) {
-          const extracted = extractPdfFromMessage(msg, channel, channelTitle, i, messages);
-          if (extracted) {
-            pdfItems.push(extracted);
+        const pdfItems: ExtractedTelegramPdf[] = [];
+
+        for (let i = 0; i < messages.length; i++) {
+          const msg = messages[i];
+          if (msg instanceof Api.Message) {
+            const extracted = extractPdfFromMessage(msg, channel, channelTitle, i, messages);
+            if (extracted) {
+              pdfItems.push(extracted);
+            }
           }
         }
+
+        const cumulativePdfs = mergeChannelPdfsIntoArchive(channel, channelTitle, pdfItems);
+
+        return res.status(200).json({
+          channel,
+          channelTitle,
+          pdfs: cumulativePdfs,
+        });
+      } catch (chPdfErr) {
+        const isInvalid = isSessionInvalidError(chPdfErr);
+        if (isInvalid) {
+          markSessionInvalidated(activeSession, apiId);
+        }
+        const archivedPdfs = mergeChannelPdfsIntoArchive(channel, archivedTitle, []);
+        if (archivedPdfs.length > 0) {
+          return res.status(200).json({
+            channel,
+            channelTitle: archivedTitle,
+            pdfs: archivedPdfs,
+            sessionInvalidated: isInvalid,
+          });
+        }
+        throw chPdfErr;
       }
-
-      const cumulativePdfs = mergeChannelPdfsIntoArchive(channel, channelTitle, pdfItems);
-
-      return res.status(200).json({
-        channel,
-        channelTitle,
-        pdfs: cumulativePdfs,
-      });
     }
 
     // 6. GET /api/telegram/download-pdf
@@ -891,43 +1117,72 @@ export default async function handler(req: any, res: any) {
 
       if (!activeSession) {
         return res.status(401).json({
-          error: 'Not signed in to Telegram. Please sign in first.',
+          sessionInvalidated: wasSessionInvalidated,
+          error: wasSessionInvalidated
+            ? 'Your Telegram session was reset because it was used in two places at once. Please open Telegram Sync and sign in again to download PDFs.'
+            : 'Not signed in to Telegram. Please open Telegram Sync and sign in first.',
         });
       }
 
-      const client = await getConnectedClient(activeSession, apiId, apiHash);
-      const entity = await client.getEntity(channel);
-      const messages = await client.getMessages(entity, { ids: [messageId] });
-      const msg = messages?.[0];
+      try {
+        const client = await getConnectedClient(activeSession, apiId, apiHash);
+        const entity = await client.getEntity(channel);
+        const messages = await client.getMessages(entity, { ids: [messageId] });
+        const msg = messages?.[0];
 
-      if (!msg || !(msg instanceof Api.Message)) {
-        return res.status(404).json({ error: `Message #${messageId} not found in @${channel}.` });
+        if (!msg || !(msg instanceof Api.Message)) {
+          return res.status(404).json({ error: `Message #${messageId} not found in @${channel}.` });
+        }
+
+        const meta = extractPdfFromMessage(msg, channel, channel);
+        if (!meta) {
+          return res.status(400).json({ error: `Message #${messageId} does not contain a valid PDF document.` });
+        }
+
+        const buffer = await client.downloadMedia(msg, {});
+
+        if (!buffer || !(buffer instanceof Buffer)) {
+          return res.status(500).json({ error: 'Failed to download PDF binary stream from Telegram.' });
+        }
+
+        const safeFilename = encodeURIComponent(meta.fileName);
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Length', String(buffer.byteLength));
+        res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+        res.setHeader('X-Telegram-Filename', safeFilename);
+        res.setHeader('X-Telegram-Message-Id', String(meta.messageId));
+        return res.status(200).send(buffer);
+      } catch (dlErr) {
+        if (isSessionInvalidError(dlErr)) {
+          markSessionInvalidated(activeSession, apiId);
+          return res.status(401).json({
+            sessionInvalidated: true,
+            error: 'Your Telegram session expired because it was active in two places simultaneously. Please open Telegram Sync and sign in again.',
+          });
+        }
+        throw dlErr;
       }
-
-      const meta = extractPdfFromMessage(msg, channel, channel);
-      if (!meta) {
-        return res.status(400).json({ error: `Message #${messageId} does not contain a valid PDF document.` });
-      }
-
-      const buffer = await client.downloadMedia(msg, {});
-
-      if (!buffer || !(buffer instanceof Buffer)) {
-        return res.status(500).json({ error: 'Failed to download PDF binary stream from Telegram.' });
-      }
-
-      const safeFilename = encodeURIComponent(meta.fileName);
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Length', String(buffer.byteLength));
-      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-      res.setHeader('X-Telegram-Filename', safeFilename);
-      res.setHeader('X-Telegram-Message-Id', String(meta.messageId));
-      return res.status(200).send(buffer);
     }
 
     return res.status(404).json({ error: `Unknown Telegram API route: ${pathname}` });
   } catch (err: unknown) {
+    if (isSessionInvalidError(err) || (err instanceof Error && err.message === 'TELEGRAM_SESSION_INVALIDATED')) {
+      if (activeSession) {
+        markSessionInvalidated(activeSession, apiId);
+      }
+      return res.status(200).json({
+        ok: false,
+        configured: false,
+        sessionInvalidated: true,
+        channels: [],
+        allPdfs: [],
+        pdfs: [],
+        error:
+          'Your Telegram session was reset because the same session key was used from two locations simultaneously. Please sign in again with your phone number to generate a fresh session.',
+      });
+    }
+
     const rawMessage = err instanceof Error ? err.message : 'Telegram server error.';
-    console.warn('[/api/telegram] Notice:', rawMessage);
     const friendlyMessage =
       rawMessage === 'TIMEOUT' || rawMessage.includes('TIMEOUT')
         ? 'Connection to Telegram MTProto timed out in this cloud environment. If you deployed to Vercel, open your Vercel URL to sign in directly.'

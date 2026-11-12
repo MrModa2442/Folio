@@ -263,11 +263,18 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
     try {
       const feed = await fetchExploreChannelFeed(joined, true);
       setPdfs(feed.allPdfs);
+      if (feed.sessionInvalidated) {
+        refreshStatus();
+      }
       if (feed.allPdfs.length === 0) {
-        setErrorMessage(`Scanned ${channels.length} channel(s), but no PDF files were found in recent messages.`);
+        setErrorMessage(
+          feed.sessionInvalidated
+            ? 'Your previous Telegram session was reset because it was active in two locations simultaneously. Please sign in with your phone number above to scan new channels.'
+            : `Scanned ${channels.length} channel(s), but no PDF files were found in recent messages.`
+        );
       } else {
         setSuccessBanner(
-          `Found ${feed.allPdfs.length} PDF books across ${feed.channels.length} channel(s)! They are now visible in Explore.`
+          `Loaded ${feed.allPdfs.length} PDF books across ${feed.channels.length} channel(s)! They are now visible in Explore.`
         );
       }
     } catch (err) {

@@ -40,6 +40,20 @@ export interface PageHighlightStroke {
   points: Array<{ x: number; y: number }>;
 }
 
+export interface SavedVocabularyItem {
+  id: string;
+  word: string;
+  pronunciation?: string;
+  partOfSpeech: string;
+  persianMeaning: string;
+  englishMeaning: string;
+  contextExplanation: string;
+  bookId?: string;
+  bookTitle: string;
+  page: number;
+  createdAt: string;
+}
+
 export interface DailyReadingStats {
   dailyGoalPages: number;
   pagesReadToday: number;
@@ -67,6 +81,8 @@ export interface TelegramConfigStatus {
   hasApiHash: boolean;
   hasSession: boolean;
   defaultChannel: string;
+  serverChannels?: string[];
+  sessionInvalidated?: boolean;
 }
 
 export interface Collaborator {
@@ -109,3 +125,26 @@ export type SortOption = 'recently-added' | 'title-asc' | 'progress-desc';
 export type AmbientSoundType = 'none' | 'rain' | 'fireplace' | 'library';
 
 export type AppTheme = 'spotify-dark' | 'nordic-light' | 'warm-minimal';
+
+export interface UiSectionPreferences {
+  showReadingTab: boolean;
+  showFinishedTab: boolean;
+  showNotesHub: boolean;
+  showVocabularyHub: boolean;
+  showPlaylistsSection: boolean;
+  showBookshelfTab: boolean;
+  showExploreTab: boolean;
+  showBottomPlayerBar: boolean;
+}
+
+export const DEFAULT_UI_PREFERENCES: UiSectionPreferences = {
+  showReadingTab: true,
+  showFinishedTab: true,
+  showNotesHub: true,
+  showVocabularyHub: true,
+  showPlaylistsSection: true,
+  showBookshelfTab: true,
+  showExploreTab: true,
+  showBottomPlayerBar: true,
+};
+

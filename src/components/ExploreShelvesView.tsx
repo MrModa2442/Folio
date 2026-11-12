@@ -582,24 +582,29 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
             </div>
             <div className="max-w-md mx-auto space-y-1">
               <h4 className="text-sm font-bold">
-                {feedConfigured
-                  ? 'Add Telegram Book Channels to Populate Explore'
-                  : 'Connect Your Server Telegram Channels'}
+                {searchQuery.trim() || selectedTopicFilter !== 'all'
+                  ? 'No matching books found'
+                  : 'No books available right now'}
               </h4>
               <p className={`text-xs ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
-                As the app owner, connect your Telegram account once and list your book channels (e.g.{' '}
-                <code className="text-[#1DB954]">@channel1, @channel2</code>) in{' '}
-                <strong>Telegram Sync</strong> or in Vercel&apos;s <code className="text-white">TELEGRAM_CHANNELS</code>{' '}
-                environment variable so every visitor sees all channel PDFs here automatically.
+                {searchQuery.trim() || selectedTopicFilter !== 'all'
+                  ? 'Try adjusting your search keywords or switching the topic filter above.'
+                  : 'Tap refresh to check for newly synced books in the Explore catalog.'}
               </p>
             </div>
-            <button
-              onClick={onOpenTelegramSetup}
-              className="px-4 py-2 rounded-full text-xs font-semibold bg-[#1DB954] text-black hover:bg-[#1ed760] inline-flex items-center gap-1.5"
-            >
-              <Send className="w-3.5 h-3.5" />
-              <span>Configure Server Channels</span>
-            </button>
+            {(searchQuery.trim() || selectedTopicFilter !== 'all') && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery('');
+                  setSelectedTopicFilter('all');
+                  setSelectedChannelFilter('all');
+                }}
+                className="px-4 py-2 rounded-full text-xs font-semibold bg-[#1DB954] text-black hover:bg-[#1ed760] inline-flex items-center gap-1.5"
+              >
+                <span>Clear Filters</span>
+              </button>
+            )}
           </div>
         )}
       </section>

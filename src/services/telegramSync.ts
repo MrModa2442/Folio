@@ -25,6 +25,7 @@ export interface ExploreChannelGroup {
 export interface ExploreTelegramFeedResponse {
   configured: boolean;
   serverHasSession: boolean;
+  sessionInvalidated?: boolean;
   channels: ExploreChannelGroup[];
   allPdfs: TelegramPdfItem[];
 }
@@ -188,7 +189,7 @@ export function deduplicateTelegramPdfs(items: TelegramPdfItem[]): TelegramPdfIt
 }
 
 export async function fetchTelegramStatus(): Promise<TelegramConfigStatus> {
-  const localSession = getStoredTelegramSession();
+  let localSession = getStoredTelegramSession();
   try {
     const res = await fetch('/api/telegram/status', {
       headers: getSessionHeaders(),
@@ -204,10 +205,15 @@ export async function fetchTelegramStatus(): Promise<TelegramConfigStatus> {
       };
     }
     const data = await res.json();
+    if (data.sessionInvalidated && localSession) {
+      setStoredTelegramSession('');
+      localSession = '';
+    }
     return {
       ...data,
       configured: Boolean(data.configured || localSession),
       hasSession: Boolean(data.hasSession || localSession),
+      sessionInvalidated: Boolean(data.sessionInvalidated),
     };
   } catch {
     return {
@@ -244,6 +250,9 @@ export async function fetchExploreChannelFeed(
       };
     }
     const data: ExploreTelegramFeedResponse = await res.json();
+    if (data.sessionInvalidated) {
+      setStoredTelegramSession('');
+    }
     const merged = mergeExploreFeedWithLocalArchive(data.channels || []);
     return {
       ...data,
@@ -323,6 +332,9 @@ export async function fetchChannelPdfs(
     }
   );
   const data = await res.json();
+  if (data?.sessionInvalidated) {
+    setStoredTelegramSession('');
+  }
   if (!res.ok) {
     throw new Error(data.error || 'Failed to fetch PDFs from Telegram channel.');
   }
@@ -344,6 +356,9 @@ export async function downloadAndImportTelegramPdf(
     let errMsg = `Failed to download PDF (#${item.messageId}).`;
     try {
       const errJson = await res.json();
+      if (errJson?.sessionInvalidated) {
+        setStoredTelegramSession('');
+      }
       if (errJson.error) errMsg = errJson.error;
     } catch {
       // ignore json parse error

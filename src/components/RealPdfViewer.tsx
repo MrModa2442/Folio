@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PageBookmark, PageHighlightStroke } from '../types/library';
 import { loadCachedOcrPages, saveCachedOcrPages } from '../services/ocrCache';
-import { auth } from '../lib/firebase';
+import { upsertVocabularyItem } from '../services/vocabularyStore';
 import {
   ChevronLeft,
   ChevronRight,
@@ -19,6 +19,7 @@ import {
   Highlighter,
   Search,
   Bookmark,
+  ListTree,
   Undo2,
   Trash2,
   X,
@@ -103,6 +104,13 @@ interface DictionaryEntryResult {
   englishMeaning: string;
   contextExplanation: string;
   isAiEnhanced?: boolean;
+}
+
+interface PdfChapterItem {
+  id: string;
+  title: string;
+  page: number;
+  level: number;
 }
 
 interface RealPdfViewerProps {
@@ -195,6 +203,11 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [isBookmarksDrawerOpen, setIsBookmarksDrawerOpen] = useState<boolean>(false);
   const [bookmarkNoteDraft, setBookmarkNoteDraft] = useState<string>('');
 
+  // Table of Contents / Chapters Drawer state
+  const [isChaptersDrawerOpen, setIsChaptersDrawerOpen] = useState<boolean>(false);
+  const [pdfChapters, setPdfChapters] = useState<PdfChapterItem[]>([]);
+  const [hasEmbeddedOutline, setHasEmbeddedOutline] = useState<boolean>(false);
+
   // Instant On-Page Dictionary / Word Translator & Explainer state
   const [isDictionaryOpen, setIsDictionaryOpen] = useState<boolean>(false);
   const [dictQuery, setDictQuery] = useState<string>('');
@@ -248,7 +261,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     });
 
     loadingTask.promise
-      .then(doc => {
+      .then(async doc => {
         if (!isMounted) return;
         setPdfDoc(doc);
         setTotalPages(doc.numPages);
@@ -256,6 +269,84 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         setCurrentPage(start);
         setPageInput(String(start));
         setIsLoadingDoc(false);
+
+        // Extract embedded PDF Table of Contents / Chapters outline
+        try {
+          const outline = await doc.getOutline();
+          if (!isMounted) return;
+          if (outline && outline.length > 0) {
+            const extractedChapters: PdfChapterItem[] = [];
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const walkOutline = async (items: any[], level: number) => {
+              for (const item of items) {
+                if (!item || !item.title) continue;
+                let pageNum = 1;
+                try {
+                  let dest = item.dest;
+                  if (typeof dest === 'string') {
+                    dest = await doc.getDestination(dest);
+                  }
+                  if (Array.isArray(dest) && dest[0]) {
+                    const pageIdx = await doc.getPageIndex(dest[0]);
+                    pageNum = Math.max(1, Math.min(doc.numPages, pageIdx + 1));
+                  }
+                } catch {
+                  // fallback to page 1 if destination ref cannot be resolved
+                }
+                extractedChapters.push({
+                  id: `ch_${extractedChapters.length}_${pageNum}`,
+                  title: String(item.title).trim(),
+                  page: pageNum,
+                  level: Math.min(level, 2),
+                });
+                if (Array.isArray(item.items) && item.items.length > 0 && level < 2) {
+                  await walkOutline(item.items, level + 1);
+                }
+              }
+            };
+            await walkOutline(outline, 0);
+            if (!isMounted) return;
+            if (extractedChapters.length > 0) {
+              setPdfChapters(extractedChapters);
+              setHasEmbeddedOutline(true);
+              return;
+            }
+          }
+
+          // Fallback: Generate smart reading sections so even scanned PDFs without embedded outlines have quick section navigation
+          const fallbackSections: PdfChapterItem[] = [];
+          const numPages = doc.numPages;
+          if (numPages <= 15) {
+            for (let p = 1; p <= numPages; p += Math.max(1, Math.floor(numPages / 5))) {
+              fallbackSections.push({
+                id: `sec_${p}`,
+                title: p === 1 ? 'Beginning (Opening Page)' : `Page ${p}`,
+                page: p,
+                level: 0,
+              });
+            }
+          } else {
+            const step = Math.max(10, Math.round(numPages / 10 / 5) * 5);
+            let sectionNum = 1;
+            for (let p = 1; p <= numPages; p += step) {
+              fallbackSections.push({
+                id: `sec_${p}`,
+                title:
+                  p === 1
+                    ? 'Section 1 — Opening Pages'
+                    : `Section ${sectionNum} — Pages ${p}–${Math.min(numPages, p + step - 1)}`,
+                page: p,
+                level: 0,
+              });
+              sectionNum++;
+            }
+          }
+          setPdfChapters(fallbackSections);
+          setHasEmbeddedOutline(false);
+        } catch {
+          setPdfChapters([]);
+          setHasEmbeddedOutline(false);
+        }
       })
       .catch(err => {
         console.error('PDF.js failed to load document:', err);
@@ -1296,12 +1387,36 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         );
         return [aiResult, ...filtered].slice(0, 8);
       });
+      // Automatically save looked-up word to the user's Saved Vocabulary Bank (Local + Cloud SQL)
+      upsertVocabularyItem({
+        word: aiResult.word || cleanTerm,
+        pronunciation: aiResult.pronunciation || '',
+        partOfSpeech: aiResult.partOfSpeech || '',
+        persianMeaning: aiResult.persianMeaning || '',
+        englishMeaning: aiResult.englishMeaning || '',
+        contextExplanation: aiResult.contextExplanation || '',
+        bookId,
+        bookTitle: bookTitle || 'General Reading',
+        page: currentPage,
+      });
     } catch (err) {
       if (activeLookupWordRef.current !== key) return;
       // Only show error if instant fallback also failed
       const fallback = dictCacheMapRef.current.get(key);
       if (!fallback) {
         setDictError(err instanceof Error ? err.message : 'Dictionary lookup failed.');
+      } else {
+        upsertVocabularyItem({
+          word: fallback.word || cleanTerm,
+          pronunciation: fallback.pronunciation || '',
+          partOfSpeech: fallback.partOfSpeech || '',
+          persianMeaning: fallback.persianMeaning || '',
+          englishMeaning: fallback.englishMeaning || '',
+          contextExplanation: fallback.contextExplanation || '',
+          bookId,
+          bookTitle: bookTitle || 'General Reading',
+          page: currentPage,
+        });
       }
     } finally {
       if (activeLookupWordRef.current === key) {
@@ -1312,37 +1427,27 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   };
 
   const handleSaveDefinitionToPageNote = () => {
-    if (!dictResult || !onToggleBookmark) return;
-    const summaryNote = `${dictResult.word} (${dictResult.partOfSpeech}): ${dictResult.persianMeaning} | ${dictResult.englishMeaning}`;
-    const existingNote = currentBookmark?.note ? `${currentBookmark.note}\n• ${summaryNote}` : `• ${summaryNote}`;
-    if (currentBookmark && onUpdateBookmarkNote) {
-      onUpdateBookmarkNote(currentBookmark.id, existingNote);
-    } else {
-      onToggleBookmark(currentPage, existingNote);
-    }
+    if (!dictResult) return;
+    upsertVocabularyItem({
+      word: dictResult.word,
+      pronunciation: dictResult.pronunciation || '',
+      partOfSpeech: dictResult.partOfSpeech,
+      persianMeaning: dictResult.persianMeaning,
+      englishMeaning: dictResult.englishMeaning,
+      contextExplanation: dictResult.contextExplanation,
+      bookId,
+      bookTitle: bookTitle || 'General Reading',
+      page: currentPage,
+    });
 
-    if (auth.currentUser) {
-      auth.currentUser
-        .getIdToken()
-        .then(token =>
-          fetch('/api/cloudsql/vocabulary', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({
-              word: dictResult.word,
-              partOfSpeech: dictResult.partOfSpeech,
-              persianMeaning: dictResult.persianMeaning,
-              englishMeaning: dictResult.englishMeaning,
-              contextExplanation: dictResult.contextExplanation,
-              bookTitle: bookTitle || '',
-              page: currentPage,
-            }),
-          })
-        )
-        .catch(() => {});
+    if (onToggleBookmark) {
+      const summaryNote = `${dictResult.word} (${dictResult.partOfSpeech}): ${dictResult.persianMeaning} | ${dictResult.englishMeaning}`;
+      const existingNote = currentBookmark?.note ? `${currentBookmark.note}\n• ${summaryNote}` : `• ${summaryNote}`;
+      if (currentBookmark && onUpdateBookmarkNote) {
+        onUpdateBookmarkNote(currentBookmark.id, existingNote);
+      } else {
+        onToggleBookmark(currentPage, existingNote);
+      }
     }
 
     setSavedDictToPin(true);
@@ -1506,11 +1611,32 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             </button>
           )}
 
+          {/* Open Table of Contents / Chapters Drawer */}
+          <button
+            type="button"
+            onClick={() => {
+              setIsChaptersDrawerOpen(v => !v);
+              setIsBookmarksDrawerOpen(false);
+              setIsSearchOpen(false);
+              setIsDictionaryOpen(false);
+            }}
+            className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
+              isChaptersDrawerOpen
+                ? 'bg-[#1DB954] text-black'
+                : 'bg-white/10 hover:bg-white/20 text-white'
+            }`}
+            title="Open Table of Contents & Chapters"
+          >
+            <ListTree className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Chapters</span>
+          </button>
+
           {/* Open Bookmarks & Notes Drawer */}
           <button
             type="button"
             onClick={() => {
               setIsBookmarksDrawerOpen(v => !v);
+              setIsChaptersDrawerOpen(false);
               setIsSearchOpen(false);
             }}
             className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
@@ -1544,6 +1670,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             onClick={() => {
               setIsSearchOpen(v => !v);
               setIsBookmarksDrawerOpen(false);
+              setIsChaptersDrawerOpen(false);
               setIsDictionaryOpen(false);
             }}
             className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
@@ -1563,6 +1690,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             onClick={() => {
               setIsDictionaryOpen(v => !v);
               setIsBookmarksDrawerOpen(false);
+              setIsChaptersDrawerOpen(false);
             }}
             className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
               isDictionaryOpen
@@ -2079,6 +2207,70 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Floating Table of Contents / Chapters & Sections Drawer */}
+      {isChaptersDrawerOpen && (
+        <div className="w-full sm:w-80 sm:left-4 sm:top-12 sm:absolute z-30 bg-[#181818] text-white border border-[#333333] sm:rounded-xl shadow-2xl p-3.5 space-y-3 max-h-[75vh] overflow-y-auto">
+          <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
+            <div>
+              <h4 className="text-xs font-bold flex items-center gap-1.5">
+                <ListTree className="w-3.5 h-3.5 text-[#1DB954]" />
+                <span>{hasEmbeddedOutline ? 'Table of Contents' : 'Chapters & Reading Sections'}</span>
+              </h4>
+              <p className="text-[10px] text-[#B3B3B3] mt-0.5">
+                {hasEmbeddedOutline
+                  ? `${pdfChapters.length} chapters in this book`
+                  : `Quick page milestones across ${totalPages} pages`}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsChaptersDrawerOpen(false)}
+              className="p-1 rounded hover:bg-white/10"
+              title="Close Chapters"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="space-y-1">
+            {pdfChapters.map((ch, idx) => {
+              const nextChPage = pdfChapters[idx + 1]?.page || totalPages + 1;
+              const isCurrentSection =
+                currentPage >= ch.page && currentPage < nextChPage;
+
+              return (
+                <button
+                  key={ch.id}
+                  type="button"
+                  dir="auto"
+                  onClick={() => {
+                    goToPage(ch.page);
+                    setIsChaptersDrawerOpen(false);
+                  }}
+                  style={{ paddingLeft: `${10 + ch.level * 12}px` }}
+                  className={`w-full text-left py-2 pr-2.5 rounded-lg text-xs flex items-center justify-between gap-2 transition-colors ${
+                    isCurrentSection
+                      ? 'bg-[#1DB954]/20 border border-[#1DB954]/50 text-white font-semibold'
+                      : 'bg-[#242424] hover:bg-[#2E2E2E] text-white/85'
+                  }`}
+                >
+                  <span className="truncate leading-snug">{ch.title}</span>
+                  <span
+                    className={`font-mono text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
+                      isCurrentSection
+                        ? 'bg-[#1DB954] text-black font-bold'
+                        : 'bg-black/40 text-[#B3B3B3]'
+                    }`}
+                  >
+                    p. {ch.page}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
 
