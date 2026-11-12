@@ -3,6 +3,7 @@ import { StringSession } from 'telegram/sessions/index.js';
 import { Logger } from 'telegram/extensions/index.js';
 import fs from 'fs';
 import path from 'path';
+import builtInCatalogJson from '../src/data/builtInExploreCatalog.json' with { type: 'json' };
 
 const DEFAULT_API_ID = 2040;
 const DEFAULT_API_HASH = 'b18441a1ff607e10a989891a5462e627';
@@ -27,11 +28,29 @@ if (typeof process !== 'undefined' && process.on) {
 // Reusable connected client cache + in-flight connection lock so parallel requests
 // never open duplicate TCP sockets with the same StringSession (which causes 406: AUTH_KEY_DUPLICATED)
 const clientPool = new Map<string, TelegramClient>();
+const clientIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const clientConnectingPool = new Map<string, Promise<TelegramClient>>();
 const invalidatedSessions = new Set<string>();
 
 function getSessionPoolKey(sessionStr: string, apiId: number): string {
   return `${apiId}:${sessionStr.slice(0, 48)}`;
+}
+
+// Disconnect idle MTProto sockets after 10 seconds so AI Studio and Vercel never hold simultaneous open sockets
+function scheduleIdleDisconnect(sessionStr: string, apiId: number): void {
+  if (!sessionStr) return;
+  const key = getSessionPoolKey(sessionStr, apiId);
+  const existingTimer = clientIdleTimers.get(key);
+  if (existingTimer) clearTimeout(existingTimer);
+  const timer = setTimeout(() => {
+    clientIdleTimers.delete(key);
+    const client = clientPool.get(key);
+    if (client) {
+      clientPool.delete(key);
+      client.disconnect().catch(() => {});
+    }
+  }, 10_000);
+  clientIdleTimers.set(key, timer);
 }
 
 function isSessionInvalidError(err: unknown): boolean {
@@ -97,6 +116,7 @@ async function getConnectedClient(
       await client.connect();
       if (sessionStr) {
         clientPool.set(key, client);
+        scheduleIdleDisconnect(sessionStr, apiId);
       }
       return client;
     } catch (connErr) {
@@ -119,11 +139,27 @@ async function getConnectedClient(
 
 type ExtractedTelegramPdf = NonNullable<ReturnType<typeof extractPdfFromMessage>>;
 
-// Permanent cumulative archive of all discovered PDFs per channel so older PDFs never disappear
+const BUILTIN_CATALOG_PATH = path.resolve(process.cwd(), 'src/data/builtInExploreCatalog.json');
 const ARCHIVE_FILE_PATHS = [
   path.resolve(process.cwd(), '.folio-explore-archive.json'),
   '/tmp/folio-explore-archive.json',
 ];
+
+let runtimeBakedSession = String((builtInCatalogJson as { bakedSession?: string })?.bakedSession || '').trim();
+
+function getBakedSession(): string {
+  try {
+    if (fs.existsSync(BUILTIN_CATALOG_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(BUILTIN_CATALOG_PATH, 'utf-8'));
+      if (raw?.bakedSession && typeof raw.bakedSession === 'string') {
+        runtimeBakedSession = raw.bakedSession.trim();
+      }
+    }
+  } catch {
+    // ignore read error on serverless read-only fs
+  }
+  return runtimeBakedSession;
+}
 
 const persistentChannelArchive = new Map<
   string,
@@ -134,9 +170,57 @@ const persistentChannelArchive = new Map<
 >();
 let archiveLoadedFromDisk = false;
 
+function ingestChannelRecordMap(
+  parsedChannels: Record<string, { channelTitle: string; pdfs: ExtractedTelegramPdf[] }> | undefined
+) {
+  if (!parsedChannels || typeof parsedChannels !== 'object') return;
+  for (const [ch, entry] of Object.entries(parsedChannels)) {
+    const cleanCh = ch.toLowerCase().trim();
+    if (!cleanCh || !entry || !Array.isArray(entry.pdfs)) continue;
+    const existing = persistentChannelArchive.get(cleanCh) || {
+      channelTitle: entry.channelTitle || `@${cleanCh}`,
+      pdfsByMsgId: new Map<number, ExtractedTelegramPdf>(),
+    };
+    for (const pdf of entry.pdfs) {
+      if (pdf && typeof pdf.messageId === 'number') {
+        existing.pdfsByMsgId.set(pdf.messageId, {
+          ...pdf,
+          channelUsername: cleanCh,
+        });
+      }
+    }
+    persistentChannelArchive.set(cleanCh, existing);
+  }
+}
+
 function loadArchiveFromDiskOnce() {
   if (archiveLoadedFromDisk) return;
   archiveLoadedFromDisk = true;
+
+  // 1. Load compiled-in src/data/builtInExploreCatalog.json first (works on Vercel out-of-the-box)
+  try {
+    const staticChannels = (
+      builtInCatalogJson as {
+        channels?: Record<string, { channelTitle: string; pdfs: ExtractedTelegramPdf[] }>;
+      }
+    )?.channels;
+    ingestChannelRecordMap(staticChannels);
+  } catch {
+    // ignore
+  }
+
+  // 2. Load latest on-disk src/data/builtInExploreCatalog.json if updated at runtime
+  try {
+    if (fs.existsSync(BUILTIN_CATALOG_PATH)) {
+      const raw = JSON.parse(fs.readFileSync(BUILTIN_CATALOG_PATH, 'utf-8'));
+      if (raw?.bakedSession) runtimeBakedSession = String(raw.bakedSession).trim();
+      ingestChannelRecordMap(raw?.channels);
+    }
+  } catch {
+    // ignore
+  }
+
+  // 3. Load legacy runtime archive files if present
   for (const filePath of ARCHIVE_FILE_PATHS) {
     try {
       if (fs.existsSync(filePath)) {
@@ -145,23 +229,7 @@ function loadArchiveFromDiskOnce() {
           string,
           { channelTitle: string; pdfs: ExtractedTelegramPdf[] }
         >;
-        for (const [ch, entry] of Object.entries(parsed || {})) {
-          const cleanCh = ch.toLowerCase().trim();
-          if (!cleanCh || !entry || !Array.isArray(entry.pdfs)) continue;
-          const existing = persistentChannelArchive.get(cleanCh) || {
-            channelTitle: entry.channelTitle || `@${cleanCh}`,
-            pdfsByMsgId: new Map<number, ExtractedTelegramPdf>(),
-          };
-          for (const pdf of entry.pdfs) {
-            if (pdf && typeof pdf.messageId === 'number') {
-              existing.pdfsByMsgId.set(pdf.messageId, {
-                ...pdf,
-                channelUsername: cleanCh,
-              });
-            }
-          }
-          persistentChannelArchive.set(cleanCh, existing);
-        }
+        ingestChannelRecordMap(parsed);
         break;
       }
     } catch {
@@ -170,7 +238,10 @@ function loadArchiveFromDiskOnce() {
   }
 }
 
-function saveArchiveToDisk() {
+function saveArchiveToDisk(newBakedSession?: string) {
+  if (newBakedSession && newBakedSession.trim()) {
+    runtimeBakedSession = newBakedSession.trim();
+  }
   const serialized: Record<string, { channelTitle: string; pdfs: ExtractedTelegramPdf[] }> = {};
   for (const [ch, entry] of persistentChannelArchive.entries()) {
     serialized[ch] = {
@@ -178,6 +249,23 @@ function saveArchiveToDisk() {
       pdfs: Array.from(entry.pdfsByMsgId.values()),
     };
   }
+
+  // Write to src/data/builtInExploreCatalog.json so git push / Vercel deploy includes the books and session inside the app
+  try {
+    const builtInPayload = JSON.stringify(
+      {
+        bakedSession: runtimeBakedSession || '',
+        defaultChannels: 'ocbooks',
+        channels: serialized,
+      },
+      null,
+      2
+    );
+    fs.writeFileSync(BUILTIN_CATALOG_PATH, builtInPayload, 'utf-8');
+  } catch {
+    // ignore on read-only serverless fs
+  }
+
   const json = JSON.stringify(serialized);
   for (const filePath of ARCHIVE_FILE_PATHS) {
     try {
@@ -575,10 +663,11 @@ export default async function handler(req: any, res: any) {
 
   const headerSession = String(req.headers?.['x-telegram-session'] || '').trim();
   const querySession = String(req.query?.session || '').trim();
+  const bakedSession = getBakedSession();
   const envSession = (process.env.TELEGRAM_SESSION || '').trim();
 
   // Pick a valid session that hasn't been invalidated by AUTH_KEY_DUPLICATED
-  const candidateSessions = [envSession, headerSession, querySession].filter(Boolean);
+  const candidateSessions = [headerSession, querySession, bakedSession, envSession].filter(Boolean);
   const validCandidateSession = candidateSessions.find(s => !invalidatedSessions.has(s)) || '';
   const wasSessionInvalidated =
     candidateSessions.length > 0 && !validCandidateSession;
@@ -808,6 +897,8 @@ export default async function handler(req: any, res: any) {
       };
 
       if (!sessionFailedDuringScan) {
+        saveArchiveToDisk(sessionToUse);
+        scheduleIdleDisconnect(sessionToUse, apiId);
         exploreCache = {
           timestamp: now,
           key: cacheKey,
@@ -942,6 +1033,8 @@ export default async function handler(req: any, res: any) {
       const sessionString = (client.session.save() as unknown as string) || '';
       invalidatedSessions.delete(sessionString);
       clientPool.set(getSessionPoolKey(sessionString, apiId), client);
+      scheduleIdleDisconnect(sessionString, apiId);
+      saveArchiveToDisk(sessionString);
 
       return res.status(200).json({
         ok: true,

@@ -229,8 +229,16 @@ export const TelegramChannelModal: React.FC<TelegramChannelModalProps> = ({
       setNeedsPassword(false);
       setPhoneCode('');
       setTwoFaPassword('');
-      setSuccessBanner('Connected! You can now scan multiple channels or copy your session for Vercel.');
       refreshStatus();
+
+      const targetChannels = normalizeMultipleChannels(channelInput || '@ocbooks').join(', ') || 'ocbooks';
+      onChangeChannel(targetChannels);
+      setSuccessBanner('Connected! Baking @ocbooks catalog & session directly into the app for Vercel...');
+      const feed = await fetchExploreChannelFeed(targetChannels, true);
+      setPdfs(feed.allPdfs);
+      setSuccessBanner(
+        `Saved ${feed.allPdfs.length} books & your session directly into the app code (src/data/builtInExploreCatalog.json)! Ready for Vercel with zero setup needed.`
+      );
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Failed to verify code.');
     } finally {

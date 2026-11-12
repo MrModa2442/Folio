@@ -2,6 +2,7 @@ import { Book, CoverPattern, TelegramConfigStatus, TelegramPdfItem } from '../ty
 import { extractPdfMetadata } from '../utils/pdfParser';
 import { cleanPdfFilename, sanitizeBookTitle, sanitizeBookAuthor } from '../utils/library';
 import { storePdfBlob, getBookCover, storeBookCover } from './db';
+import builtInCatalogJson from '../data/builtInExploreCatalog.json';
 
 const PALETTE = [
   '#1E293B', // Slate
@@ -30,14 +31,38 @@ export interface ExploreTelegramFeedResponse {
   allPdfs: TelegramPdfItem[];
 }
 
-function loadLocalExploreArchive(): ExploreChannelGroup[] {
+function getBuiltInCatalogGroups(): ExploreChannelGroup[] {
   try {
-    const raw = localStorage.getItem(STORAGE_EXPLORE_ARCHIVE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    const rawChannels = (
+      builtInCatalogJson as {
+        channels?: Record<string, { channelTitle?: string; pdfs?: TelegramPdfItem[] }>;
+      }
+    )?.channels;
+    if (!rawChannels || typeof rawChannels !== 'object') return [];
+    const groups: ExploreChannelGroup[] = [];
+    for (const [ch, entry] of Object.entries(rawChannels)) {
+      if (!ch || !entry || !Array.isArray(entry.pdfs)) continue;
+      groups.push({
+        channel: ch,
+        channelTitle: entry.channelTitle || `@${ch}`,
+        pdfs: entry.pdfs,
+      });
+    }
+    return groups;
   } catch {
     return [];
+  }
+}
+
+function loadLocalExploreArchive(): ExploreChannelGroup[] {
+  const builtIn = getBuiltInCatalogGroups();
+  try {
+    const raw = localStorage.getItem(STORAGE_EXPLORE_ARCHIVE_KEY);
+    if (!raw) return builtIn;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? [...builtIn, ...parsed] : builtIn;
+  } catch {
+    return builtIn;
   }
 }
 
