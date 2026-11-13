@@ -200,7 +200,7 @@ function loadArchiveFromDiskOnce() {
   // 1. Load compiled-in src/data/builtInExploreCatalog.json first (works on Vercel out-of-the-box)
   try {
     const staticChannels = (
-      builtInCatalogJson as {
+      builtInCatalogJson as unknown as {
         channels?: Record<string, { channelTitle: string; pdfs: ExtractedTelegramPdf[] }>;
       }
     )?.channels;
@@ -666,8 +666,15 @@ export default async function handler(req: any, res: any) {
   const bakedSession = getBakedSession();
   const envSession = (process.env.TELEGRAM_SESSION || '').trim();
 
+  // If the owner's browser sends a verified session header that isn't baked into src/data/builtInExploreCatalog.json yet,
+  // bake it into the source code immediately so Vercel deployments have it built in.
+  if (headerSession && !invalidatedSessions.has(headerSession) && headerSession !== bakedSession) {
+    loadArchiveFromDiskOnce();
+    saveArchiveToDisk(headerSession);
+  }
+
   // Pick a valid session that hasn't been invalidated by AUTH_KEY_DUPLICATED
-  const candidateSessions = [headerSession, querySession, bakedSession, envSession].filter(Boolean);
+  const candidateSessions = [headerSession, querySession, getBakedSession(), envSession].filter(Boolean);
   const validCandidateSession = candidateSessions.find(s => !invalidatedSessions.has(s)) || '';
   const wasSessionInvalidated =
     candidateSessions.length > 0 && !validCandidateSession;

@@ -40,6 +40,7 @@ import { VocabularyHub } from './components/VocabularyHub';
 import { CustomizeAppearanceModal } from './components/CustomizeAppearanceModal';
 import {
   fetchExploreChannelFeed,
+  fetchTelegramStatus,
   downloadAndImportTelegramPdf,
   normalizeChannelInput,
 } from './services/telegramSync';
@@ -157,6 +158,7 @@ export default function App() {
 
   // Listen for local vocabulary updates (e.g. when looking up words inside the PDF reader)
   useEffect(() => {
+    fetchTelegramStatus().catch(() => {});
     return subscribeToVocabularyUpdates(() => {
       setVocabulary(loadSavedVocabulary());
     });
@@ -827,10 +829,6 @@ export default function App() {
         onChangeTheme={setTheme}
         preferences={uiPreferences}
         onChangePreferences={setUiPreferences}
-        onOpenTelegramSync={() => {
-          setIsCustomizeOpen(false);
-          setIsTelegramSyncOpen(true);
-        }}
       />
 
       {/* Modals & Fullscreen Reader */}

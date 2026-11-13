@@ -34,7 +34,7 @@ export interface ExploreTelegramFeedResponse {
 function getBuiltInCatalogGroups(): ExploreChannelGroup[] {
   try {
     const rawChannels = (
-      builtInCatalogJson as {
+      builtInCatalogJson as unknown as {
         channels?: Record<string, { channelTitle?: string; pdfs?: TelegramPdfItem[] }>;
       }
     )?.channels;
