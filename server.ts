@@ -7,6 +7,7 @@ import { createServer as createViteServer } from 'vite';
 import telegramHandler, { normalizeTelegramChannel } from './api/telegram.js';
 import ocrHandler from './api/ocr.js';
 import dictionaryHandler from './api/dictionary.js';
+import chaptersHandler from './api/chapters.js';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
 import {
   getUserLibraryFromSql,
@@ -39,6 +40,11 @@ async function startServer() {
   // Instant On-Page Dictionary, Word Translator & Literary Explainer endpoint
   app.use('/api/dictionary', (req, res) => {
     return dictionaryHandler(req, res);
+  });
+
+  // AI Table of Contents & Chapter Page-Range Extractor endpoint
+  app.use('/api/chapters', (req, res) => {
+    return chaptersHandler(req, res);
   });
 
   // Authenticated Cloud SQL (PostgreSQL) endpoints
