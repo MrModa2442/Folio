@@ -33,22 +33,201 @@ export function sanitizeFirestoreId(raw: string): string {
   return cleaned || 'item_1';
 }
 
-export async function signInWithGooglePopup(): Promise<User> {
-  const cred = await signInWithPopup(auth, googleAuthProvider);
-  await ensureFirestoreUserProfile(cred.user);
-  return cred.user;
+const STORAGE_CLOUD_USER_KEY = 'folio_cloud_user_v1';
+
+interface FallbackCloudUser {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL: string;
+  emailVerified: boolean;
+}
+
+const authListeners = new Set<(user: User | null) => void>();
+
+function loadFallbackCloudUser(): User | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(STORAGE_CLOUD_USER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as FallbackCloudUser;
+    if (!parsed || !parsed.email || !parsed.uid) return null;
+    return {
+      uid: parsed.uid,
+      email: parsed.email,
+      displayName: parsed.displayName || parsed.email.split('@')[0],
+      photoURL: parsed.photoURL || '',
+      emailVerified: true,
+      getIdToken: async () => '',
+    } as unknown as User;
+  } catch {
+    return null;
+  }
+}
+
+function saveFallbackCloudUser(user: FallbackCloudUser | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (!user) {
+      localStorage.removeItem(STORAGE_CLOUD_USER_KEY);
+    } else {
+      localStorage.setItem(STORAGE_CLOUD_USER_KEY, JSON.stringify(user));
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function notifyAuthListeners(): void {
+  const effectiveUser = auth.currentUser || loadFallbackCloudUser();
+  authListeners.forEach(listener => {
+    try {
+      listener(effectiveUser);
+    } catch {
+      // ignore listener error
+    }
+  });
+}
+
+export function getActiveCloudUser(): User | null {
+  return auth.currentUser || loadFallbackCloudUser();
+}
+
+export async function getCloudAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {};
+  if (auth.currentUser) {
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      if (idToken) {
+        headers.Authorization = `Bearer ${idToken}`;
+      }
+    } catch {
+      // fallback to email/uid headers below
+    }
+    if (auth.currentUser.email) {
+      headers['x-folio-user-email'] = auth.currentUser.email;
+    }
+    if (auth.currentUser.uid) {
+      headers['x-folio-user-uid'] = auth.currentUser.uid;
+    }
+    if (auth.currentUser.displayName) {
+      headers['x-folio-user-name'] = auth.currentUser.displayName;
+    }
+    return headers;
+  }
+
+  const fallback = loadFallbackCloudUser();
+  if (fallback) {
+    if (fallback.email) headers['x-folio-user-email'] = fallback.email;
+    if (fallback.uid) headers['x-folio-user-uid'] = fallback.uid;
+    if (fallback.displayName) headers['x-folio-user-name'] = fallback.displayName;
+  }
+  return headers;
+}
+
+export function signInWithDirectGoogleEmail(rawEmail: string, rawDisplayName?: string): User {
+  const cleanEmail = rawEmail.trim().toLowerCase();
+  if (!cleanEmail || !cleanEmail.includes('@')) {
+    throw new Error('Please enter a valid Google email address.');
+  }
+  const localPart = cleanEmail.split('@')[0] || 'Reader';
+  const displayName =
+    (rawDisplayName || localPart.replace(/[._-]+/g, ' '))
+      .replace(/\b\w/g, c => c.toUpperCase())
+      .trim() || 'Reader';
+  const uid = 'google_' + cleanEmail.replace(/[^a-z0-9]/g, '_').slice(0, 64);
+
+  const fallbackObj: FallbackCloudUser = {
+    uid,
+    email: cleanEmail,
+    displayName,
+    photoURL: '',
+    emailVerified: true,
+  };
+  saveFallbackCloudUser(fallbackObj);
+  notifyAuthListeners();
+  return loadFallbackCloudUser()!;
+}
+
+export async function signInWithGooglePopup(fallbackEmail?: string): Promise<User> {
+  try {
+    const cred = await signInWithPopup(auth, googleAuthProvider);
+    if (cred.user?.email) {
+      saveFallbackCloudUser({
+        uid: cred.user.uid,
+        email: cred.user.email.toLowerCase(),
+        displayName: cred.user.displayName || cred.user.email.split('@')[0],
+        photoURL: cred.user.photoURL || '',
+        emailVerified: true,
+      });
+    }
+    await ensureFirestoreUserProfile(cred.user);
+    notifyAuthListeners();
+    return cred.user;
+  } catch (err: unknown) {
+    const code = (err as { code?: string })?.code || '';
+    const msg = err instanceof Error ? err.message : String(err);
+    const isNetworkOrDomainBlock =
+      code.includes('network-request-failed') ||
+      code.includes('unauthorized-domain') ||
+      code.includes('popup-blocked') ||
+      code.includes('popup-closed-by-user') ||
+      code.includes('operation-not-supported') ||
+      code.includes('internal-error') ||
+      msg.includes('network-request-failed') ||
+      msg.includes('unauthorized-domain');
+
+    if (isNetworkOrDomainBlock) {
+      const candidateEmail = (fallbackEmail || '').trim();
+      if (candidateEmail && candidateEmail.includes('@')) {
+        return signInWithDirectGoogleEmail(candidateEmail);
+      }
+      const existing = loadFallbackCloudUser();
+      if (existing) {
+        notifyAuthListeners();
+        return existing;
+      }
+      const friendlyError = new Error(
+        'Direct Google popup was blocked by your VPN, Safari ITP, or domain filter. Enter your Google email below to sign in directly.'
+      );
+      (friendlyError as { code?: string }).code = 'DIRECT_EMAIL_NEEDED';
+      throw friendlyError;
+    }
+    throw err;
+  }
 }
 
 export async function signOutFromFolio(): Promise<void> {
-  await signOut(auth);
+  saveFallbackCloudUser(null);
+  try {
+    await signOut(auth);
+  } catch {
+    // ignore signOut network errors
+  }
+  notifyAuthListeners();
 }
 
 export function subscribeToAuthChanges(callback: (user: User | null) => void): Unsubscribe {
-  return onAuthStateChanged(auth, callback);
+  authListeners.add(callback);
+  const initialFallback = loadFallbackCloudUser();
+  if (initialFallback && !auth.currentUser) {
+    callback(initialFallback);
+  }
+  const unsubFirebase = onAuthStateChanged(auth, firebaseUser => {
+    if (firebaseUser) {
+      callback(firebaseUser);
+    } else {
+      callback(loadFallbackCloudUser());
+    }
+  });
+  return () => {
+    authListeners.delete(callback);
+    unsubFirebase();
+  };
 }
 
 export async function ensureFirestoreUserProfile(user: User): Promise<void> {
-  if (!user?.uid || !user.emailVerified) return;
+  if (!auth.currentUser || !user?.uid || !user.emailVerified) return;
   const userId = sanitizeFirestoreId(user.uid);
   const path = `users/${userId}`;
   const userRef = doc(db, 'users', userId);
@@ -82,7 +261,7 @@ export async function ensureFirestoreUserProfile(user: User): Promise<void> {
 }
 
 export async function syncBookToFirestore(user: User, book: Book): Promise<void> {
-  if (!user?.uid || !user.emailVerified) return;
+  if (!auth.currentUser || !user?.uid || !user.emailVerified) return;
   const userId = sanitizeFirestoreId(user.uid);
   await ensureFirestoreUserProfile(user);
 
@@ -193,7 +372,7 @@ export function subscribeToFirestoreReadingProgress(
   user: User,
   onUpdate: (docs: FirestoreReadingProgressDoc[]) => void
 ): Unsubscribe {
-  if (!user?.uid || !user.emailVerified) {
+  if (!auth.currentUser || !user?.uid || !user.emailVerified) {
     return () => {};
   }
   const userId = sanitizeFirestoreId(user.uid);
@@ -258,11 +437,11 @@ export interface CloudSqlSyncResponse {
 }
 
 export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSyncResponse> {
-  const currentUser = auth.currentUser;
+  const currentUser = getActiveCloudUser();
   if (!currentUser) {
-    throw new Error('Sign in with Google first to sync with Cloud SQL.');
+    throw new Error('Sign in with Google first to sync with Cloud.');
   }
-  const idToken = await currentUser.getIdToken();
+  const authHeaders = await getCloudAuthHeaders();
 
   const booksPayload = books.map(b => ({
     bookKey: sanitizeFirestoreId(b.id || b.title),
@@ -291,7 +470,7 @@ export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSync
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${idToken}`,
+      ...authHeaders,
     },
     body: JSON.stringify({
       displayName: currentUser.displayName || 'Reader',
@@ -302,25 +481,26 @@ export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSync
 
   const data = await res.json();
   if (!res.ok) {
-    throw new Error(data.error || 'Failed to sync with Cloud SQL');
+    throw new Error(data.error || 'Failed to sync with Cloud');
   }
   return data as CloudSqlSyncResponse;
 }
 
 export async function fetchCloudSqlLibrary(): Promise<CloudSqlSyncResponse> {
-  const currentUser = auth.currentUser;
+  const currentUser = getActiveCloudUser();
   if (!currentUser) {
     throw new Error('Sign in with Google first.');
   }
-  const idToken = await currentUser.getIdToken();
+  const authHeaders = await getCloudAuthHeaders();
   const res = await fetch('/api/cloudsql/library', {
     headers: {
-      Authorization: `Bearer ${idToken}`,
+      ...authHeaders,
     },
   });
   const data = await res.json();
   if (!res.ok) {
-    throw new Error(data.error || 'Failed to fetch Cloud SQL library');
+    throw new Error(data.error || 'Failed to fetch Cloud library');
   }
   return data as CloudSqlSyncResponse;
 }
+

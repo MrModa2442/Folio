@@ -1,5 +1,5 @@
 import { SavedVocabularyItem } from '../types/library';
-import { auth } from '../lib/firebase';
+import { getActiveCloudUser, getCloudAuthHeaders } from './cloudSync';
 
 const STORAGE_VOCABULARY_KEY = 'folio_vocabulary_v1';
 const VOCABULARY_EVENT_NAME = 'folio-vocabulary-updated';
@@ -76,15 +76,14 @@ export function upsertVocabularyItem(
 
   saveVocabularyList(nextList);
 
-  if (syncToCloud && auth.currentUser) {
-    auth.currentUser
-      .getIdToken()
-      .then(token =>
+  if (syncToCloud && getActiveCloudUser()) {
+    getCloudAuthHeaders()
+      .then(authHeaders =>
         fetch('/api/cloudsql/vocabulary', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
+            ...authHeaders,
           },
           body: JSON.stringify({
             word: newItem.word,

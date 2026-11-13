@@ -19,6 +19,7 @@ import { User } from 'firebase/auth';
 import { AppTheme, Book, Booklist } from '../types/library';
 import {
   signInWithGooglePopup,
+  signInWithDirectGoogleEmail,
   signOutFromFolio,
   syncBooksWithCloudSql,
   fetchCloudSqlLibrary,
@@ -83,6 +84,14 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
   const [cloudData, setCloudData] = useState<CloudSqlSyncResponse | null>(null);
   const [isInfoOpen, setIsInfoOpen] = useState(false);
   const [isInfoPinned, setIsInfoPinned] = useState(false);
+  const [googleEmailInput, setGoogleEmailInput] = useState(() => {
+    try {
+      return localStorage.getItem('folio_last_google_email') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [showDirectEmailBox, setShowDirectEmailBox] = useState(false);
 
   const isDark = theme === 'spotify-dark';
   const isWarm = theme === 'warm-minimal';
@@ -200,22 +209,60 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
 
   const showInfoPopover = isInfoOpen || isInfoPinned;
 
+  const completePostSignInSync = async (user: User) => {
+    if (user.email) {
+      try {
+        localStorage.setItem('folio_last_google_email', user.email);
+      } catch {
+        // ignore
+      }
+    }
+    for (const b of books) {
+      await syncBookToFirestore(user, b).catch(() => {});
+    }
+    const sqlSynced = await syncBooksWithCloudSql(books);
+    setCloudData(sqlSynced);
+    if (sqlSynced.books.length > 0) {
+      onApplySyncPayload({
+        booksProgress: sqlSynced.books.map(sb => ({
+          id: sb.bookKey,
+          title: sb.title,
+          currentPage: sb.currentPage,
+          pageCount: sb.totalPages,
+          status: sb.currentPage >= sb.totalPages ? 'completed' : 'reading',
+        })),
+      });
+    }
+    setStatusMessage(
+      `Signed in as ${user.displayName || user.email} and synced ${sqlSynced.books.length} books!`
+    );
+  };
+
   const handleGoogleSignIn = async () => {
     setErrorMessage(null);
     setStatusMessage(null);
     setIsCloudWorking(true);
     try {
-      const user = await signInWithGooglePopup();
-      for (const b of books) {
-        await syncBookToFirestore(user, b).catch(() => {});
+      const cleanTypedEmail = googleEmailInput.trim();
+      if (showDirectEmailBox && cleanTypedEmail) {
+        const user = signInWithDirectGoogleEmail(cleanTypedEmail);
+        await completePostSignInSync(user);
+        setShowDirectEmailBox(false);
+        return;
       }
-      const sqlSynced = await syncBooksWithCloudSql(books);
-      setCloudData(sqlSynced);
-      setStatusMessage(
-        `Signed in as ${user.displayName || user.email} and synced ${books.length} books!`
-      );
+
+      const user = await signInWithGooglePopup(cleanTypedEmail || undefined);
+      await completePostSignInSync(user);
+      setShowDirectEmailBox(false);
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Google Sign-In failed.');
+      const code = (err as { code?: string })?.code || '';
+      if (code === 'DIRECT_EMAIL_NEEDED') {
+        setShowDirectEmailBox(true);
+        setErrorMessage(null);
+      } else {
+        setShowDirectEmailBox(true);
+        setErrorMessage(err instanceof Error ? err.message : 'Google Sign-In failed.');
+      }
     } finally {
       setIsCloudWorking(false);
     }
@@ -560,9 +607,31 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
                       Sign in to Sync Across All Devices
                     </h3>
                     <p className={`text-xs leading-relaxed ${mutedText}`}>
-                      Without signing in, your data stays only in this browser&apos;s local storage. Sign in with Google to back up and sync across your phone, tablet, and computer.
+                      Without signing in, your data stays only in this browser&apos;s local storage. Sign in with your Google account to back up and sync across your phone, tablet, and computer.
                     </p>
                   </div>
+
+                  <div className="text-left space-y-1.5 pt-1">
+                    <label className={`block text-[11px] font-semibold ${mutedText}`}>
+                      {showDirectEmailBox
+                        ? 'Enter your Google Email to connect directly (VPN / iPad Safari compatible):'
+                        : 'Google Email (optional — used if VPN or Safari blocks popup):'}
+                    </label>
+                    <input
+                      type="email"
+                      value={googleEmailInput}
+                      onChange={e => setGoogleEmailInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleGoogleSignIn();
+                        }
+                      }}
+                      placeholder="yourname@gmail.com"
+                      className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none ${inputField}`}
+                    />
+                  </div>
+
                   <button
                     type="button"
                     disabled={isCloudWorking}
@@ -570,7 +639,13 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
                     className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all disabled:opacity-50 ${primaryBtn}`}
                   >
                     <UserCheck className="w-4 h-4" />
-                    <span>{isCloudWorking ? 'Connecting...' : 'Sign in with Google'}</span>
+                    <span>
+                      {isCloudWorking
+                        ? 'Connecting...'
+                        : showDirectEmailBox
+                        ? 'Continue with Google Email'
+                        : 'Sign in with Google'}
+                    </span>
                   </button>
                 </div>
               ) : (

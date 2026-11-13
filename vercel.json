@@ -3,6 +3,11 @@
     {
       "source": "/api/telegram/:path*",
       "destination": "/api/telegram?action=:path*"
+    },
+    {
+      "source": "/api/cloudsql/:path*",
+      "destination": "/api/cloudsql?action=:path*"
     }
   ]
 }
+
