@@ -161,6 +161,8 @@ function getBakedSession(): string {
   return runtimeBakedSession;
 }
 
+const MAX_EXPLORE_BOOKS = 250;
+
 const persistentChannelArchive = new Map<
   string,
   {
@@ -181,7 +183,10 @@ function ingestChannelRecordMap(
       channelTitle: entry.channelTitle || `@${cleanCh}`,
       pdfsByMsgId: new Map<number, ExtractedTelegramPdf>(),
     };
-    for (const pdf of entry.pdfs) {
+    const sorted = [...entry.pdfs].sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
+    );
+    for (const pdf of sorted.slice(0, MAX_EXPLORE_BOOKS)) {
       if (pdf && typeof pdf.messageId === 'number') {
         existing.pdfsByMsgId.set(pdf.messageId, {
           ...pdf,
@@ -244,9 +249,14 @@ function saveArchiveToDisk(newBakedSession?: string) {
   }
   const serialized: Record<string, { channelTitle: string; pdfs: ExtractedTelegramPdf[] }> = {};
   for (const [ch, entry] of persistentChannelArchive.entries()) {
+    const sorted = Array.from(entry.pdfsByMsgId.values())
+      .sort(
+        (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
+      )
+      .slice(0, MAX_EXPLORE_BOOKS);
     serialized[ch] = {
       channelTitle: entry.channelTitle,
-      pdfs: Array.from(entry.pdfsByMsgId.values()),
+      pdfs: sorted,
     };
   }
 
@@ -307,12 +317,7 @@ function mergeChannelPdfsIntoArchive(
     });
   }
 
-  persistentChannelArchive.set(cleanCh, existing);
-  if (changed) {
-    saveArchiveToDisk();
-  }
-
-  // Deduplicate by title across the channel while keeping newest first
+  // Deduplicate by title across the channel while keeping newest first, capped at MAX_EXPLORE_BOOKS (250)
   const allForChannel = Array.from(existing.pdfsByMsgId.values()).sort(
     (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
   );
@@ -328,6 +333,18 @@ function mergeChannelPdfsIntoArchive(
     seenTitles.add(uniqueKey);
     if (titleKey) seenTitles.add(titleKey);
     deduped.push(item);
+    if (deduped.length >= MAX_EXPLORE_BOOKS) break;
+  }
+
+  // Keep map trimmed to MAX_EXPLORE_BOOKS as well
+  existing.pdfsByMsgId.clear();
+  for (const item of deduped) {
+    existing.pdfsByMsgId.set(item.messageId, item);
+  }
+
+  persistentChannelArchive.set(cleanCh, existing);
+  if (changed) {
+    saveArchiveToDisk();
   }
 
   return deduped;
@@ -368,19 +385,20 @@ function buildArchivedExploreResponse(
       channelResults.push({
         channel: cleanCh,
         channelTitle,
-        pdfs: archivedPdfs,
+        pdfs: archivedPdfs.slice(0, MAX_EXPLORE_BOOKS),
       });
     }
   }
 
   allPdfs.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+  const limitedAllPdfs = allPdfs.slice(0, MAX_EXPLORE_BOOKS);
 
   return {
-    configured: allPdfs.length > 0 || serverHasSession,
+    configured: limitedAllPdfs.length > 0 || serverHasSession,
     serverHasSession,
     sessionInvalidated,
     channels: channelResults,
-    allPdfs,
+    allPdfs: limitedAllPdfs,
   };
 }
 
@@ -802,7 +820,7 @@ export default async function handler(req: any, res: any) {
             (entity && 'title' in entity && typeof entity.title === 'string' && entity.title) || archivedTitle;
 
           const hasExistingArchive = Boolean(archivedEntry && archivedEntry.pdfsByMsgId.size > 0);
-          const maxPagesToWalk = !hasExistingArchive || forceRefresh ? 20 : 1;
+          const maxPagesToWalk = !hasExistingArchive || forceRefresh ? 4 : 1;
 
           const freshlyExtracted: ExtractedTelegramPdf[] = [];
           let offsetId = 0;
@@ -837,6 +855,8 @@ export default async function handler(req: any, res: any) {
               }
             }
 
+            if (freshlyExtracted.length >= MAX_EXPLORE_BOOKS) break;
+
             const lastMsg = docMessages[docMessages.length - 1];
             const lastId = lastMsg && 'id' in lastMsg && typeof lastMsg.id === 'number' ? lastMsg.id : 0;
             if (!lastId || lastId === offsetId || docMessages.length < 100) {
@@ -845,7 +865,7 @@ export default async function handler(req: any, res: any) {
             offsetId = lastId;
           }
 
-          // Merge into permanent cumulative archive so older PDFs stay forever
+          // Merge into permanent cumulative archive capped at 250 books
           const cumulativeChannelPdfs = mergeChannelPdfsIntoArchive(
             cleanCh,
             channelTitle,
@@ -865,7 +885,7 @@ export default async function handler(req: any, res: any) {
           channelResults.push({
             channel: cleanCh,
             channelTitle,
-            pdfs: cumulativeChannelPdfs,
+            pdfs: cumulativeChannelPdfs.slice(0, MAX_EXPLORE_BOOKS),
           });
         } catch (chErr) {
           if (isSessionInvalidError(chErr)) {
@@ -887,20 +907,21 @@ export default async function handler(req: any, res: any) {
             channelResults.push({
               channel: cleanCh,
               channelTitle: archivedTitle,
-              pdfs: fallbackArchived,
+              pdfs: fallbackArchived.slice(0, MAX_EXPLORE_BOOKS),
             });
           }
         }
       }
 
       allPdfs.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      const limitedAllPdfs = allPdfs.slice(0, MAX_EXPLORE_BOOKS);
 
       const responseData = {
-        configured: !sessionFailedDuringScan || allPdfs.length > 0,
+        configured: !sessionFailedDuringScan || limitedAllPdfs.length > 0,
         serverHasSession: Boolean(envSession && !invalidatedSessions.has(envSession)),
         sessionInvalidated: sessionFailedDuringScan || wasSessionInvalidated,
         channels: channelResults,
-        allPdfs,
+        allPdfs: limitedAllPdfs,
       };
 
       if (!sessionFailedDuringScan) {

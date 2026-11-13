@@ -225,9 +225,10 @@ export const ExploreShelvesView: React.FC<ExploreShelvesViewProps> = ({
         seenMsgIds.add(msgKey);
         if (titleKey) seenTitles.add(titleKey);
         mergedList.push({ ...item, channelUsername: ch });
+        if (mergedList.length >= 250) break;
       }
 
-      setAllChannelPdfs(mergedList);
+      setAllChannelPdfs(mergedList.slice(0, 250));
     } finally {
       setIsLoadingFeed(false);
     }

@@ -15,6 +15,7 @@ const PALETTE = [
 
 const STORAGE_TG_SESSION_KEY = 'folio_tg_session_v1';
 const STORAGE_EXPLORE_ARCHIVE_KEY = 'folio_explore_pdf_archive_v1';
+export const MAX_EXPLORE_BOOKS = 250;
 const inflightCoverRequests = new Map<string, Promise<string | null>>();
 
 export interface ExploreChannelGroup {
@@ -45,7 +46,7 @@ function getBuiltInCatalogGroups(): ExploreChannelGroup[] {
       groups.push({
         channel: ch,
         channelTitle: entry.channelTitle || `@${ch}`,
-        pdfs: entry.pdfs,
+        pdfs: entry.pdfs.slice(0, MAX_EXPLORE_BOOKS),
       });
     }
     return groups;
@@ -91,7 +92,7 @@ function mergeExploreFeedWithLocalArchive(
     });
   }
 
-  // 2. Merge incoming groups on top (newest items first, keeping all older items)
+  // 2. Merge incoming groups on top (newest items first, keeping up to MAX_EXPLORE_BOOKS)
   for (const grp of incomingGroups) {
     const chKey = normalizeChannelInput(grp.channel);
     if (!chKey) continue;
@@ -112,9 +113,11 @@ function mergeExploreFeedWithLocalArchive(
   const combinedAll: TelegramPdfItem[] = [];
 
   for (const entry of groupMap.values()) {
-    const dedupedPdfs = deduplicateTelegramPdfs(entry.items).sort(
-      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
-    );
+    const dedupedPdfs = deduplicateTelegramPdfs(entry.items)
+      .sort(
+        (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
+      )
+      .slice(0, MAX_EXPLORE_BOOKS);
     mergedGroups.push({
       channel: entry.channel,
       channelTitle: entry.channelTitle,
@@ -123,9 +126,11 @@ function mergeExploreFeedWithLocalArchive(
     combinedAll.push(...dedupedPdfs);
   }
 
-  const finalAllPdfs = deduplicateTelegramPdfs(combinedAll).sort(
-    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
-  );
+  const finalAllPdfs = deduplicateTelegramPdfs(combinedAll)
+    .sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime() || b.messageId - a.messageId
+    )
+    .slice(0, MAX_EXPLORE_BOOKS);
 
   if (mergedGroups.length > 0) {
     saveLocalExploreArchive(mergedGroups);
