@@ -918,14 +918,31 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       return;
     }
 
-    // 2. Clean tap: left 42% goes back, right 42% goes forward
+    // 2. Clean click/tap: ONLY trigger when clicking in the brown sides outside the PDF page itself
     if (Math.abs(dx) < 14 && Math.abs(dy) < 14 && elapsed < 450) {
+      if (target.closest('[data-pdf-page-surface="true"]')) {
+        return;
+      }
+
+      if (canvasRef.current) {
+        const pageRect = canvasRef.current.getBoundingClientRect();
+        // Ignore clicks that fall within the horizontal bounds of the page
+        if (e.clientX >= pageRect.left && e.clientX <= pageRect.right) {
+          return;
+        }
+        if (e.clientX < pageRect.left) {
+          handlePrevPage();
+        } else if (e.clientX > pageRect.right) {
+          handleNextPage();
+        }
+        return;
+      }
+
       const rect = containerRef.current.getBoundingClientRect();
       const relX = (e.clientX - rect.left) / rect.width;
-
-      if (relX <= 0.42) {
+      if (relX <= 0.25) {
         handlePrevPage();
-      } else if (relX >= 0.58) {
+      } else if (relX >= 0.75) {
         handleNextPage();
       }
     }
@@ -2967,7 +2984,10 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           </div>
         ) : (
           <div
-            className="relative shadow-2xl rounded-xs transition-all duration-200"
+            data-pdf-page-surface="true"
+            className={`relative shadow-2xl rounded-xs transition-all duration-200 ${
+              isHighlightMode ? 'cursor-crosshair' : 'cursor-default'
+            }`}
             style={{ filter: getThemeFilter() }}
           >
             {isPageRendering && (
