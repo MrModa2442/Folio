@@ -9,6 +9,12 @@ import {
   loadCachedBookChapters,
   recognizeAndCacheBookChapters,
   subscribeToChapterUpdates,
+  loadCachedBookPageOffset,
+  saveCachedBookPageOffset,
+  clearCachedBookPageOffset,
+  detectAndCacheBookPageOffset,
+  subscribeToPageOffsetUpdates,
+  normalizeDigitsToAsciiClient,
 } from '../services/ocrCache';
 import { upsertVocabularyItem } from '../services/vocabularyStore';
 import {
@@ -122,6 +128,7 @@ interface PdfChapterItem {
   startPage: number;
   endPage: number;
   level: number;
+  isBookPageNumber?: boolean;
 }
 
 interface RealPdfViewerProps {
@@ -222,6 +229,12 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [pagesReadCount, setPagesReadCount] = useState<number>(1);
   const readPagesSetRef = useRef<Set<number>>(new Set([initialPage || 1]));
 
+  // Printed Book Page Number Calibration (pageOffset = pdfPage - printedBookPage, e.g. 15 - 10 = 5)
+  const [pageOffset, setPageOffset] = useState<number>(0);
+  const [isCalibratingPageOffset, setIsCalibratingPageOffset] = useState<boolean>(false);
+  const [isPageSyncPopoverOpen, setIsPageSyncPopoverOpen] = useState<boolean>(false);
+  const [manualPrintedPageInput, setManualPrintedPageInput] = useState<string>('');
+
   // Instant On-Page Dictionary / Word Translator & Explainer state
   const [isDictionaryOpen, setIsDictionaryOpen] = useState<boolean>(false);
   const [dictQuery, setDictQuery] = useState<string>('');
@@ -239,6 +252,28 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const currentBookmark = bookmarks.find(b => b.page === currentPage);
   const currentPageStrokes = highlights[currentPage] || [];
   const docCacheKey = bookId || (arrayBuffer ? `pdf_bytes_${arrayBuffer.byteLength}` : 'default_pdf');
+
+  // Helper to convert any physical PDF page number (1..totalPages) to the Book's Printed Page Number
+  const effectiveOffset = Math.max(0, pageOffset);
+  const totalBookPages = Math.max(1, totalPages - effectiveOffset);
+  const isFrontMatterPage = effectiveOffset > 0 && currentPage <= effectiveOffset;
+  const currentBookPage = currentPage > effectiveOffset ? currentPage - effectiveOffset : currentPage;
+
+  const formatBookPageNumber = useCallback(
+    (pdfPage: number): string => {
+      if (effectiveOffset > 0 && pdfPage <= effectiveOffset) {
+        return `Intro ${pdfPage}`;
+      }
+      return String(pdfPage - effectiveOffset);
+    },
+    [effectiveOffset]
+  );
+
+  // Keep the toolbar page input box synchronized with the Printed Book Page Number (e.g. 10 when on PDF page 15)
+  useEffect(() => {
+    setPageInput(String(currentBookPage));
+    setManualPrintedPageInput(String(currentBookPage));
+  }, [currentBookPage, effectiveOffset]);
 
   // Track unique pages read for the Reading Milestone Reward that unlocks Smart Chapters
   useEffect(() => {
@@ -284,6 +319,13 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       pageTextCacheRef.current.clear();
     });
 
+    const cachedOffset = loadCachedBookPageOffset(docCacheKey);
+    if (cachedOffset !== null) {
+      setPageOffset(cachedOffset);
+    } else {
+      setPageOffset(0);
+    }
+
     const cachedAiChapters = loadCachedBookChapters(docCacheKey);
     if (cachedAiChapters.length > 0) {
       setPdfChapters(cachedAiChapters);
@@ -308,6 +350,12 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       }
     });
 
+    const unsubOffset = subscribeToPageOffsetUpdates(detail => {
+      if (!isMounted || detail.docKey !== docCacheKey) return;
+      setPageOffset(detail.pageOffset);
+      setIsCalibratingPageOffset(false);
+    });
+
     const dataCopy = new Uint8Array(arrayBuffer.slice(0));
 
     const loadingTask = pdfjsLib.getDocument({
@@ -327,8 +375,26 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         setTotalPages(doc.numPages);
         const start = Math.max(1, Math.min(doc.numPages, initialPage || 1));
         setCurrentPage(start);
-        setPageInput(String(start));
         setIsLoadingDoc(false);
+
+        // 1. Immediately calibrate the printed book page number offset (so PDF page 15 matches Book page 10)
+        if (loadCachedBookPageOffset(docCacheKey) === null) {
+          setIsCalibratingPageOffset(true);
+          detectAndCacheBookPageOffset(
+            docCacheKey,
+            bookTitle || 'Book',
+            doc.numPages,
+            doc,
+            start
+          )
+            .then(detected => {
+              if (!isMounted) return;
+              setPageOffset(detected);
+            })
+            .finally(() => {
+              if (isMounted) setIsCalibratingPageOffset(false);
+            });
+        }
 
         const existingAiCh = loadCachedBookChapters(docCacheKey);
         if (existingAiCh.length > 0) {
@@ -337,13 +403,14 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           return;
         }
 
-        // Start AI Table of Contents recognition on the opening pages right away in the background
+        // 2. Start AI Table of Contents recognition on the opening pages right away in the background
         setIsAiRecognizingChapters(true);
         recognizeAndCacheBookChapters(
           docCacheKey,
           bookTitle || 'Book',
           doc.numPages,
-          doc
+          doc,
+          start
         )
           .then(aiCh => {
             if (!isMounted) return;
@@ -463,6 +530,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       isMounted = false;
       unsubOcr();
       unsubChapters();
+      unsubOffset();
       aiScanAbortRef.current++;
       try {
         loadingTask.destroy();
@@ -471,6 +539,26 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       }
     };
   }, [arrayBuffer, docCacheKey, bookTitle]);
+
+  // If user jumps to a body page (>= 5) and pageOffset wasn't confirmed yet, inspect the current page's header/footer
+  useEffect(() => {
+    if (!pdfDoc || currentPage < 5 || isCalibratingPageOffset) return;
+    if (loadCachedBookPageOffset(docCacheKey) !== null) return;
+    setIsCalibratingPageOffset(true);
+    detectAndCacheBookPageOffset(
+      docCacheKey,
+      bookTitle || 'Book',
+      totalPages,
+      pdfDoc,
+      currentPage
+    )
+      .then(detected => {
+        setPageOffset(detected);
+      })
+      .finally(() => {
+        setIsCalibratingPageOffset(false);
+      });
+  }, [pdfDoc, currentPage, docCacheKey, bookTitle, totalPages, isCalibratingPageOffset]);
 
   // Draw highlighter strokes AND active search match boxes on the transparent overlay canvas
   const drawHighlightOverlay = useCallback(
@@ -695,13 +783,12 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     drawHighlightOverlay(null);
   }, [highlights, currentPage, isSearchOpen, searchResults, activeHitIndex, drawHighlightOverlay]);
 
-  // Page turns
+  // Page turns (goToPage takes physical PDF page 1..totalPages; goToBookPageInput takes printed book page number)
   const goToPage = useCallback(
     (pageNum: number, scrollRatioY?: number) => {
       if (!pdfDoc) return;
       const clamped = Math.max(1, Math.min(totalPages, pageNum));
       setCurrentPage(clamped);
-      setPageInput(String(clamped));
       if (onPageChange) {
         onPageChange(clamped, totalPages);
       }
@@ -722,6 +809,26 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       }
     },
     [pdfDoc, totalPages, onPageChange]
+  );
+
+  // Navigate by Printed Book Page Number (supports Persian ۱۰, Arabic ١٠, and English 10 digits)
+  const goToBookPageInput = useCallback(
+    (rawInput: string) => {
+      const normalized = normalizeDigitsToAsciiClient(rawInput || '').trim();
+      const parsed = parseInt(normalized.replace(/[^\d-]/g, ''), 10);
+      if (!Number.isFinite(parsed)) {
+        setPageInput(String(currentBookPage));
+        return;
+      }
+      if (parsed <= 0) {
+        // Allow jumping to front-matter pages if 0 or negative
+        goToPage(Math.max(1, Math.min(totalPages, effectiveOffset + parsed)));
+        return;
+      }
+      const targetPdfPage = Math.max(1, Math.min(totalPages, parsed + effectiveOffset));
+      goToPage(targetPdfPage);
+    },
+    [currentBookPage, effectiveOffset, goToPage, totalPages]
   );
 
   const handlePrevPage = useCallback(() => {
@@ -1665,13 +1772,28 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     <div className="flex-1 flex flex-col h-full overflow-hidden select-none relative">
       {/* Primary Reader Toolbar */}
       <div className="min-h-10 px-3 sm:px-4 py-1.5 border-b border-white/10 flex flex-wrap items-center justify-between gap-2 bg-black/40 shrink-0 text-xs">
-        {/* Left: Page Switcher */}
-        <div className="flex items-center gap-1">
+        {/* Left: Page Switcher (Matched to Printed Book Page Numbers) */}
+        <div className="flex items-center gap-1 relative">
+          {effectiveOffset > 0 && (
+            <button
+              onClick={() => goToPage(1)}
+              disabled={currentPage <= 1}
+              className={`hidden md:inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                isFrontMatterPage
+                  ? 'bg-amber-400/20 text-amber-300 border border-amber-400/40'
+                  : 'opacity-70 hover:opacity-100 hover:bg-white/10 disabled:opacity-30'
+              }`}
+              title="Go to Cover / Opening Intro Pages"
+            >
+              Cover
+            </button>
+          )}
+
           <button
-            onClick={() => goToPage(1)}
-            disabled={currentPage <= 1}
+            onClick={() => goToPage(1 + effectiveOffset)}
+            disabled={currentPage === 1 + effectiveOffset}
             className="hidden sm:inline-flex px-1.5 py-0.5 rounded text-[11px] opacity-70 hover:opacity-100 hover:bg-white/10 disabled:opacity-30 transition-colors"
-            title="First page"
+            title="Book Page 1"
           >
             1
           </button>
@@ -1689,18 +1811,28 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           <form
             onSubmit={e => {
               e.preventDefault();
-              goToPage(parseInt(pageInput, 10) || 1);
+              goToBookPageInput(pageInput);
             }}
             className="flex items-center gap-1 font-mono"
           >
+            {isFrontMatterPage && (
+              <span
+                className="px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300 text-[10px] font-sans font-semibold"
+                title={`Front-matter / Intro page ${currentPage} of ${effectiveOffset} (Book Page 1 starts on PDF page ${effectiveOffset + 1})`}
+              >
+                Intro
+              </span>
+            )}
             <input
               type="text"
+              dir="auto"
               value={pageInput}
               onChange={e => setPageInput(e.target.value)}
-              onBlur={() => goToPage(parseInt(pageInput, 10) || currentPage)}
+              onBlur={() => goToBookPageInput(pageInput)}
+              title="Book Page Number (matches the page number written in the book)"
               className="w-11 text-center py-0.5 rounded border border-white/20 bg-white text-black text-xs font-semibold focus:outline-hidden focus:ring-1 focus:ring-[#1DB954]"
             />
-            <span className="opacity-60 text-xs">/ {totalPages}</span>
+            <span className="opacity-60 text-xs">/ {totalBookPages}</span>
           </form>
 
           <button
@@ -1719,8 +1851,133 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             className="hidden sm:inline-flex px-1.5 py-0.5 rounded text-[11px] opacity-70 hover:opacity-100 hover:bg-white/10 disabled:opacity-30 transition-colors"
             title="Last page"
           >
-            {totalPages}
+            {totalBookPages}
           </button>
+
+          {/* Book Page Number Calibration Badge & 1-Click Manual Match Popover */}
+          <button
+            type="button"
+            onClick={() => {
+              setManualPrintedPageInput(String(currentBookPage));
+              setIsPageSyncPopoverOpen(v => !v);
+            }}
+            className={`ml-1 px-2 py-0.5 rounded-full text-[10px] font-semibold flex items-center gap-1 transition-colors border ${
+              effectiveOffset > 0
+                ? 'bg-[#1DB954]/15 border-[#1DB954]/40 text-[#1DB954] hover:bg-[#1DB954]/25'
+                : isCalibratingPageOffset
+                ? 'bg-amber-400/15 border-amber-400/40 text-amber-300'
+                : 'bg-white/10 border-white/15 text-white/80 hover:bg-white/20 hover:text-white'
+            }`}
+            title="Match PDF page number to the exact page number written on this page of the book"
+          >
+            {isCalibratingPageOffset ? (
+              <>
+                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                <span className="hidden lg:inline">Syncing #</span>
+              </>
+            ) : effectiveOffset > 0 ? (
+              <>
+                <Check className="w-2.5 h-2.5" />
+                <span className="hidden lg:inline">Book # Synced</span>
+              </>
+            ) : (
+              <span>Match Book #</span>
+            )}
+          </button>
+
+          {isPageSyncPopoverOpen && (
+            <div className="absolute left-0 top-9 z-40 w-72 bg-[#181818] text-white border border-[#383838] rounded-xl shadow-2xl p-3 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-[#1DB954]">
+                  Match Printed Book Page #
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsPageSyncPopoverOpen(false)}
+                  className="p-0.5 rounded hover:bg-white/10 text-[#B3B3B3] hover:text-white"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+              <p className="text-[11px] text-[#B3B3B3] leading-relaxed">
+                Look at the page number written on this page of the book (e.g. <span className="text-white font-mono">10</span> or <span className="text-white font-mono">۱۰</span>) and enter it below so every page in this book matches:
+              </p>
+              <form
+                onSubmit={e => {
+                  e.preventDefault();
+                  const norm = normalizeDigitsToAsciiClient(manualPrintedPageInput || '').trim();
+                  const printedNum = parseInt(norm, 10);
+                  if (Number.isFinite(printedNum) && printedNum >= 1 && printedNum <= totalPages) {
+                    const newOffset = currentPage - printedNum;
+                    saveCachedBookPageOffset(docCacheKey, newOffset);
+                    setPageOffset(newOffset);
+                    setIsPageSyncPopoverOpen(false);
+                  }
+                }}
+                className="flex items-center gap-1.5"
+              >
+                <input
+                  type="text"
+                  dir="auto"
+                  value={manualPrintedPageInput}
+                  onChange={e => setManualPrintedPageInput(e.target.value)}
+                  placeholder="e.g. 10 or ۱۰"
+                  className="w-24 text-center py-1.5 px-2 rounded-lg bg-[#242424] border border-[#383838] text-white font-mono text-xs font-bold focus:outline-hidden focus:border-[#1DB954]"
+                  autoFocus
+                />
+                <button
+                  type="submit"
+                  className="flex-1 py-1.5 px-3 rounded-lg bg-[#1DB954] text-black font-bold text-xs hover:bg-[#1ed760]"
+                >
+                  Match Page #
+                </button>
+              </form>
+              <div className="flex items-center justify-between pt-1 border-t border-white/10 text-[10px] text-[#B3B3B3]">
+                <span>
+                  PDF p.{currentPage} → Book p.{currentBookPage}
+                </span>
+                <div className="flex items-center gap-2">
+                  {pdfDoc && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsCalibratingPageOffset(true);
+                        detectAndCacheBookPageOffset(
+                          docCacheKey,
+                          bookTitle || 'Book',
+                          totalPages,
+                          pdfDoc,
+                          currentPage,
+                          true
+                        )
+                          .then(detected => {
+                            setPageOffset(detected);
+                            setIsPageSyncPopoverOpen(false);
+                          })
+                          .finally(() => setIsCalibratingPageOffset(false));
+                      }}
+                      className="text-amber-300 hover:underline"
+                    >
+                      Auto-Detect
+                    </button>
+                  )}
+                  {effectiveOffset !== 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        clearCachedBookPageOffset(docCacheKey);
+                        setPageOffset(0);
+                        setIsPageSyncPopoverOpen(false);
+                      }}
+                      className="text-rose-400 hover:underline"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Center: Smart Reading Tools (Trim Margins, Bookmark, Highlighter, Search PDF) */}
@@ -2077,7 +2334,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                 <>
                   <span className="text-xs font-mono text-[#1DB954] font-semibold px-2 py-1 rounded bg-[#1DB954]/10">
                     Match {activeHitIndex + 1} of {searchResults.length} · p.{' '}
-                    {searchResults[activeHitIndex]?.page}
+                    {searchResults[activeHitIndex]
+                      ? formatBookPageNumber(searchResults[activeHitIndex].page)
+                      : ''}
                   </span>
 
                   <div className="flex items-center gap-1">
@@ -2182,7 +2441,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                       <span className="opacity-60">{hit.snippetAfter}</span>
                     </span>
                     <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-black/50 text-[#1DB954] shrink-0">
-                      p. {hit.page}
+                      p. {formatBookPageNumber(hit.page)}
                     </span>
                   </button>
                 );
@@ -2203,7 +2462,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               <div>
                 <h4 className="text-xs font-bold">On-Page Dictionary &amp; Explainer</h4>
                 <p className="text-[10px] text-[#B3B3B3]">
-                  Persian · Arabic · English · Page {currentPage} Context
+                  Persian · Arabic · English · Page {formatBookPageNumber(currentPage)} Context
                 </p>
               </div>
             </div>
@@ -2281,7 +2540,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                     type="button"
                     onClick={handleSaveDefinitionToPageNote}
                     className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-amber-400/20 text-amber-300 hover:bg-amber-400 hover:text-black transition-colors flex items-center gap-1 shrink-0"
-                    title={`Save this word definition to Page ${currentPage} notes`}
+                    title={`Save this word definition to Page ${formatBookPageNumber(currentPage)} notes`}
                   >
                     {savedDictToPin ? (
                       <>
@@ -2291,7 +2550,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                     ) : (
                       <>
                         <Bookmark className="w-3 h-3" />
-                        <span>Pin to p.{currentPage}</span>
+                        <span>Pin to p.{formatBookPageNumber(currentPage)}</span>
                       </>
                     )}
                   </button>
@@ -2396,7 +2655,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                     } to unlock (${pagesReadCount}/${chaptersUnlockThreshold} pages)`
                   : isAiRecognizingChapters
                   ? 'AI is mapping the opening Table of Contents...'
-                  : `${pdfChapters.length} chapters mapped across ${totalPages} pages`}
+                  : `${pdfChapters.length} chapters mapped across ${totalBookPages} book pages`}
               </p>
             </div>
             <div className="flex items-center gap-1">
@@ -2407,7 +2666,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                   onClick={() => {
                     setIsAiRecognizingChapters(true);
                     try {
-                      localStorage.removeItem(`folio_book_chapters_v1_${docCacheKey}`);
+                      localStorage.removeItem(`folio_book_chapters_v2_${docCacheKey}`);
                     } catch {
                       // ignore
                     }
@@ -2415,7 +2674,8 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                       docCacheKey,
                       bookTitle || 'Book',
                       totalPages,
-                      pdfDoc
+                      pdfDoc,
+                      currentPage
                     )
                       .then(aiCh => {
                         if (aiCh.length > 0) {
@@ -2485,15 +2745,34 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               )}
 
               {pdfChapters.map((ch, idx) => {
-                const startP = ch.startPage || ch.page || 1;
-                const nextChStart = pdfChapters[idx + 1]?.startPage || pdfChapters[idx + 1]?.page;
-                const endP =
-                  ch.endPage && ch.endPage >= startP
+                const rawStart = ch.startPage || ch.page || 1;
+                const nextChRawStart =
+                  pdfChapters[idx + 1]?.startPage || pdfChapters[idx + 1]?.page;
+                const rawEnd =
+                  ch.endPage && ch.endPage >= rawStart
                     ? ch.endPage
-                    : nextChStart && nextChStart > startP
-                    ? nextChStart - 1
+                    : nextChRawStart && nextChRawStart > rawStart
+                    ? nextChRawStart - 1
+                    : ch.isBookPageNumber
+                    ? totalBookPages
                     : totalPages;
-                const isCurrentSection = currentPage >= startP && currentPage <= endP;
+
+                // If extracted from printed Table of Contents (isBookPageNumber), start/end are already Printed Book Pages
+                const startBookPage = ch.isBookPageNumber
+                  ? Math.max(1, Math.min(totalBookPages, rawStart))
+                  : Math.max(1, rawStart - effectiveOffset);
+                const endBookPage = ch.isBookPageNumber
+                  ? Math.max(startBookPage, Math.min(totalBookPages, rawEnd))
+                  : Math.max(startBookPage, rawEnd - effectiveOffset);
+
+                const targetPdfPage = ch.isBookPageNumber
+                  ? Math.max(1, Math.min(totalPages, startBookPage + effectiveOffset))
+                  : Math.max(1, Math.min(totalPages, rawStart));
+
+                const isCurrentSection =
+                  !isFrontMatterPage &&
+                  currentBookPage >= startBookPage &&
+                  currentBookPage <= endBookPage;
 
                 return (
                   <button
@@ -2501,7 +2780,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                     type="button"
                     dir="auto"
                     onClick={() => {
-                      goToPage(startP);
+                      goToPage(targetPdfPage);
                       setIsChaptersDrawerOpen(false);
                     }}
                     style={{ paddingLeft: `${10 + ch.level * 12}px` }}
@@ -2519,7 +2798,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                           : 'bg-black/40 text-[#B3B3B3]'
                       }`}
                     >
-                      {startP === endP ? `p. ${startP}` : `p. ${startP}–${endP}`}
+                      {startBookPage === endBookPage
+                        ? `p. ${startBookPage}`
+                        : `p. ${startBookPage}–${endBookPage}`}
                     </span>
                   </button>
                 );
@@ -2561,7 +2842,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               className="p-2.5 rounded-lg bg-[#242424] space-y-2"
             >
               <p className="text-[11px] font-semibold text-amber-300">
-                Page {currentPage} {currentBookmark ? '(Pinned)' : ''}
+                Page {formatBookPageNumber(currentPage)} {currentBookmark ? '(Pinned)' : ''}
               </p>
               <input
                 type="text"
@@ -2574,7 +2855,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                 type="submit"
                 className="w-full py-1.5 rounded bg-amber-400 text-black font-semibold text-xs hover:bg-amber-300"
               >
-                {currentBookmark ? 'Save Note on Page ' + currentPage : 'Pin Page ' + currentPage + ' with Note'}
+                {currentBookmark
+                  ? 'Save Note on Page ' + formatBookPageNumber(currentPage)
+                  : 'Pin Page ' + formatBookPageNumber(currentPage) + ' with Note'}
               </button>
             </form>
           )}
@@ -2597,7 +2880,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                   >
                     <div className="min-w-0">
                       <span className="font-mono text-[11px] font-bold text-amber-300">
-                        Page {bm.page}
+                        Page {formatBookPageNumber(bm.page)}
                       </span>
                       {bm.note && <p className="text-xs text-white/90 mt-0.5 break-words">{bm.note}</p>}
                     </div>
@@ -2634,7 +2917,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                               : 'bg-yellow-400/15 text-yellow-300 hover:bg-yellow-400/25'
                           }`}
                         >
-                          p. {pageNum}
+                          p. {formatBookPageNumber(pageNum)}
                         </button>
                       ))}
                     </div>
@@ -2690,7 +2973,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             {isPageRendering && (
               <div className="absolute top-2 right-2 bg-black/70 backdrop-blur-xs text-white px-2.5 py-1 rounded text-[11px] font-mono flex items-center gap-1.5 z-10 shadow-md">
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-[#1DB954]" />
-                <span>Page {currentPage}...</span>
+                <span>Page {formatBookPageNumber(currentPage)}...</span>
               </div>
             )}
 
