@@ -58,6 +58,10 @@ import {
   mergeCloudVocabularyIntoLocal,
   subscribeToVocabularyUpdates,
 } from './services/vocabularyStore';
+import {
+  enqueueBookForBackgroundScan,
+  enqueueLibraryForBackgroundScan,
+} from './services/ocrCache';
 import type { User } from 'firebase/auth';
 import { Search, LayoutGrid, List as ListIcon, Plus, Send, ArrowUpDown } from 'lucide-react';
 
@@ -243,6 +247,7 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem(STORAGE_BOOKS_KEY, JSON.stringify(books));
+    enqueueLibraryForBackgroundScan(books);
   }, [books]);
 
   useEffect(() => {
@@ -282,6 +287,9 @@ export default function App() {
 
   // Handlers
   const handleSaveBook = (book: Book, targetListId?: string) => {
+    // Immediately start reviewing & indexing all pages/words of the book in the background
+    enqueueBookForBackgroundScan(book, true);
+
     setBooks(prev => {
       const existing = prev.findIndex(
         b =>

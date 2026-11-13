@@ -1,13 +1,17 @@
 import type { Request, Response } from 'express';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
-function getAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY environment variable is not configured.');
+function getAiClient(): GoogleGenAI | null {
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    '';
+  if (!apiKey.trim()) {
+    return null;
   }
   return new GoogleGenAI({
-    apiKey,
+    apiKey: apiKey.trim(),
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -38,8 +42,7 @@ async function transcribeSinglePage(
     'Transcribe all text lines visible on this book page from top to bottom as a JSON object with a "lines" array of strings.';
 
   const modelsToTry: Array<{ name: string; useLowThinking: boolean }> = [
-    { name: 'gemini-3.8-flash', useLowThinking: true },
-    { name: 'gemini-flash-latest', useLowThinking: false },
+    { name: 'gemini-4-hydrogen', useLowThinking: true },
     { name: 'gemini-3.1-flash-lite', useLowThinking: false },
   ];
 
@@ -113,12 +116,20 @@ export default async function ocrHandler(req: Request, res: Response) {
     }
 
     const ai = getAiClient();
+    if (!ai) {
+      // Signal the client to seamlessly run built-in browser OCR (Tesseract fas+eng)
+      return res.status(200).json({ results: [], useClientOcr: true });
+    }
+
+    let anySucceeded = false;
     const results = await Promise.all(
       pages.map(async p => {
         try {
-          return await transcribeSinglePage(ai, p);
+          const out = await transcribeSinglePage(ai, p);
+          anySucceeded = true;
+          return out;
         } catch (err) {
-          console.error(`OCR error on page ${p.page}:`, err);
+          console.warn(`OCR model fallback on page ${p.page}:`, err);
           return {
             page: p.page,
             lines: [],
@@ -128,11 +139,17 @@ export default async function ocrHandler(req: Request, res: Response) {
       })
     );
 
+    if (!anySucceeded) {
+      return res.status(200).json({ results: [], useClientOcr: true });
+    }
+
     return res.status(200).json({ results });
   } catch (err) {
-    console.error('OCR API route error:', err);
-    return res.status(500).json({
-      error: err instanceof Error ? err.message : 'Internal server error during AI page scan.',
+    console.warn('OCR API fallback to client OCR:', err);
+    return res.status(200).json({
+      results: [],
+      useClientOcr: true,
     });
   }
 }
+

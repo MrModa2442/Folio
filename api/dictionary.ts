@@ -5,10 +5,14 @@ let cachedAiClient: GoogleGenAI | null = null;
 
 function getAiClient(): GoogleGenAI | null {
   if (cachedAiClient) return cachedAiClient;
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    '';
+  if (!apiKey.trim()) return null;
   cachedAiClient = new GoogleGenAI({
-    apiKey,
+    apiKey: apiKey.trim(),
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -165,8 +169,7 @@ async function fetchDeepGeminiDefinition(
     .join('\n\n');
 
   const modelsToTry: Array<{ name: string; useLowThinking: boolean }> = [
-    { name: 'gemini-3.8-flash', useLowThinking: true },
-    { name: 'gemini-flash-latest', useLowThinking: false },
+    { name: 'gemini-4-hydrogen', useLowThinking: true },
     { name: 'gemini-3.1-flash-lite', useLowThinking: false },
   ];
 

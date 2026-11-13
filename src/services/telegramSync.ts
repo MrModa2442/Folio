@@ -2,6 +2,7 @@ import { Book, CoverPattern, TelegramConfigStatus, TelegramPdfItem } from '../ty
 import { extractPdfMetadata } from '../utils/pdfParser';
 import { cleanPdfFilename, sanitizeBookTitle, sanitizeBookAuthor } from '../utils/library';
 import { storePdfBlob, getBookCover, storeBookCover } from './db';
+import { enqueueBookForBackgroundScan } from './ocrCache';
 import builtInCatalogJson from '../data/builtInExploreCatalog.json';
 
 const PALETTE = [
@@ -433,7 +434,7 @@ export async function downloadAndImportTelegramPdf(
   const patterns: CoverPattern[] = ['botanical', 'geometric', 'embossed', 'classical'];
   const coverPattern = patterns[colorIndex % patterns.length];
 
-  return {
+  const newBook: Book = {
     id: bookId,
     title: finalTitle,
     author: finalAuthor,
@@ -452,4 +453,7 @@ export async function downloadAndImportTelegramPdf(
     telegramChannel: cleanChannel,
     telegramMessageId: item.messageId,
   };
+
+  enqueueBookForBackgroundScan(newBook, true);
+  return newBook;
 }

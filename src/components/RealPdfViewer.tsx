@@ -1,7 +1,12 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
+import { createWorker, Worker as TesseractWorker } from 'tesseract.js';
 import { PageBookmark, PageHighlightStroke } from '../types/library';
-import { loadCachedOcrPages, saveCachedOcrPages } from '../services/ocrCache';
+import {
+  loadCachedOcrPages,
+  saveCachedOcrPages,
+  subscribeToOcrUpdates,
+} from '../services/ocrCache';
 import { upsertVocabularyItem } from '../services/vocabularyStore';
 import {
   ChevronLeft,
@@ -248,6 +253,15 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       pageTextCacheRef.current.clear();
     });
 
+    const unsubOcr = subscribeToOcrUpdates(detail => {
+      if (!isMounted || detail.docKey !== docCacheKey) return;
+      for (const item of detail.newPages) {
+        ocrPagesMapRef.current[item.page] = item.lines;
+        pageTextCacheRef.current.delete(item.page);
+      }
+      setAiCachedPageCount(detail.scannedCount);
+    });
+
     const dataCopy = new Uint8Array(arrayBuffer.slice(0));
 
     const loadingTask = pdfjsLib.getDocument({
@@ -357,6 +371,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
 
     return () => {
       isMounted = false;
+      unsubOcr();
       aiScanAbortRef.current++;
       try {
         loadingTask.destroy();
@@ -1019,7 +1034,16 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     [searchResults, goToPage]
   );
 
-  // Background AI Page Scanner using Gemini Flash-Lite (/api/ocr)
+  const tesseractWorkerRef = useRef<Promise<TesseractWorker> | null>(null);
+
+  const getOrInitTesseractWorker = useCallback(async (): Promise<TesseractWorker> => {
+    if (!tesseractWorkerRef.current) {
+      tesseractWorkerRef.current = createWorker(['fas', 'eng']);
+    }
+    return tesseractWorkerRef.current;
+  }, []);
+
+  // Background Page Scanner using Server Gemini OCR (/api/ocr) with automatic Built-in Browser OCR (Tesseract fas+eng) fallback
   const startAiPageScanner = useCallback(
     async (activeQueryForLiveMatch = searchQuery, scanOnlyUnscanned = true) => {
       if (!pdfDoc) return;
@@ -1050,6 +1074,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       let scannedSoFar = Object.keys(ocrPagesMapRef.current).length;
       setAiScanProgress({ scanned: scannedSoFar, total });
       let jumpedToFirstAiHit = false;
+      let useLocalBrowserOcr = false;
 
       try {
         const batchSize = 3;
@@ -1068,25 +1093,52 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
 
           if (renderedPages.length === 0) continue;
 
-          const response = await fetch('/api/ocr', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pages: renderedPages }),
-          });
+          let pageResults: Array<{ page: number; lines: string[]; error?: string }> = [];
 
-          if (!response.ok) {
-            const errData = (await response.json().catch(() => ({}))) as { error?: string };
-            throw new Error(errData.error || `AI scan HTTP ${response.status}`);
+          if (!useLocalBrowserOcr) {
+            try {
+              const response = await fetch('/api/ocr', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pages: renderedPages }),
+              });
+
+              if (response.ok) {
+                const data = (await response.json()) as {
+                  results?: Array<{ page: number; lines: string[]; error?: string }>;
+                  useClientOcr?: boolean;
+                };
+                if (data.useClientOcr) {
+                  useLocalBrowserOcr = true;
+                } else {
+                  pageResults = data.results || [];
+                }
+              } else {
+                useLocalBrowserOcr = true;
+              }
+            } catch {
+              useLocalBrowserOcr = true;
+            }
           }
 
-          const data = (await response.json()) as {
-            results?: Array<{ page: number; lines: string[]; error?: string }>;
-          };
+          if (useLocalBrowserOcr) {
+            const worker = await getOrInitTesseractWorker();
+            for (const rp of renderedPages) {
+              if (aiScanAbortRef.current !== scanId) return;
+              const rec = await worker.recognize(rp.imageBase64);
+              const rawText = rec?.data?.text || '';
+              const lines = rawText
+                .split(/\r?\n/)
+                .map(l => l.trim())
+                .filter(Boolean);
+              pageResults.push({ page: rp.page, lines });
+            }
+          }
 
           if (aiScanAbortRef.current !== scanId) return;
 
           const newEntries: Array<{ page: number; lines: string[] }> = [];
-          for (const res of data.results || []) {
+          for (const res of pageResults) {
             if (Array.isArray(res.lines)) {
               ocrPagesMapRef.current[res.page] = res.lines;
               pageTextCacheRef.current.delete(res.page);
@@ -1100,7 +1152,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             setAiCachedPageCount(scannedSoFar);
             setAiScanProgress({ scanned: scannedSoFar, total });
 
-            // If user has a search query open, live-check the newly AI-scanned pages immediately!
+            // If user has a search query open, live-check the newly scanned pages immediately!
             const qClean = normalizePdfTextForSearch(activeQueryForLiveMatch, false);
             if (qClean) {
               const newlyFoundHits: PdfSearchHit[] = [];
@@ -1134,9 +1186,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           }
         }
       } catch (err) {
-        console.error('AI Page Scanner error:', err);
+        console.error('Page Scanner error:', err);
         if (aiScanAbortRef.current === scanId) {
-          setAiScanError(err instanceof Error ? err.message : 'AI page scan encountered an error');
+          setAiScanError(err instanceof Error ? err.message : 'Page scan encountered an error');
         }
       } finally {
         if (aiScanAbortRef.current === scanId) {
@@ -1154,10 +1206,11 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       getOrExtractPageText,
       findMatchesInPageData,
       goToPage,
+      getOrInitTesseractWorker,
     ]
   );
 
-  // Full-text search inside the open PDF with automatic fallback to Gemini Flash-Lite AI Page Scanner
+  // Full-text search inside the open PDF with automatic OCR fallback for scanned image PDFs
   const executePdfSearch = useCallback(
     async (rawQuery: string) => {
       const qNorm = normalizePdfTextForSearch(rawQuery, false);
@@ -1174,6 +1227,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       setIsSearching(true);
       const hits: PdfSearchHit[] = [];
       const total = pdfDoc.numPages;
+      let pagesWithSelectableText = 0;
 
       try {
         for (let p = 1; p <= total; p++) {
@@ -1185,6 +1239,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
 
           const pageData = await getOrExtractPageText(p);
           if (!pageData || pageData.items.length === 0) continue;
+          pagesWithSelectableText++;
 
           const pageHits = findMatchesInPageData(pageData, rawQuery);
           if (pageHits.length > 0) {
@@ -1204,10 +1259,10 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           goToPage(targetHit.page, targetHit.boxes[0]?.y);
         } else {
           setActiveHitIndex(0);
-          // If 0 matches were found in native text and not all pages have been AI-scanned yet,
-          // automatically start the Gemini Flash-Lite AI Page Scanner!
+          // Only auto-start OCR page scanning if this PDF is mostly scanned images without embedded text!
           const alreadyScannedCount = Object.keys(ocrPagesMapRef.current).length;
-          if (alreadyScannedCount < total && !isAiScanning) {
+          const isMostlyScannedImagePdf = pagesWithSelectableText < Math.max(3, Math.floor(total * 0.15));
+          if (isMostlyScannedImagePdf && alreadyScannedCount < total && !isAiScanning) {
             startAiPageScanner(rawQuery, true);
           }
         }
