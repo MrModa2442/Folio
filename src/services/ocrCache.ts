@@ -13,8 +13,8 @@ const STORE_NAME = 'book_ocr_pages';
 const OCR_UPDATED_EVENT = 'folio-ocr-updated';
 const CHAPTERS_UPDATED_EVENT = 'folio-chapters-updated';
 const PAGE_OFFSET_UPDATED_EVENT = 'folio-page-offset-updated';
-const CHAPTERS_STORAGE_PREFIX = 'folio_book_chapters_v3_';
-const PAGE_OFFSET_STORAGE_PREFIX = 'folio_page_offset_v2_';
+const CHAPTERS_STORAGE_PREFIX = 'folio_book_chapters_v4_';
+const PAGE_OFFSET_STORAGE_PREFIX = 'folio_page_offset_v3_';
 
 export interface StoredBookOcr {
   docKey: string;
@@ -111,6 +111,15 @@ export function subscribeToPageOffsetUpdates(
   return () => window.removeEventListener(PAGE_OFFSET_UPDATED_EVENT, handler);
 }
 
+export function hasAnalyzedBookChapters(docKey: string): boolean {
+  if (!docKey || typeof window === 'undefined') return false;
+  try {
+    return localStorage.getItem(`${CHAPTERS_STORAGE_PREFIX}${docKey}`) !== null;
+  } catch {
+    return false;
+  }
+}
+
 export function loadCachedBookChapters(docKey: string): SmartBookChapter[] {
   if (!docKey || typeof window === 'undefined') return [];
   try {
@@ -127,7 +136,7 @@ export function saveCachedBookChapters(
   docKey: string,
   chapters: SmartBookChapter[]
 ): void {
-  if (!docKey || typeof window === 'undefined' || !Array.isArray(chapters) || chapters.length === 0) {
+  if (!docKey || typeof window === 'undefined' || !Array.isArray(chapters)) {
     return;
   }
   try {
@@ -426,12 +435,17 @@ export interface CornerCropCandidate {
   corner: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'top-center' | 'bottom-center';
   dataUrl: string;
   hasTrailingZeroDot: boolean;
+  geometricNumber: number | null;
+  blobCount: number;
+  isTeenPattern: boolean;
+  relWidth: number;
 }
 
 /**
  * Analyzes the 4 corners (Top-Right, Top-Left, Bottom-Right, Bottom-Left) of a PDF page
- * and crops any compact corner page-number cluster at 3.5x magnification on a clean white canvas.
- * Filters out wide book-title running headers (like "شهد شورستان") and full body paragraph lines.
+ * and crops any compact corner page-number cluster (< 5.5% of page width) at 3.5x magnification.
+ * Filters out wide book-title running headers (like "شهد شورستان" = ~9.1% of page width)
+ * and computes exact sub-blob geometry for Persian/Arabic/Latin digits.
  */
 export async function extractCornerNumberCropsFromPage(
   pdfDoc: pdfjsLib.PDFDocumentProxy,
@@ -440,7 +454,7 @@ export async function extractCornerNumberCropsFromPage(
   if (typeof document === 'undefined') return [];
   try {
     const page = await pdfDoc.getPage(pageNum);
-    const vp = page.getViewport({ scale: 1.8 });
+    const vp = page.getViewport({ scale: 1.6 });
     const w = Math.max(1, Math.floor(vp.width));
     const h = Math.max(1, Math.floor(vp.height));
 
@@ -469,7 +483,8 @@ export async function extractCornerNumberCropsFromPage(
       rowInkCounts[y] = count;
     }
 
-    const minRowInk = Math.max(2, Math.floor(w * 0.0025));
+    // Use minRowInk = 1 so thin vertical tips of '۱' / '1' at the top of a header are never clipped
+    const minRowInk = 1;
 
     // Find top header ink band in top 32% of page
     let firstInkY = -1;
@@ -483,10 +498,10 @@ export async function extractCornerNumberCropsFromPage(
     let headerLineEndY = firstInkY !== -1 ? Math.min(h - 1, firstInkY + Math.floor(h * 0.05)) : -1;
     if (firstInkY !== -1) {
       let blankRun = 0;
-      for (let y = firstInkY + 6; y < Math.min(h - 1, firstInkY + Math.floor(h * 0.1)); y++) {
+      for (let y = firstInkY + 5; y < Math.min(h - 1, firstInkY + Math.floor(h * 0.1)); y++) {
         if (rowInkCounts[y] < minRowInk) {
           blankRun++;
-          if (blankRun >= 6) {
+          if (blankRun >= 5) {
             headerLineEndY = y - blankRun + 1;
             break;
           }
@@ -508,10 +523,10 @@ export async function extractCornerNumberCropsFromPage(
     let footerLineStartY = lastInkY !== -1 ? Math.max(0, lastInkY - Math.floor(h * 0.05)) : -1;
     if (lastInkY !== -1) {
       let blankRun = 0;
-      for (let y = lastInkY - 6; y > Math.max(0, lastInkY - Math.floor(h * 0.1)); y--) {
+      for (let y = lastInkY - 5; y > Math.max(0, lastInkY - Math.floor(h * 0.1)); y--) {
         if (rowInkCounts[y] < minRowInk) {
           blankRun++;
-          if (blankRun >= 6) {
+          if (blankRun >= 5) {
             footerLineStartY = y + blankRun - 1;
             break;
           }
@@ -525,10 +540,10 @@ export async function extractCornerNumberCropsFromPage(
 
     const extractCornersFromBand = (y0Raw: number, y1Raw: number, isTop: boolean) => {
       if (y0Raw < 0 || y1Raw <= y0Raw) return;
-      const y0 = Math.max(0, y0Raw - 6);
-      const y1 = Math.min(h, y1Raw + 6);
+      const y0 = Math.max(0, y0Raw - 5);
+      const y1 = Math.min(h, y1Raw + 5);
       const bandH = y1 - y0;
-      if (bandH < 8) return;
+      if (bandH < 6) return;
 
       const colHasInk = new Uint8Array(w);
       let activeCols = 0;
@@ -539,16 +554,17 @@ export async function extractCornerNumberCropsFromPage(
           const lum = (data[idx] * 299 + data[idx + 1] * 587 + data[idx + 2] * 114) / 1000;
           if (lum < 208) darkPixels++;
         }
-        if (darkPixels >= 2) {
+        if (darkPixels >= 1) {
           colHasInk[x] = 1;
           activeCols++;
         }
       }
 
-      // Skip full-width body text lines (a paragraph line covers > 40% of the page width)
+      // Skip full-width body text lines (a paragraph line covers > 38% of the page width)
       const inkCoverage = activeCols / Math.max(1, w - 2 * xMargin);
-      if (inkCoverage > 0.4) return;
+      if (inkCoverage > 0.38) return;
 
+      const minGap = Math.max(8, Math.floor(w * 0.014));
       const segments: Array<{ x0: number; x1: number }> = [];
       let inSeg = false;
       let segStart = 0;
@@ -562,7 +578,7 @@ export async function extractCornerNumberCropsFromPage(
           gap = 0;
         } else if (inSeg) {
           gap++;
-          if (gap >= 16) {
+          if (gap >= minGap) {
             segments.push({ x0: segStart, x1: x - gap });
             inSeg = false;
           }
@@ -574,9 +590,10 @@ export async function extractCornerNumberCropsFromPage(
 
       for (const seg of segments) {
         const segW = seg.x1 - seg.x0;
-        // Printed corner page numbers (1 to 4 digits) are compact: between 0.4% and 11% of page width.
-        // Wide segments like book titles ("شهد شورستان" = ~17% of page width) are automatically excluded!
-        if (segW < Math.max(4, w * 0.004) || segW > w * 0.115) continue;
+        const relWidth = segW / w;
+        // Printed corner page numbers (1 to 3 digits) are compact: between 0.2% and 5.5% of page width.
+        // Wide segments like book titles ("شهد شورستان" = ~9.1% of page width) are strictly excluded!
+        if (segW < 2 || relWidth > 0.055) continue;
 
         const cx = (seg.x0 + seg.x1) / (2 * w);
         let corner: CornerCropCandidate['corner'] | null = null;
@@ -584,13 +601,19 @@ export async function extractCornerNumberCropsFromPage(
           corner = isTop ? 'top-right' : 'bottom-right';
         } else if (cx <= 0.4) {
           corner = isTop ? 'top-left' : 'bottom-left';
-        } else if (segments.length === 1 && segW <= w * 0.09) {
+        } else if (segments.length === 1 && relWidth <= 0.05) {
           corner = isTop ? 'top-center' : 'bottom-center';
         }
         if (!corner) continue;
 
-        // Inspect horizontal sub-blobs inside this corner segment to detect Persian zero dot '۰' (e.g. "۱۰", "۲۰", "۳۰")
-        const subBlobs: Array<{ bx0: number; bx1: number; by0: number; by1: number }> = [];
+        // Segment horizontal connected digit sub-blobs inside [seg.x0..seg.x1, y0..y1]
+        const rawSubBlobs: Array<{
+          bx0: number;
+          bx1: number;
+          by0: number;
+          by1: number;
+          darkCount: number;
+        }> = [];
         let inSub = false;
         let sbStart = seg.x0;
         for (let x = seg.x0; x <= seg.x1; x++) {
@@ -598,7 +621,7 @@ export async function extractCornerNumberCropsFromPage(
           for (let y = y0; y < y1; y++) {
             const idx = (y * w + x) * 4;
             const lum = (data[idx] * 299 + data[idx + 1] * 587 + data[idx + 2] * 114) / 1000;
-            if (lum < 205) {
+            if (lum < 208) {
               hasDark = true;
               break;
             }
@@ -607,20 +630,21 @@ export async function extractCornerNumberCropsFromPage(
             inSub = true;
             sbStart = x;
           } else if (!hasDark && inSub) {
-            subBlobs.push({ bx0: sbStart, bx1: x - 1, by0: y1, by1: y0 });
+            rawSubBlobs.push({ bx0: sbStart, bx1: x - 1, by0: y1, by1: y0, darkCount: 0 });
             inSub = false;
           }
         }
         if (inSub) {
-          subBlobs.push({ bx0: sbStart, bx1: seg.x1, by0: y1, by1: y0 });
+          rawSubBlobs.push({ bx0: sbStart, bx1: seg.x1, by0: y1, by1: y0, darkCount: 0 });
         }
 
-        for (const sb of subBlobs) {
+        for (const sb of rawSubBlobs) {
           for (let y = y0; y < y1; y++) {
             for (let x = sb.bx0; x <= sb.bx1; x++) {
               const idx = (y * w + x) * 4;
               const lum = (data[idx] * 299 + data[idx + 1] * 587 + data[idx + 2] * 114) / 1000;
-              if (lum < 205) {
+              if (lum < 208) {
+                sb.darkCount++;
                 if (y < sb.by0) sb.by0 = y;
                 if (y > sb.by1) sb.by1 = y;
               }
@@ -628,31 +652,68 @@ export async function extractCornerNumberCropsFromPage(
           }
         }
 
+        // Filter out tiny 1-pixel dust specks
+        const subBlobs = rawSubBlobs
+          .filter(sb => sb.darkCount >= 3 && sb.by1 >= sb.by0)
+          .map(sb => {
+            const bw = sb.bx1 - sb.bx0 + 1;
+            const bh = sb.by1 - sb.by0 + 1;
+            return {
+              ...sb,
+              bw,
+              bh,
+              aspect: bw / Math.max(1, bh),
+            };
+          });
+
+        if (subBlobs.length === 0 || subBlobs.length > 4) continue;
+
         let hasTrailingZeroDot = false;
-        if (subBlobs.length === 2) {
+        let geometricNumber: number | null = null;
+        let isTeenPattern = false;
+
+        if (subBlobs.length === 1) {
+          const b0 = subBlobs[0];
+          // Single narrow vertical stem is digit '1' ('۱' / '١' / '1')
+          if (b0.bh >= 6 && b0.aspect <= 0.48) {
+            geometricNumber = 1;
+          }
+        } else if (subBlobs.length === 2) {
           const leftBlob = subBlobs[0];
           const rightBlob = subBlobs[1];
-          const leftH = Math.max(1, leftBlob.by1 - leftBlob.by0 + 1);
-          const rightH = Math.max(1, rightBlob.by1 - rightBlob.by0 + 1);
-          const rightW = Math.max(1, rightBlob.bx1 - rightBlob.bx0 + 1);
-          // In Persian/Arabic fonts, '۰' (0) is a small diamond dot ~25%..58% the height of the left digit
-          if (
-            leftH >= 12 &&
-            rightH >= 3 &&
-            rightH <= leftH * 0.62 &&
-            rightW >= 3 &&
-            rightW <= rightH * 1.85
-          ) {
+          const isLeftStemOne = leftBlob.bh >= 6 && leftBlob.aspect <= 0.54;
+          const isRightZeroDot =
+            leftBlob.bh >= 6 &&
+            rightBlob.bh >= 2 &&
+            rightBlob.bh <= leftBlob.bh * 0.68 &&
+            rightBlob.aspect >= 0.45 &&
+            rightBlob.aspect <= 2.1;
+          const isRightStemOne =
+            rightBlob.bh >= 6 &&
+            rightBlob.aspect <= 0.52 &&
+            Math.abs(leftBlob.bh - rightBlob.bh) <= Math.max(3, leftBlob.bh * 0.35);
+
+          if (isRightZeroDot) {
             hasTrailingZeroDot = true;
+          }
+          if (isLeftStemOne) {
+            isTeenPattern = true;
+            if (isRightZeroDot) {
+              // '[vertical stem ۱] + [small zero dot ۰]' is unambiguously 10 ('۱۰')!
+              geometricNumber = 10;
+            } else if (isRightStemOne) {
+              // '[vertical stem ۱] + [vertical stem ۱]' is unambiguously 11 ('۱۱' / '11')!
+              geometricNumber = 11;
+            }
           }
         }
 
         // Render 3.5x magnified corner number on a clean white canvas with generous padding
-        const cropX0 = Math.max(0, seg.x0 - 12);
-        const cropX1 = Math.min(w, seg.x1 + 12);
-        const cropW = Math.max(16, cropX1 - cropX0);
+        const cropX0 = Math.max(0, seg.x0 - 10);
+        const cropX1 = Math.min(w, seg.x1 + 10);
+        const cropW = Math.max(14, cropX1 - cropX0);
         const scaleUp = 3.5;
-        const pad = 36;
+        const pad = 32;
         const outW = Math.round(cropW * scaleUp) + pad * 2;
         const outH = Math.round(bandH * scaleUp) + pad * 2;
 
@@ -678,7 +739,6 @@ export async function extractCornerNumberCropsFromPage(
           Math.round(bandH * scaleUp)
         );
 
-        // Gentle contrast stretch that preserves thin Persian strokes and zero dots
         const cImg = cCtx.getImageData(0, 0, outW, outH);
         const cd = cImg.data;
         for (let i = 0; i < cd.length; i += 4) {
@@ -694,6 +754,10 @@ export async function extractCornerNumberCropsFromPage(
           corner,
           dataUrl: cornerCanvas.toDataURL('image/png'),
           hasTrailingZeroDot,
+          geometricNumber,
+          blobCount: subBlobs.length,
+          isTeenPattern,
+          relWidth,
         });
         cornerCanvas.width = 0;
         cornerCanvas.height = 0;
@@ -702,6 +766,9 @@ export async function extractCornerNumberCropsFromPage(
 
     extractCornersFromBand(firstInkY, headerLineEndY, true);
     extractCornersFromBand(footerLineStartY, lastInkY, false);
+
+    // Sort candidates by narrowest width first so compact numbers are always inspected before anything wider
+    candidates.sort((a, b) => a.relWidth - b.relWidth);
 
     srcCanvas.width = 0;
     srcCanvas.height = 0;
@@ -712,7 +779,7 @@ export async function extractCornerNumberCropsFromPage(
 }
 
 /**
- * Legacy helper kept for compatibility: combines extracted corner crops into a single JPEG strip if needed.
+ * Legacy helper kept for compatibility: returns the best corner crop dataUrl for a page.
  */
 export async function renderPageHeaderFooterStripToJpeg(
   pdfDoc: pdfjsLib.PDFDocumentProxy,
@@ -723,7 +790,7 @@ export async function renderPageHeaderFooterStripToJpeg(
 }
 
 /**
- * Quickly inspects the 4 corners of a single PDF page (native text first, then 4-corner visual crops)
+ * Quickly inspects the 4 corners of a single PDF page (native text first, then geometric sub-blobs + OCR)
  * to read the printed page number written on that page.
  */
 export async function detectPrintedPageNumberFromCorners(
@@ -770,9 +837,20 @@ export async function detectPrintedPageNumberFromCorners(
     // ignore native text error
   }
 
-  // 2. Scanned page 4-corner visual analysis
+  // 2. Scanned page 4-corner visual & geometric sub-blob analysis
   const cornerCrops = await extractCornerNumberCropsFromPage(pdfDoc, pageNum);
   if (cornerCrops.length === 0) return null;
+
+  // Check instant geometric sub-blob recognition first (e.g. '۱۰' = 10, '۱۱' = 11, '۱' = 1)
+  for (const crop of cornerCrops) {
+    if (crop.geometricNumber !== null) {
+      const n = crop.geometricNumber;
+      const offset = pageNum - n;
+      if (n >= 1 && n <= totalPages && offset >= -2 && offset <= maxReasonableOffset) {
+        return n;
+      }
+    }
+  }
 
   try {
     const worker = await getSharedTesseractWorker();
@@ -787,7 +865,6 @@ export async function detectPrintedPageNumberFromCorners(
       let n = parseInt(norm, 10);
       if (!Number.isFinite(n) || n <= 0) continue;
 
-      // If Tesseract read a single digit (e.g. "1" from "۱۰") and our sub-blob geometry detected the trailing Persian zero dot '۰', multiply by 10
       if (n >= 1 && n <= 9 && crop.hasTrailingZeroDot) {
         const withZero = n * 10;
         const offsetWithZero = pageNum - withZero;
@@ -870,8 +947,8 @@ async function extractNativePageLines(
 
 /**
  * Automatically detects the printed book page offset (`pdfPage - printedBookPage`,
- * e.g. 5 when PDF page 15 has printed page 10 at its corner) by checking the 4 corners
- * of the current page and sample body pages.
+ * e.g. 4 when Book Page 1 starts on PDF page 5, or 5 when PDF page 15 has printed page 10)
+ * by analyzing the 4 corners across the opening and sample body pages.
  */
 export async function detectAndCacheBookPageOffset(
   docKey: string,
@@ -893,65 +970,109 @@ export async function detectAndCacheBookPageOffset(
     return 0;
   }
 
-  // Prioritize the page the user is currently viewing (if >= 4), plus nearby body pages
-  const samplePagesSet = new Set<number>();
-  if (preferredCurrentPage >= 4 && preferredCurrentPage <= totalPages) {
-    samplePagesSet.add(preferredCurrentPage);
-    if (preferredCurrentPage + 1 <= totalPages) samplePagesSet.add(preferredCurrentPage + 1);
-    if (preferredCurrentPage + 2 <= totalPages) samplePagesSet.add(preferredCurrentPage + 2);
-  }
-  for (const p of [15, 17, 16, 14, 12, 10, 8]) {
-    if (p <= totalPages && samplePagesSet.size < 5) {
-      samplePagesSet.add(p);
-    }
-  }
-  if (samplePagesSet.size === 0) {
-    for (let p = Math.max(2, Math.floor(totalPages * 0.3)); p <= totalPages && samplePagesSet.size < 4; p++) {
-      samplePagesSet.add(p);
+  // 1. Check native digital PDF text lines across pages 2..18 first
+  const cachedOcr = await loadCachedOcrPages(docKey);
+  const linesMap: Record<number, string[]> = { ...cachedOcr };
+  const probeLimit = Math.min(18, totalPages);
+  for (let p = 2; p <= probeLimit; p++) {
+    if (!linesMap[p] || linesMap[p].length === 0) {
+      const nativeLines = await extractNativePageLines(pdfDoc, p);
+      if (nativeLines.length > 0) {
+        linesMap[p] = nativeLines;
+      }
     }
   }
 
-  const samplePages = Array.from(samplePagesSet);
-  const offsetVotes = new Map<number, number>();
+  const nativeConsensus = computePageOffsetFromLinesMap(linesMap, totalPages);
+  if (nativeConsensus && nativeConsensus.distinctPages >= 2) {
+    saveCachedBookPageOffset(docKey, nativeConsensus.offset);
+    return nativeConsensus.offset;
+  }
 
-  // 1. Analyze the 4 corners of each sample page directly
-  for (const p of samplePages) {
-    const printedNum = await detectPrintedPageNumberFromCorners(pdfDoc, p, totalPages);
-    if (printedNum !== null) {
-      const offset = p - printedNum;
-      const nextCount = (offsetVotes.get(offset) || 0) + 1;
-      offsetVotes.set(offset, nextCount);
+  // 2. Scanned Book Multi-Page 4-Corner Sub-Blob & Sequence Calibrator
+  // Check pages 15, 16, 14, 17, 13, 12, 11, 10, 6, 5, 4 (plus preferredCurrentPage)
+  // Because page 10 ('۱۰') is [stem '1' + zero dot '0'] and page 11 ('۱۱') is [stem '1' + stem '1'],
+  // and pages 10..19 all have 2 sub-blobs starting with stem '1' while pages 1..9 have 1 sub-blob,
+  // checking these pages finds the exact offset immediately!
+  const scanPagesOrder = [
+    ...(preferredCurrentPage >= 4 && preferredCurrentPage <= totalPages
+      ? [preferredCurrentPage]
+      : []),
+    15,
+    16,
+    14,
+    17,
+    13,
+    12,
+    11,
+    10,
+    9,
+    8,
+    7,
+    6,
+    5,
+    4,
+  ].filter((p, idx, arr) => p >= 2 && p <= totalPages && arr.indexOf(p) === idx);
 
-      // If the user's current page gave a clear corner page number, or 2 pages agree on the exact offset, lock it in immediately!
-      if (p === preferredCurrentPage || nextCount >= 2) {
+  const offsetWeights = new Map<number, number>();
+  const pageCropInfo = new Map<number, CornerCropCandidate>();
+
+  const addVote = (offset: number, weight: number) => {
+    if (offset < 0 || offset > Math.min(40, Math.floor(totalPages * 0.35))) return;
+    offsetWeights.set(offset, (offsetWeights.get(offset) || 0) + weight);
+  };
+
+  for (const p of scanPagesOrder) {
+    const crops = await extractCornerNumberCropsFromPage(pdfDoc, p);
+    if (crops.length === 0) continue;
+    const bestCrop = crops[0];
+    pageCropInfo.set(p, bestCrop);
+
+    if (bestCrop.geometricNumber !== null) {
+      const offset = p - bestCrop.geometricNumber;
+      const weight = bestCrop.geometricNumber >= 10 ? 15 : 8;
+      addVote(offset, weight);
+
+      // If we hit a high-confidence geometric anchor ('۱۰' = 10 or '۱۱' = 11) confirmed by another vote, lock in right away!
+      if ((offsetWeights.get(offset) || 0) >= 20) {
         saveCachedBookPageOffset(docKey, offset);
         return offset;
       }
     }
   }
 
-  // If at least one sample page yielded a valid corner number, use the best offset vote
-  if (offsetVotes.size > 0) {
-    let bestOffset = 0;
-    let bestCount = 0;
-    for (const [off, cnt] of offsetVotes.entries()) {
-      if (cnt > bestCount) {
-        bestOffset = off;
-        bestCount = cnt;
+  // Score sequence transition from 1-digit pages (1..9 -> blobCount === 1) to teen pages (10..19 -> isTeenPattern === true)
+  for (let candOffset = 0; candOffset <= Math.min(20, totalPages - 5); candOffset++) {
+    let seqScore = 0;
+    for (const [p, crop] of pageCropInfo.entries()) {
+      const bookP = p - candOffset;
+      if (bookP >= 1 && bookP <= 9 && crop.blobCount === 1) {
+        seqScore += 3;
+      } else if (bookP >= 10 && bookP <= 19 && crop.isTeenPattern) {
+        seqScore += 4;
       }
     }
-    saveCachedBookPageOffset(docKey, bestOffset);
-    return bestOffset;
+    if (seqScore >= 9) {
+      addVote(candOffset, seqScore);
+    }
   }
 
-  // 2. Fallback: Check cached OCR lines or Server AI if corner crops needed server vision
-  const cachedOcr = await loadCachedOcrPages(docKey);
-  const consensus = computePageOffsetFromLinesMap(cachedOcr, totalPages);
-  if (consensus && consensus.distinctPages >= 2) {
-    saveCachedBookPageOffset(docKey, consensus.offset);
-    return consensus.offset;
+  if (offsetWeights.size > 0) {
+    let bestOffset = 0;
+    let bestWeight = 0;
+    for (const [off, w] of offsetWeights.entries()) {
+      if (w > bestWeight) {
+        bestOffset = off;
+        bestWeight = w;
+      }
+    }
+    if (bestWeight >= 10) {
+      saveCachedBookPageOffset(docKey, bestOffset);
+      return bestOffset;
+    }
   }
 
+  // 3. Also query Server Gemini AI (/api/chapters in offset_only mode) with corner crops if available
   const bodySamplePayload: Array<{
     page: number;
     lines: string[];
@@ -959,16 +1080,13 @@ export async function detectAndCacheBookPageOffset(
     mimeType?: string;
   }> = [];
 
-  for (const p of samplePages.slice(0, 3)) {
-    const crops = await extractCornerNumberCropsFromPage(pdfDoc, p);
-    if (crops.length > 0) {
-      bodySamplePayload.push({
-        page: p,
-        lines: cachedOcr[p] || [],
-        imageBase64: crops[0].dataUrl,
-        mimeType: 'image/png',
-      });
-    }
+  for (const [p, crop] of Array.from(pageCropInfo.entries()).slice(0, 4)) {
+    bodySamplePayload.push({
+      page: p,
+      lines: linesMap[p] || [],
+      imageBase64: crop.dataUrl,
+      mimeType: 'image/png',
+    });
   }
 
   if (bodySamplePayload.length > 0) {
@@ -1000,7 +1118,7 @@ export async function detectAndCacheBookPageOffset(
 
 /**
  * Recognizes the book's Table of Contents / Chapters ONLY if the book actually has a chapters
- * section in its opening pages. Returns [] if the book has no Table of Contents.
+ * section in its opening pages. Saves and returns [] if the book has no Table of Contents.
  */
 export async function recognizeAndCacheBookChapters(
   docKey: string,
@@ -1009,14 +1127,14 @@ export async function recognizeAndCacheBookChapters(
   pdfDoc?: pdfjsLib.PDFDocumentProxy,
   preferredCurrentPage = 1
 ): Promise<SmartBookChapter[]> {
-  const existingChapters = loadCachedBookChapters(docKey);
-  if (existingChapters.length > 0) {
+  if (hasAnalyzedBookChapters(docKey)) {
+    const cached = loadCachedBookChapters(docKey);
     if (pdfDoc && loadCachedBookPageOffset(docKey) === null) {
       detectAndCacheBookPageOffset(docKey, bookTitle, totalPages, pdfDoc, preferredCurrentPage).catch(
         () => {}
       );
     }
-    return existingChapters;
+    return cached;
   }
 
   const frontLimit = Math.min(12, totalPages);
@@ -1051,7 +1169,10 @@ export async function recognizeAndCacheBookChapters(
     }
   }
 
-  if (frontPagesPayload.length === 0) return [];
+  if (frontPagesPayload.length === 0) {
+    saveCachedBookChapters(docKey, []);
+    return [];
+  }
 
   try {
     const res = await fetch('/api/chapters', {
@@ -1072,10 +1193,9 @@ export async function recognizeAndCacheBookChapters(
       if (typeof data.pageOffset === 'number' && Number.isFinite(data.pageOffset)) {
         saveCachedBookPageOffset(docKey, data.pageOffset);
       }
-      if (Array.isArray(data.chapters) && data.chapters.length > 0) {
-        saveCachedBookChapters(docKey, data.chapters);
-        return data.chapters;
-      }
+      const detectedChapters = Array.isArray(data.chapters) ? data.chapters : [];
+      saveCachedBookChapters(docKey, detectedChapters);
+      return detectedChapters;
     }
   } catch {
     // ignore network error
@@ -1087,6 +1207,7 @@ export async function recognizeAndCacheBookChapters(
     );
   }
 
+  saveCachedBookChapters(docKey, []);
   return [];
 }
 

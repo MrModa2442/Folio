@@ -267,11 +267,16 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     [effectiveOffset]
   );
 
-  // Keep the toolbar page input box synchronized with the Printed Book Page Number (e.g. 10 when on PDF page 15)
+  // Keep the toolbar page input box synchronized with the Printed Book Page Number (e.g. 1 when on PDF page 5, or 10 when on PDF page 15)
   useEffect(() => {
-    setPageInput(String(currentBookPage));
-    setManualPrintedPageInput(String(currentBookPage));
-  }, [currentBookPage, effectiveOffset]);
+    if (isFrontMatterPage) {
+      setPageInput(`Intro ${currentPage}`);
+      setManualPrintedPageInput('');
+    } else {
+      setPageInput(String(currentBookPage));
+      setManualPrintedPageInput(String(currentBookPage));
+    }
+  }, [currentBookPage, currentPage, isFrontMatterPage, effectiveOffset]);
 
   // Load PDF Document + Cached AI OCR pages & AI Chapters from IndexedDB/localStorage
   useEffect(() => {
@@ -383,7 +388,8 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           return;
         }
 
-        // 2. Start AI Table of Contents recognition on the opening pages right away in the background
+        // 2. Analyze the opening pages for a Table of Contents / Chapters section.
+        // If the book's first pages do NOT contain a Table of Contents, pdfChapters remains [] and the Chapters button stays disabled.
         setIsAiRecognizingChapters(true);
         recognizeAndCacheBookChapters(
           docCacheKey,
@@ -397,73 +403,14 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             if (aiCh.length > 0) {
               setPdfChapters(aiCh);
               setHasEmbeddedOutline(true);
+            } else {
+              setPdfChapters([]);
+              setHasEmbeddedOutline(false);
             }
           })
           .finally(() => {
             if (isMounted) setIsAiRecognizingChapters(false);
           });
-
-        // Also check embedded PDF Table of Contents / Chapters outline while AI reads the opening pages
-        try {
-          const outline = await doc.getOutline();
-          if (!isMounted) return;
-          if (outline && outline.length > 0) {
-            const rawOutline: Array<{ title: string; startPage: number; level: number }> = [];
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const walkOutline = async (items: any[], level: number) => {
-              for (const item of items) {
-                if (!item || !item.title) continue;
-                let pageNum = 1;
-                try {
-                  let dest = item.dest;
-                  if (typeof dest === 'string') {
-                    dest = await doc.getDestination(dest);
-                  }
-                  if (Array.isArray(dest) && dest[0]) {
-                    const pageIdx = await doc.getPageIndex(dest[0]);
-                    pageNum = Math.max(1, Math.min(doc.numPages, pageIdx + 1));
-                  }
-                } catch {
-                  // fallback to page 1 if destination ref cannot be resolved
-                }
-                rawOutline.push({
-                  title: String(item.title).trim(),
-                  startPage: pageNum,
-                  level: Math.min(level, 2),
-                });
-                if (Array.isArray(item.items) && item.items.length > 0 && level < 2) {
-                  await walkOutline(item.items, level + 1);
-                }
-              }
-            };
-            await walkOutline(outline, 0);
-            if (!isMounted) return;
-            if (rawOutline.length >= 2) {
-              const extractedChapters: PdfChapterItem[] = rawOutline.map((ch, idx) => {
-                const nextStart = rawOutline[idx + 1]?.startPage;
-                const endPage =
-                  nextStart && nextStart > ch.startPage
-                    ? nextStart - 1
-                    : nextStart === ch.startPage
-                    ? ch.startPage
-                    : doc.numPages;
-                return {
-                  id: `ch_${idx}_${ch.startPage}`,
-                  title: ch.title,
-                  page: ch.startPage,
-                  startPage: ch.startPage,
-                  endPage: Math.max(ch.startPage, Math.min(doc.numPages, endPage)),
-                  level: ch.level,
-                };
-              });
-              setPdfChapters(prev => (prev.length > 0 ? prev : extractedChapters));
-              setHasEmbeddedOutline(true);
-              return;
-            }
-          }
-        } catch {
-          // ignore
-        }
       })
       .catch(err => {
         console.error('PDF.js failed to load document:', err);
@@ -1797,12 +1744,14 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             className="flex items-center gap-1 font-mono"
           >
             {isFrontMatterPage && (
-              <span
-                className="px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300 text-[10px] font-sans font-semibold"
-                title={`Front-matter / Intro page ${currentPage} of ${effectiveOffset} (Book Page 1 starts on PDF page ${effectiveOffset + 1})`}
+              <button
+                type="button"
+                onClick={() => goToPage(1 + effectiveOffset)}
+                className="px-1.5 py-0.5 rounded bg-[#1DB954]/20 hover:bg-[#1DB954]/30 text-[#1DB954] border border-[#1DB954]/40 text-[10px] font-sans font-semibold transition-colors"
+                title={`Jump to Book Page 1 (starts on PDF page ${effectiveOffset + 1})`}
               >
-                Intro
-              </span>
+                Page 1 →
+              </button>
             )}
             <input
               type="text"
@@ -1810,10 +1759,19 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               value={pageInput}
               onChange={e => setPageInput(e.target.value)}
               onBlur={() => goToBookPageInput(pageInput)}
-              title="Current Book Page Number (detected from page corners)"
-              className="w-11 text-center py-0.5 rounded border border-white/20 bg-white text-black text-xs font-semibold focus:outline-hidden focus:ring-1 focus:ring-[#1DB954]"
+              title="Book Page Number (matches the page number written in the book itself)"
+              className="w-14 text-center py-0.5 rounded border border-white/20 bg-white text-black text-xs font-semibold focus:outline-hidden focus:ring-1 focus:ring-[#1DB954]"
             />
-            <span className="opacity-60 text-xs">/ {totalPages}</span>
+            <span
+              className="opacity-60 text-xs"
+              title={
+                effectiveOffset > 0
+                  ? `${totalBookPages} numbered book pages (${totalPages} total PDF pages including ${effectiveOffset} intro pages)`
+                  : `${totalBookPages} pages`
+              }
+            >
+              / {totalBookPages}
+            </span>
           </form>
 
           <button
@@ -1830,9 +1788,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             onClick={() => goToPage(totalPages)}
             disabled={currentPage >= totalPages}
             className="hidden sm:inline-flex px-1.5 py-0.5 rounded text-[11px] opacity-70 hover:opacity-100 hover:bg-white/10 disabled:opacity-30 transition-colors"
-            title="Last page"
+            title="Last book page"
           >
-            {totalPages}
+            {totalBookPages}
           </button>
 
           {/* Book Page Number Calibration Badge & 1-Click Manual Match Popover */}
@@ -2633,7 +2591,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                   onClick={() => {
                     setIsAiRecognizingChapters(true);
                     try {
-                      localStorage.removeItem(`folio_book_chapters_v3_${docCacheKey}`);
+                      localStorage.removeItem(`folio_book_chapters_v4_${docCacheKey}`);
                     } catch {
                       // ignore
                     }

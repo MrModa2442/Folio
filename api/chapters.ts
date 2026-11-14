@@ -227,6 +227,13 @@ function finalizeChapterRanges(
 
   if (deduped.length < 2) return [];
 
+  const distinctStartPages = new Set(deduped.map(d => d.startPage));
+  const minStart = deduped[0].startPage;
+  const maxStart = deduped[deduped.length - 1].startPage;
+  if (distinctStartPages.size < 2 || maxStart - minStart < 3) {
+    return [];
+  }
+
   return deduped.map((ch, idx) => {
     const nextStart = deduped[idx + 1]?.startPage;
     let computedEnd = ch.endPage;
@@ -294,7 +301,7 @@ export function parseHeuristicChaptersFromFrontPages(
         tocLikeLinesOnPage++;
       }
     }
-    if (tocLikeLinesOnPage >= 3) {
+    if (tocLikeLinesOnPage >= 4) {
       tocPageNumbers.add(fp.page);
     }
   }
@@ -377,8 +384,8 @@ async function extractChaptersAndOffsetWithGemini(
   const systemInstruction =
     'You are an expert literary archivist and multilingual book analyzer (specializing in Persian/Farsi, Arabic, and English books). ' +
     'You have two critical tasks:\n' +
-    '1. CORNER PAGE NUMBER DETECTION (pageOffset): Look at the top-right, top-left, bottom-right, and bottom-left corners of each sample page (both text lines and corner/header/footer images). You will see a printed number (e.g. Persian digits "۱۰" = 10 on PDF page 15, or "۱۲" = 12 on PDF page 17), which is the page number of the book right now. Compute the integer `pageOffset = pdfPage - printedBookPage` (e.g., 15 - 10 = 5).\n' +
-    '2. TABLE OF CONTENTS CHAPTERS: Check if the opening pages contain an explicit Table of Contents ("فهرست مطالب" / "Contents") page listing the book\'s chapters and their page numbers. If and ONLY if the book has a Table of Contents section, extract the chapters with their `startPage` and `endPage`. If the book does NOT have a Table of Contents section in the opening pages, you MUST return an empty `chapters: []` array (never invent chapters or use running headers).';
+    '1. PRINTED BOOK PAGE NUMBER DETECTION (pageOffset): Look at the top-right, top-left, bottom-right, and bottom-left corners of each sample page (both text lines and corner/header/footer images). You will see a printed number written by the book author/publisher (e.g. "1" or "۱" on PDF page 5, or "۱۰" = 10 on PDF page 15, or "۱۲" = 12 on PDF page 17). Compute the integer `pageOffset = pdfPage - printedBookPage` (e.g., 5 - 1 = 4, or 15 - 10 = 5).\n' +
+    '2. TABLE OF CONTENTS CHAPTERS: Check if the opening pages (pages 1..15) contain an explicit, dedicated Table of Contents ("فهرست مطالب" / "فهرست" / "Contents") page that lists the chapters/topics of the book alongside their page numbers. If and ONLY if such a Table of Contents page exists in the opening pages, set `hasTableOfContents: true`, set `tocPdfPageNumber` to that page number (1..15), and extract the chapters. If the opening pages do NOT contain an explicit Table of Contents page showing chapters and their page numbers, you MUST set `hasTableOfContents: false`, `tocPdfPageNumber: -1`, and return an empty `chapters: []` array (NEVER invent chapters from normal text, poems, or running headers).';
 
   const allTextPages = [...frontPages, ...bodySamplePages];
   const seenTextPages = new Set<number>();
@@ -400,7 +407,7 @@ async function extractChaptersAndOffsetWithGemini(
   const imageParts: Array<{ inlineData: { mimeType: string; data: string } } | { text: string }> = [];
   for (const p of imagePages) {
     imageParts.push({
-      text: `Image below is from physical PDF Page ${p.page} (inspect top-right, top-left, bottom-right, and bottom-left corners for the printed page number, e.g. ۱۰, ۱۱, ۱۲, so you can compute pageOffset = ${p.page} - printedPageNumber):`,
+      text: `Image below is from physical PDF Page ${p.page} (inspect top-right, top-left, bottom-right, and bottom-left corners for the printed book page number, e.g. ۱, ۱۰, ۱۱, ۱۲, so you can compute pageOffset = ${p.page} - printedPageNumber):`,
     });
     imageParts.push({
       inlineData: {
@@ -415,8 +422,8 @@ async function extractChaptersAndOffsetWithGemini(
     `Total PDF Pages: ${totalPages}`,
     textBlocks ? `Extracted Text from Pages:\n${textBlocks}` : '',
     offsetOnly
-      ? 'Determine the exact `pageOffset` (`pdfPage - printedBookPage`) from the corner numbers on the sample pages. Return JSON with `pageOffset` (integer) and an empty `chapters` array.'
-      : 'Determine the exact `pageOffset` (`pdfPage - printedBookPage`) from the corner numbers AND, only if the opening pages contain a real Table of Contents ("فهرست مطالب" / "Contents"), extract its chapters. If there is no Table of Contents, return `chapters: []`.',
+      ? 'Determine the exact `pageOffset` (`pdfPage - printedBookPage`) from the corner numbers on the sample pages. Return JSON with `pageOffset` (integer), `hasTableOfContents: false`, `tocPdfPageNumber: -1`, and an empty `chapters` array.'
+      : 'Determine the exact `pageOffset` (`pdfPage - printedBookPage`) from the corner numbers AND check whether the opening pages contain an explicit Table of Contents ("فهرست مطالب" / "Contents") page. If there is no Table of Contents page in the opening pages, return `hasTableOfContents: false`, `tocPdfPageNumber: -1`, and `chapters: []`.',
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -447,12 +454,17 @@ async function extractChaptersAndOffsetWithGemini(
             hasTableOfContents: {
               type: Type.BOOLEAN,
               description:
-                'True ONLY if the opening pages explicitly contain a Table of Contents ("فهرست مطالب" / "Contents") listing topics and page numbers.',
+                'True ONLY if the opening pages explicitly contain a dedicated Table of Contents ("فهرست مطالب" / "Contents") page listing chapters and their page numbers.',
+            },
+            tocPdfPageNumber: {
+              type: Type.INTEGER,
+              description:
+                'The PDF page number (1..15) where the Table of Contents page starts, or -1 if the book has no Table of Contents page.',
             },
             pageOffset: {
               type: Type.INTEGER,
               description:
-                'The integer offset (pdfPage - printedBookPage). For example, if PDF Page 15 shows printed page 10 in its corner, pageOffset is 5. If unknown, return -999.',
+                'The integer offset (pdfPage - printedBookPage). For example, if PDF Page 5 has printed page 1, pageOffset is 4; if PDF Page 15 has printed page 10, pageOffset is 5. If unknown, return -999.',
             },
             chapters: {
               type: Type.ARRAY,
@@ -480,16 +492,17 @@ async function extractChaptersAndOffsetWithGemini(
               },
             },
           },
-          required: ['hasTableOfContents', 'pageOffset', 'chapters'],
+          required: ['hasTableOfContents', 'tocPdfPageNumber', 'pageOffset', 'chapters'],
         },
       },
     });
 
     const rawText = (
-      response.text ?? '{"hasTableOfContents":false,"pageOffset":-999,"chapters":[]}'
+      response.text ?? '{"hasTableOfContents":false,"tocPdfPageNumber":-1,"pageOffset":-999,"chapters":[]}'
     ).trim();
     const parsed = JSON.parse(rawText) as {
       hasTableOfContents?: boolean;
+      tocPdfPageNumber?: number;
       pageOffset?: number;
       chapters?: Array<{ title: string; startPage: number; endPage?: number; level?: number }>;
     };
@@ -503,13 +516,15 @@ async function extractChaptersAndOffsetWithGemini(
     const maxBookPage =
       validOffset !== null && validOffset > 0 ? Math.max(1, totalPages - validOffset) : totalPages;
 
-    const list =
-      parsed.hasTableOfContents && Array.isArray(parsed.chapters) ? parsed.chapters : [];
-    const finalized = finalizeChapterRanges(list, maxBookPage, bookTitle);
+    const tocPageValid =
+      parsed.hasTableOfContents === true &&
+      typeof parsed.tocPdfPageNumber === 'number' &&
+      parsed.tocPdfPageNumber >= 1 &&
+      parsed.tocPdfPageNumber <= 15;
 
-    if (!offsetOnly && finalized.length === 0 && validOffset === null) {
-      throw new Error('Neither chapters nor pageOffset extracted');
-    }
+    const list =
+      !offsetOnly && tocPageValid && Array.isArray(parsed.chapters) ? parsed.chapters : [];
+    const finalized = finalizeChapterRanges(list, maxBookPage, bookTitle);
 
     return {
       chapters: finalized,
@@ -565,22 +580,20 @@ export default async function chaptersHandler(req: Request, res: Response) {
         );
         const finalOffset =
           aiResult.pageOffset !== null ? aiResult.pageOffset : heuristicOffset;
-        if (aiResult.chapters.length > 0 || finalOffset !== null) {
-          const maxBookPage =
-            finalOffset !== null && finalOffset > 0
-              ? Math.max(1, totalPages - finalOffset)
-              : totalPages;
-          const fallbackChapters =
-            !offsetOnly && aiResult.chapters.length === 0
-              ? parseHeuristicChaptersFromFrontPages(frontPages, maxBookPage, bookTitle)
-              : aiResult.chapters;
+        const maxBookPage =
+          finalOffset !== null && finalOffset > 0
+            ? Math.max(1, totalPages - finalOffset)
+            : totalPages;
+        const fallbackChapters =
+          !offsetOnly && aiResult.chapters.length === 0
+            ? parseHeuristicChaptersFromFrontPages(frontPages, maxBookPage, bookTitle)
+            : aiResult.chapters;
 
-          return res.status(200).json({
-            chapters: fallbackChapters,
-            pageOffset: finalOffset,
-            source: 'ai',
-          });
-        }
+        return res.status(200).json({
+          chapters: fallbackChapters,
+          pageOffset: finalOffset,
+          source: 'ai',
+        });
       } catch (err) {
         console.warn('Gemini chapter/offset extraction fallback to heuristic:', err);
       }

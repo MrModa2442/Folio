@@ -1,7 +1,7 @@
 import React from 'react';
 import { AppTheme, Book, Booklist, UiSectionPreferences, DEFAULT_UI_PREFERENCES } from '../types/library';
 import { PWAInstallButton } from './PWAInstallButton';
-import { Plus, Moon, Sun, Coffee, SlidersHorizontal } from 'lucide-react';
+import { Plus, Moon, Sun, Coffee } from 'lucide-react';
 
 interface NavigationProps {
   currentTab: 'library' | 'explore' | 'bookshelf' | 'notes' | 'vocabulary';
@@ -16,7 +16,6 @@ interface NavigationProps {
   theme: AppTheme;
   onChangeTheme: (theme: AppTheme) => void;
   uiPreferences?: UiSectionPreferences;
-  onOpenCustomize?: () => void;
 }
 
 export const Navigation: React.FC<NavigationProps> = ({
@@ -29,7 +28,6 @@ export const Navigation: React.FC<NavigationProps> = ({
   theme,
   onChangeTheme,
   uiPreferences = DEFAULT_UI_PREFERENCES,
-  onOpenCustomize,
 }) => {
   const isDark = theme === 'spotify-dark';
 
@@ -98,7 +96,7 @@ export const Navigation: React.FC<NavigationProps> = ({
         )}
       </nav>
 
-      {/* Zone 3: Theme Switcher, Customize Sections, Offline iPad App & Import PDF */}
+      {/* Zone 3: Theme Switcher, Offline iPad App & Import PDF */}
       <div className="flex items-center gap-2 shrink-0">
         {/* Minimal Theme Switcher */}
         <div
@@ -143,26 +141,6 @@ export const Navigation: React.FC<NavigationProps> = ({
             <Coffee className="w-3.5 h-3.5" />
           </button>
         </div>
-
-        {/* Customize Layout & Visible Sections Button */}
-        {onOpenCustomize && (
-          <button
-            type="button"
-            onClick={onOpenCustomize}
-            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-semibold border transition-colors ${
-              isDark
-                ? 'bg-[#1F1F1F] border-[#333333] text-[#B3B3B3] hover:text-white hover:bg-[#282828]'
-                : theme === 'warm-minimal'
-                ? 'bg-[#F2ECE1] border-[#D8CEB8] text-[#292524] hover:bg-[#EAE0CE]'
-                : 'bg-zinc-100 border-zinc-200 text-zinc-700 hover:bg-zinc-200'
-            }`}
-            title="Customize App Design & Visible Sections"
-            aria-label="Customize App Design & Visible Sections"
-          >
-            <SlidersHorizontal className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">Customize</span>
-          </button>
-        )}
 
         {/* Mandatory In-App Offline / iPad PWA Install & Vault Button */}
         <PWAInstallButton

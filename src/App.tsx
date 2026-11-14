@@ -523,7 +523,6 @@ export default function App() {
         theme={theme}
         onChangeTheme={setTheme}
         uiPreferences={uiPreferences}
-        onOpenCustomize={() => setIsCustomizeOpen(true)}
       />
 
       <OfflineIndicator />
