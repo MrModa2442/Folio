@@ -25,10 +25,16 @@ interface NotesHighlightsHubProps {
 type AnnotationFilter = 'all' | 'pins' | 'highlights';
 
 const HIGHLIGHT_COLOR_LABELS: Record<string, { label: string; dot: string }> = {
-  '#FACC15': { label: 'Yellow', dot: '#FACC15' },
-  '#4ADE80': { label: 'Green', dot: '#4ADE80' },
-  '#FB7185': { label: 'Rose', dot: '#FB7185' },
-  '#38BDF8': { label: 'Sky', dot: '#38BDF8' },
+  '#FACC15': { label: 'Yellow Highlight', dot: '#FACC15' },
+  '#4ADE80': { label: 'Green Highlight', dot: '#4ADE80' },
+  '#FB7185': { label: 'Rose Highlight', dot: '#FB7185' },
+  '#38BDF8': { label: 'Sky Highlight', dot: '#38BDF8' },
+  '#111827': { label: 'Black Pen', dot: '#111827' },
+  '#1D4ED8': { label: 'Blue Pen', dot: '#1D4ED8' },
+  '#DC2626': { label: 'Red Pen', dot: '#DC2626' },
+  '#047857': { label: 'Emerald Pen', dot: '#047857' },
+  '#78350F': { label: 'Walnut Pen', dot: '#78350F' },
+  '#FFFFFF': { label: 'White Pen', dot: '#FFFFFF' },
 };
 
 export const NotesHighlightsHub: React.FC<NotesHighlightsHubProps> = ({
@@ -527,7 +533,7 @@ export const NotesHighlightsHub: React.FC<NotesHighlightsHubProps> = ({
               {totalHighlightedPagesCount}
             </div>
             <div className={`text-[11px] font-medium ${isDark ? 'text-[#B3B3B3]' : 'text-zinc-500'}`}>
-              Highlighted Pages
+              Highlights &amp; Pen Pages
             </div>
           </div>
         </div>
@@ -541,7 +547,7 @@ export const NotesHighlightsHub: React.FC<NotesHighlightsHubProps> = ({
               [
                 { id: 'all', label: `All (${totalPinsCount + totalHighlightedPagesCount})` },
                 { id: 'pins', label: `Pins & Notes (${totalPinsCount})` },
-                { id: 'highlights', label: `Highlights (${totalHighlightedPagesCount})` },
+                { id: 'highlights', label: `Highlights & Pen (${totalHighlightedPagesCount})` },
               ] as const
             ).map(tab => (
               <button

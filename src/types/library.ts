@@ -38,6 +38,8 @@ export interface PageBookmark {
 export interface PageHighlightStroke {
   color: string;
   points: Array<{ x: number; y: number }>;
+  tool?: 'highlight' | 'pen';
+  size?: number;
 }
 
 export interface SavedVocabularyItem {

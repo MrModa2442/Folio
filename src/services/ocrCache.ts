@@ -151,6 +151,20 @@ export function saveCachedBookChapters(
   }
 }
 
+export function clearCachedBookChapters(docKey: string): void {
+  if (!docKey || typeof window === 'undefined') return;
+  try {
+    localStorage.removeItem(`${CHAPTERS_STORAGE_PREFIX}${docKey}`);
+    window.dispatchEvent(
+      new CustomEvent<ChaptersUpdateEventDetail>(CHAPTERS_UPDATED_EVENT, {
+        detail: { docKey, chapters: [] },
+      })
+    );
+  } catch {
+    // ignore storage errors
+  }
+}
+
 export function subscribeToChapterUpdates(
   callback: (detail: ChaptersUpdateEventDetail) => void
 ): () => void {
@@ -1117,27 +1131,46 @@ export async function detectAndCacheBookPageOffset(
 }
 
 /**
- * Recognizes the book's Table of Contents / Chapters ONLY if the book actually has a chapters
- * section in its opening pages. Saves and returns [] if the book has no Table of Contents.
+/**
+ * User-interactive AI & OCR Chapter List Recognizer.
+ * Called when the user clicks to analyze the book (or the current page) for its Table of Contents / Chapters list.
  */
 export async function recognizeAndCacheBookChapters(
   docKey: string,
   bookTitle: string,
   totalPages: number,
   pdfDoc?: pdfjsLib.PDFDocumentProxy,
-  preferredCurrentPage = 1
+  preferredCurrentPage = 1,
+  options?: {
+    forceRefresh?: boolean;
+    scanSpecificPageOnly?: number;
+  }
 ): Promise<SmartBookChapter[]> {
-  if (hasAnalyzedBookChapters(docKey)) {
+  if (!options?.forceRefresh && !options?.scanSpecificPageOnly && hasAnalyzedBookChapters(docKey)) {
     const cached = loadCachedBookChapters(docKey);
-    if (pdfDoc && loadCachedBookPageOffset(docKey) === null) {
-      detectAndCacheBookPageOffset(docKey, bookTitle, totalPages, pdfDoc, preferredCurrentPage).catch(
-        () => {}
-      );
+    if (cached.length > 0) {
+      return cached;
     }
-    return cached;
   }
 
-  const frontLimit = Math.min(12, totalPages);
+  const targetPageNums: number[] = [];
+  if (options?.scanSpecificPageOnly && options.scanSpecificPageOnly >= 1) {
+    const p0 = Math.max(1, Math.min(totalPages, options.scanSpecificPageOnly));
+    targetPageNums.push(p0);
+    if (p0 + 1 <= totalPages) targetPageNums.push(p0 + 1);
+  } else {
+    const frontLimit = Math.min(15, totalPages);
+    for (let p = 1; p <= frontLimit; p++) {
+      targetPageNums.push(p);
+    }
+    if (preferredCurrentPage > frontLimit && preferredCurrentPage <= totalPages) {
+      targetPageNums.push(preferredCurrentPage);
+      if (preferredCurrentPage + 1 <= totalPages) {
+        targetPageNums.push(preferredCurrentPage + 1);
+      }
+    }
+  }
+
   const cachedPages = await loadCachedOcrPages(docKey);
   const frontPagesPayload: Array<{
     page: number;
@@ -1146,7 +1179,9 @@ export async function recognizeAndCacheBookChapters(
     mimeType?: string;
   }> = [];
 
-  for (let p = 1; p <= frontLimit; p++) {
+  const pagesNeedingOcr: Array<{ page: number; imageBase64: string; mimeType: string }> = [];
+
+  for (const p of targetPageNums) {
     let lines = cachedPages[p] || [];
     if (lines.length === 0 && pdfDoc) {
       lines = await extractNativePageLines(pdfDoc, p);
@@ -1155,22 +1190,95 @@ export async function recognizeAndCacheBookChapters(
       }
     }
     let imageBase64: string | undefined;
-    if (lines.length < 3 && pdfDoc && p >= 2 && p <= 8) {
+    const shouldRenderImage =
+      pdfDoc &&
+      (Boolean(options?.scanSpecificPageOnly) ||
+        p === preferredCurrentPage ||
+        (lines.length < 3 && p >= 2 && p <= 10));
+
+    if (shouldRenderImage && pdfDoc) {
       const b64 = await renderPdfPageToJpegDataUrl(pdfDoc, p);
-      if (b64) imageBase64 = b64;
+      if (b64) {
+        imageBase64 = b64;
+        if (lines.length < 3) {
+          pagesNeedingOcr.push({ page: p, imageBase64: b64, mimeType: 'image/jpeg' });
+        }
+      }
     }
-    if (lines.length > 0 || imageBase64) {
-      frontPagesPayload.push({
-        page: p,
-        lines,
-        imageBase64,
-        mimeType: 'image/jpeg',
+
+    frontPagesPayload.push({
+      page: p,
+      lines,
+      imageBase64,
+      mimeType: 'image/jpeg',
+    });
+  }
+
+  // If any key candidate TOC pages are scanned images without text lines yet, OCR them quickly so both AI & heuristic parser have full text lines
+  if (pagesNeedingOcr.length > 0) {
+    const ocrTargets = pagesNeedingOcr.slice(0, 6);
+    let ocrResults: Array<{ page: number; lines: string[] }> = [];
+    let useLocalOcr = false;
+
+    try {
+      const ocrRes = await fetch('/api/ocr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pages: ocrTargets }),
       });
+      if (ocrRes.ok) {
+        const ocrData = (await ocrRes.json()) as {
+          results?: Array<{ page: number; lines: string[] }>;
+          useClientOcr?: boolean;
+        };
+        if (ocrData.useClientOcr) {
+          useLocalOcr = true;
+        } else {
+          ocrResults = (ocrData.results || []).filter(
+            r => Array.isArray(r.lines) && r.lines.length > 0
+          );
+        }
+      } else {
+        useLocalOcr = true;
+      }
+    } catch {
+      useLocalOcr = true;
+    }
+
+    if (useLocalOcr) {
+      try {
+        const worker = await getSharedTesseractWorker();
+        for (const item of ocrTargets.slice(0, 3)) {
+          const rec = await worker.recognize(item.imageBase64);
+          const lines = (rec?.data?.text || '')
+            .split(/\r?\n/)
+            .map(l => l.trim())
+            .filter(Boolean);
+          if (lines.length > 0) {
+            ocrResults.push({ page: item.page, lines });
+          }
+        }
+      } catch {
+        // ignore local OCR error
+      }
+    }
+
+    if (ocrResults.length > 0) {
+      await saveCachedOcrPages(docKey, ocrResults, totalPages);
+      for (const r of ocrResults) {
+        const item = frontPagesPayload.find(fp => fp.page === r.page);
+        if (item) {
+          item.lines = r.lines;
+        }
+      }
     }
   }
 
-  if (frontPagesPayload.length === 0) {
-    saveCachedBookChapters(docKey, []);
+  const nonEmptyFrontPages = frontPagesPayload.filter(
+    fp => (fp.lines && fp.lines.length > 0) || Boolean(fp.imageBase64)
+  );
+
+  if (nonEmptyFrontPages.length === 0) {
     return [];
   }
 
@@ -1181,8 +1289,9 @@ export async function recognizeAndCacheBookChapters(
       body: JSON.stringify({
         bookTitle,
         totalPages,
-        frontPages: frontPagesPayload,
+        frontPages: nonEmptyFrontPages,
         bodySamplePages: [],
+        userRequested: true,
       }),
     });
     if (res.ok) {
@@ -1194,20 +1303,15 @@ export async function recognizeAndCacheBookChapters(
         saveCachedBookPageOffset(docKey, data.pageOffset);
       }
       const detectedChapters = Array.isArray(data.chapters) ? data.chapters : [];
-      saveCachedBookChapters(docKey, detectedChapters);
+      if (detectedChapters.length > 0) {
+        saveCachedBookChapters(docKey, detectedChapters);
+      }
       return detectedChapters;
     }
   } catch {
     // ignore network error
   }
 
-  if (pdfDoc && loadCachedBookPageOffset(docKey) === null) {
-    detectAndCacheBookPageOffset(docKey, bookTitle, totalPages, pdfDoc, preferredCurrentPage).catch(
-      () => {}
-    );
-  }
-
-  saveCachedBookChapters(docKey, []);
   return [];
 }
 
@@ -1239,14 +1343,13 @@ async function processSingleBookInBackground(book: Book): Promise<void> {
     // Immediately calibrate the book's printed page number offset first!
     await detectAndCacheBookPageOffset(docKey, book.title, total, pdfDoc, book.currentPage || 1);
 
-    // Always prioritize the opening 15 pages first so Table of Contents & Chapters are recognized immediately!
+    // Prioritize the opening 15 pages first, then order remaining pages starting from book.currentPage outward
     const frontPageCount = Math.min(15, total);
     const orderedPagesSet = new Set<number>();
     for (let p = 1; p <= frontPageCount; p++) {
       orderedPagesSet.add(p);
     }
 
-    // Then order remaining pages starting from book.currentPage outward
     const startPage = Math.max(1, Math.min(total, book.currentPage || 1));
     for (let offset = 0; offset < total; offset++) {
       const forward = startPage + offset;
@@ -1261,7 +1364,6 @@ async function processSingleBookInBackground(book: Book): Promise<void> {
     );
 
     if (pagesToReview.length === 0) {
-      await recognizeAndCacheBookChapters(docKey, book.title, total, pdfDoc, book.currentPage || 1);
       completedBookIds.add(docKey);
       await loadingTask.destroy().catch(() => {});
       return;
@@ -1287,10 +1389,6 @@ async function processSingleBookInBackground(book: Book): Promise<void> {
     if (nativeBatch.length > 0) {
       await saveCachedOcrPages(docKey, nativeBatch, total);
     }
-
-    // Try recognizing chapters right away from native opening pages (or opening page images)
-    let chaptersRecognized =
-      (await recognizeAndCacheBookChapters(docKey, book.title, total, pdfDoc, book.currentPage || 1)).length > 0;
 
     // Step 2: Review remaining pages with Server Gemini AI (/api/ocr) or Built-In Browser OCR fallback
     let useLocalBrowserOcr = false;
@@ -1361,25 +1459,7 @@ async function processSingleBookInBackground(book: Book): Promise<void> {
         await saveCachedOcrPages(docKey, pageResults, total);
       }
 
-      // Once the first ~15 pages have been OCR'd, run AI/heuristic chapter extraction again if not yet found!
-      if (!chaptersRecognized && i >= 9) {
-        const found = await recognizeAndCacheBookChapters(
-          docKey,
-          book.title,
-          total,
-          pdfDoc,
-          book.currentPage || 1
-        );
-        if (found.length > 0) {
-          chaptersRecognized = true;
-        }
-      }
-
       await new Promise(r => setTimeout(r, 120));
-    }
-
-    if (!chaptersRecognized) {
-      await recognizeAndCacheBookChapters(docKey, book.title, total, pdfDoc, book.currentPage || 1);
     }
 
     completedBookIds.add(docKey);

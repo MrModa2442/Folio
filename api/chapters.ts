@@ -267,7 +267,8 @@ function finalizeChapterRanges(
 export function parseHeuristicChaptersFromFrontPages(
   frontPages: FrontPageInput[],
   maxBookPage: number,
-  bookTitle = ''
+  bookTitle = '',
+  userRequested = false
 ): ExtractedChapterItem[] {
   const tocHeaderLineRegex =
     /^(?:[-–—•*\s])*(?:فهرست(?:\s+مطالب|\s+مندرجات)?|مندرجات|سرفصل(?:\s*ها)?|table\s+of\s+contents|contents)(?:[-–—•*:\s])*$/i;
@@ -276,7 +277,6 @@ export function parseHeuristicChaptersFromFrontPages(
 
   // First check which pages in frontPages actually look like a Table of Contents page
   const tocPageNumbers = new Set<number>();
-  let explicitTocStartPage = -1;
 
   for (const fp of frontPages) {
     const lines = (fp.lines || []).map(l => normalizeDigitsToAscii(l).trim()).filter(Boolean);
@@ -286,27 +286,33 @@ export function parseHeuristicChaptersFromFrontPages(
       l => tocHeaderLineRegex.test(l) || /^(?:فهرست\s+مطالب|فهرست\s+مندرجات|table\s+of\s+contents)/i.test(l)
     );
     if (hasExplicitTocHeading) {
-      if (explicitTocStartPage === -1) explicitTocStartPage = fp.page;
       tocPageNumbers.add(fp.page);
       tocPageNumbers.add(fp.page + 1);
       tocPageNumbers.add(fp.page + 2);
     }
 
-    // Or a page where >= 4 lines have leader dots ("..... 25") or chapter prefixes with page numbers
+    // Or a page where lines have leader dots ("..... 25"), chapter prefixes, or (when userRequested) topic + page number rows
     let tocLikeLinesOnPage = 0;
     for (const line of lines) {
-      if (/[.…_ـ]{3,}\s*\d{1,4}$/.test(line) || /^\d{1,4}\s*[.…_ـ]{3,}/.test(line)) {
+      if (/[.…_ـ]{2,}\s*\d{1,4}$/.test(line) || /^\d{1,4}\s*[.…_ـ]{2,}/.test(line)) {
         tocLikeLinesOnPage++;
       } else if (chapterPrefixRegex.test(line) && /\b\d{1,4}$/.test(line)) {
         tocLikeLinesOnPage++;
+      } else if (
+        userRequested &&
+        line.length >= 4 &&
+        line.length <= 110 &&
+        (/^(.+?)(?:\s{2,}|\s*[-–—:]\s*|(?:ص\.?|صفحه|page|p\.?)\s*)(\d{1,4})$/i.test(line) ||
+          /^(\d{1,4})(?:\s{2,}|\s*[-–—:]\s*)(.+?)$/.test(line))
+      ) {
+        tocLikeLinesOnPage++;
       }
     }
-    if (tocLikeLinesOnPage >= 4) {
+    if (tocLikeLinesOnPage >= (userRequested ? 2 : 4)) {
       tocPageNumbers.add(fp.page);
     }
   }
 
-  // If no page in the opening pages is a Table of Contents page, return [] so the Chapters button stays disabled
   if (tocPageNumbers.size === 0) {
     return [];
   }
@@ -385,7 +391,7 @@ async function extractChaptersAndOffsetWithGemini(
     'You are an expert literary archivist and multilingual book analyzer (specializing in Persian/Farsi, Arabic, and English books). ' +
     'You have two critical tasks:\n' +
     '1. PRINTED BOOK PAGE NUMBER DETECTION (pageOffset): Look at the top-right, top-left, bottom-right, and bottom-left corners of each sample page (both text lines and corner/header/footer images). You will see a printed number written by the book author/publisher (e.g. "1" or "۱" on PDF page 5, or "۱۰" = 10 on PDF page 15, or "۱۲" = 12 on PDF page 17). Compute the integer `pageOffset = pdfPage - printedBookPage` (e.g., 5 - 1 = 4, or 15 - 10 = 5).\n' +
-    '2. TABLE OF CONTENTS CHAPTERS: Check if the opening pages (pages 1..15) contain an explicit, dedicated Table of Contents ("فهرست مطالب" / "فهرست" / "Contents") page that lists the chapters/topics of the book alongside their page numbers. If and ONLY if such a Table of Contents page exists in the opening pages, set `hasTableOfContents: true`, set `tocPdfPageNumber` to that page number (1..15), and extract the chapters. If the opening pages do NOT contain an explicit Table of Contents page showing chapters and their page numbers, you MUST set `hasTableOfContents: false`, `tocPdfPageNumber: -1`, and return an empty `chapters: []` array (NEVER invent chapters from normal text, poems, or running headers).';
+    '2. TABLE OF CONTENTS CHAPTERS (User-Requested Analysis): The user explicitly clicked the Chapters button to analyze the provided pages and images for a Table of Contents ("فهرست مطالب" / "فهرست" / "Contents") or chapter/topic index that lists topics alongside their page numbers. Inspect both the text lines AND the page images carefully. If a Table of Contents / Chapters list is present on any of the provided pages, set `hasTableOfContents: true`, set `tocPdfPageNumber` to that page number, and extract all listed chapters/topics with their starting and ending printed book page numbers. If none of the provided pages contain a chapter/topic list, set `hasTableOfContents: false`, `tocPdfPageNumber: -1`, and return `chapters: []`.';
 
   const allTextPages = [...frontPages, ...bodySamplePages];
   const seenTextPages = new Set<number>();
@@ -401,13 +407,13 @@ async function extractChaptersAndOffsetWithGemini(
 
   const imagePages = [
     ...bodySamplePages.filter(p => p.imageBase64).slice(0, 4),
-    ...frontPages.filter(p => p.imageBase64).slice(0, 4),
+    ...frontPages.filter(p => p.imageBase64).slice(0, 6),
   ];
 
   const imageParts: Array<{ inlineData: { mimeType: string; data: string } } | { text: string }> = [];
   for (const p of imagePages) {
     imageParts.push({
-      text: `Image below is from physical PDF Page ${p.page} (inspect top-right, top-left, bottom-right, and bottom-left corners for the printed book page number, e.g. ۱, ۱۰, ۱۱, ۱۲, so you can compute pageOffset = ${p.page} - printedPageNumber):`,
+      text: `Image below is from physical PDF Page ${p.page} (inspect for Table of Contents / فهرست مطالب entries and inspect the 4 corners for the printed book page number so you can compute pageOffset = ${p.page} - printedPageNumber):`,
     });
     imageParts.push({
       inlineData: {
@@ -423,7 +429,7 @@ async function extractChaptersAndOffsetWithGemini(
     textBlocks ? `Extracted Text from Pages:\n${textBlocks}` : '',
     offsetOnly
       ? 'Determine the exact `pageOffset` (`pdfPage - printedBookPage`) from the corner numbers on the sample pages. Return JSON with `pageOffset` (integer), `hasTableOfContents: false`, `tocPdfPageNumber: -1`, and an empty `chapters` array.'
-      : 'Determine the exact `pageOffset` (`pdfPage - printedBookPage`) from the corner numbers AND check whether the opening pages contain an explicit Table of Contents ("فهرست مطالب" / "Contents") page. If there is no Table of Contents page in the opening pages, return `hasTableOfContents: false`, `tocPdfPageNumber: -1`, and `chapters: []`.',
+      : 'The user requested AI analysis to find the book\'s Chapters / Table of Contents ("فهرست مطالب" / "Contents") from these pages. Extract all chapter/section titles and their printed start/end page numbers if a list exists on these pages, and determine `pageOffset` (`pdfPage - printedBookPage`).',
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -454,12 +460,12 @@ async function extractChaptersAndOffsetWithGemini(
             hasTableOfContents: {
               type: Type.BOOLEAN,
               description:
-                'True ONLY if the opening pages explicitly contain a dedicated Table of Contents ("فهرست مطالب" / "Contents") page listing chapters and their page numbers.',
+                'True if the provided pages contain a Table of Contents ("فهرست مطالب" / "Contents") or chapter/topic list with page numbers.',
             },
             tocPdfPageNumber: {
               type: Type.INTEGER,
               description:
-                'The PDF page number (1..15) where the Table of Contents page starts, or -1 if the book has no Table of Contents page.',
+                'The PDF page number where the Table of Contents page starts, or -1 if no Table of Contents list is present.',
             },
             pageOffset: {
               type: Type.INTEGER,
@@ -518,9 +524,9 @@ async function extractChaptersAndOffsetWithGemini(
 
     const tocPageValid =
       parsed.hasTableOfContents === true &&
-      typeof parsed.tocPdfPageNumber === 'number' &&
-      parsed.tocPdfPageNumber >= 1 &&
-      parsed.tocPdfPageNumber <= 15;
+      (typeof parsed.tocPdfPageNumber !== 'number' ||
+        parsed.tocPdfPageNumber === -1 ||
+        (parsed.tocPdfPageNumber >= 1 && parsed.tocPdfPageNumber <= totalPages));
 
     const list =
       !offsetOnly && tocPageValid && Array.isArray(parsed.chapters) ? parsed.chapters : [];
@@ -547,15 +553,17 @@ export default async function chaptersHandler(req: Request, res: Response) {
       frontPages?: FrontPageInput[];
       bodySamplePages?: FrontPageInput[];
       mode?: 'full' | 'offset_only';
+      userRequested?: boolean;
     };
 
     const bookTitle = String(body.bookTitle || 'Book').trim();
     const totalPages = Math.max(1, Number(body.totalPages) || 1);
-    const frontPages = Array.isArray(body.frontPages) ? body.frontPages.slice(0, 18) : [];
+    const frontPages = Array.isArray(body.frontPages) ? body.frontPages.slice(0, 20) : [];
     const bodySamplePages = Array.isArray(body.bodySamplePages)
       ? body.bodySamplePages.slice(0, 8)
       : [];
     const offsetOnly = body.mode === 'offset_only';
+    const userRequested = body.userRequested !== false;
 
     if (frontPages.length === 0 && bodySamplePages.length === 0) {
       return res.status(200).json({ chapters: [], pageOffset: null, source: 'empty' });
@@ -586,7 +594,12 @@ export default async function chaptersHandler(req: Request, res: Response) {
             : totalPages;
         const fallbackChapters =
           !offsetOnly && aiResult.chapters.length === 0
-            ? parseHeuristicChaptersFromFrontPages(frontPages, maxBookPage, bookTitle)
+            ? parseHeuristicChaptersFromFrontPages(
+                frontPages,
+                maxBookPage,
+                bookTitle,
+                userRequested
+              )
             : aiResult.chapters;
 
         return res.status(200).json({
@@ -605,7 +618,12 @@ export default async function chaptersHandler(req: Request, res: Response) {
         : totalPages;
     const heuristicChapters = offsetOnly
       ? []
-      : parseHeuristicChaptersFromFrontPages(frontPages, maxBookPage, bookTitle);
+      : parseHeuristicChaptersFromFrontPages(
+          frontPages,
+          maxBookPage,
+          bookTitle,
+          userRequested
+        );
 
     return res.status(200).json({
       chapters: heuristicChapters,

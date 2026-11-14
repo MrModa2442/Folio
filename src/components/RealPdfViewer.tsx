@@ -7,6 +7,7 @@ import {
   saveCachedOcrPages,
   subscribeToOcrUpdates,
   loadCachedBookChapters,
+  clearCachedBookChapters,
   recognizeAndCacheBookChapters,
   subscribeToChapterUpdates,
   loadCachedBookPageOffset,
@@ -32,6 +33,8 @@ import {
   RefreshCw,
   Crop,
   Highlighter,
+  PenTool,
+  Eraser,
   Search,
   Bookmark,
   ListTree,
@@ -154,6 +157,21 @@ const HIGHLIGHT_COLORS = [
   { name: 'Sky', hex: '#38BDF8' },
 ];
 
+const PEN_COLORS = [
+  { name: 'Ink Black', hex: '#111827' },
+  { name: 'Royal Blue', hex: '#1D4ED8' },
+  { name: 'Crimson Red', hex: '#DC2626' },
+  { name: 'Emerald', hex: '#047857' },
+  { name: 'Walnut Brown', hex: '#78350F' },
+  { name: 'Chalk White', hex: '#FFFFFF' },
+];
+
+const PEN_SIZES = [
+  { label: 'Fine', value: 1.6 },
+  { label: 'Medium', value: 2.6 },
+  { label: 'Bold', value: 4.2 },
+];
+
 export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   bookId,
   bookTitle,
@@ -186,10 +204,17 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [pageInput, setPageInput] = useState<string>(String(initialPage));
   const [tapFeedback, setTapFeedback] = useState<'left' | 'right' | null>(null);
 
-  // Highlighter state
-  const [isHighlightMode, setIsHighlightMode] = useState<boolean>(false);
+  // Highlighter & Pen Writing state
+  const [activeDrawingTool, setActiveDrawingTool] = useState<'highlight' | 'pen' | null>(null);
   const [highlightColor, setHighlightColor] = useState<string>('#FACC15');
+  const [penColor, setPenColor] = useState<string>('#1D4ED8');
+  const [penSize, setPenSize] = useState<number>(2.6);
+  const [isEraserMode, setIsEraserMode] = useState<boolean>(false);
   const activeStrokeRef = useRef<Array<{ x: number; y: number }> | null>(null);
+  const isErasingRef = useRef<boolean>(false);
+  const isHighlightMode = activeDrawingTool === 'highlight';
+  const isPenMode = activeDrawingTool === 'pen';
+  const isDrawingMode = activeDrawingTool !== null;
 
   // In-PDF Full-Text Search + AI Page OCR Scanner state
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
@@ -221,11 +246,12 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [isBookmarksDrawerOpen, setIsBookmarksDrawerOpen] = useState<boolean>(false);
   const [bookmarkNoteDraft, setBookmarkNoteDraft] = useState<string>('');
 
-  // Table of Contents / Chapters Drawer state (only enabled when book has a real chapters section)
+  // Table of Contents / Chapters Drawer state (user-interactive: user chooses when AI analyzes book for chapter list)
   const [isChaptersDrawerOpen, setIsChaptersDrawerOpen] = useState<boolean>(false);
   const [pdfChapters, setPdfChapters] = useState<PdfChapterItem[]>([]);
   const [hasEmbeddedOutline, setHasEmbeddedOutline] = useState<boolean>(false);
   const [isAiRecognizingChapters, setIsAiRecognizingChapters] = useState<boolean>(false);
+  const [hasCheckedChaptersOnce, setHasCheckedChaptersOnce] = useState<boolean>(false);
 
   // Printed Book Page Number Calibration (pageOffset = pdfPage - printedBookPage, e.g. 15 - 10 = 5)
   const [pageOffset, setPageOffset] = useState<number>(0);
@@ -381,36 +407,17 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             });
         }
 
+        // Load any chapters that the user previously asked AI to analyze for this book
         const existingAiCh = loadCachedBookChapters(docCacheKey);
         if (existingAiCh.length > 0) {
           setPdfChapters(existingAiCh);
           setHasEmbeddedOutline(true);
-          return;
+          setHasCheckedChaptersOnce(true);
+        } else {
+          setPdfChapters([]);
+          setHasEmbeddedOutline(false);
+          setHasCheckedChaptersOnce(false);
         }
-
-        // 2. Analyze the opening pages for a Table of Contents / Chapters section.
-        // If the book's first pages do NOT contain a Table of Contents, pdfChapters remains [] and the Chapters button stays disabled.
-        setIsAiRecognizingChapters(true);
-        recognizeAndCacheBookChapters(
-          docCacheKey,
-          bookTitle || 'Book',
-          doc.numPages,
-          doc,
-          start
-        )
-          .then(aiCh => {
-            if (!isMounted) return;
-            if (aiCh.length > 0) {
-              setPdfChapters(aiCh);
-              setHasEmbeddedOutline(true);
-            } else {
-              setPdfChapters([]);
-              setHasEmbeddedOutline(false);
-            }
-          })
-          .finally(() => {
-            if (isMounted) setIsAiRecognizingChapters(false);
-          });
       })
       .catch(err => {
         console.error('PDF.js failed to load document:', err);
@@ -525,33 +532,98 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         }
       }
 
-      // 2. Draw user Apple Pencil / finger highlighter strokes
+      // 2. Draw user Highlighter strokes AND Pen Ink writings
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
 
       const allStrokes: PageHighlightStroke[] = [
         ...(highlights[currentPage] || []),
-        ...(extraPoints && extraPoints.length > 1
-          ? [{ color: highlightColor, points: extraPoints }]
+        ...(extraPoints && extraPoints.length >= 1 && !isEraserMode
+          ? [
+              {
+                color: isPenMode ? penColor : highlightColor,
+                points: extraPoints,
+                tool: isPenMode ? ('pen' as const) : ('highlight' as const),
+                size: isPenMode ? penSize : undefined,
+              },
+            ]
           : []),
       ];
 
       for (const stroke of allStrokes) {
-        if (!stroke.points || stroke.points.length < 2) continue;
+        if (!stroke.points || stroke.points.length === 0) continue;
+        const isPenStroke = stroke.tool === 'pen';
+
         ctx.save();
         ctx.strokeStyle = stroke.color;
-        ctx.globalAlpha = 0.36;
-        ctx.lineWidth = Math.max(14, overlay.width * 0.022);
-        ctx.beginPath();
-        ctx.moveTo(stroke.points[0].x * overlay.width, stroke.points[0].y * overlay.height);
-        for (let i = 1; i < stroke.points.length; i++) {
-          ctx.lineTo(stroke.points[i].x * overlay.width, stroke.points[i].y * overlay.height);
+        ctx.fillStyle = stroke.color;
+
+        if (isPenStroke) {
+          const sizeVal = stroke.size || 2.6;
+          const penPxWidth = Math.max(1.5, (overlay.width / 900) * sizeVal);
+          ctx.globalAlpha = 0.96;
+          ctx.lineWidth = penPxWidth;
+
+          if (stroke.points.length === 1) {
+            ctx.beginPath();
+            ctx.arc(
+              stroke.points[0].x * overlay.width,
+              stroke.points[0].y * overlay.height,
+              penPxWidth / 2,
+              0,
+              Math.PI * 2
+            );
+            ctx.fill();
+          } else {
+            ctx.beginPath();
+            const p0x = stroke.points[0].x * overlay.width;
+            const p0y = stroke.points[0].y * overlay.height;
+            ctx.moveTo(p0x, p0y);
+
+            for (let i = 1; i < stroke.points.length - 1; i++) {
+              const cx = stroke.points[i].x * overlay.width;
+              const cy = stroke.points[i].y * overlay.height;
+              const nx = stroke.points[i + 1].x * overlay.width;
+              const ny = stroke.points[i + 1].y * overlay.height;
+              const midX = (cx + nx) / 2;
+              const midY = (cy + ny) / 2;
+              ctx.quadraticCurveTo(cx, cy, midX, midY);
+            }
+
+            const lastPt = stroke.points[stroke.points.length - 1];
+            ctx.lineTo(lastPt.x * overlay.width, lastPt.y * overlay.height);
+            ctx.stroke();
+          }
+        } else {
+          if (stroke.points.length < 2) {
+            ctx.restore();
+            continue;
+          }
+          ctx.globalAlpha = 0.36;
+          ctx.lineWidth = Math.max(14, overlay.width * 0.022);
+          ctx.beginPath();
+          ctx.moveTo(stroke.points[0].x * overlay.width, stroke.points[0].y * overlay.height);
+          for (let i = 1; i < stroke.points.length; i++) {
+            ctx.lineTo(stroke.points[i].x * overlay.width, stroke.points[i].y * overlay.height);
+          }
+          ctx.stroke();
         }
-        ctx.stroke();
+
         ctx.restore();
       }
     },
-    [highlights, currentPage, highlightColor, isSearchOpen, searchResults, activeHitIndex]
+    [
+      highlights,
+      currentPage,
+      highlightColor,
+      penColor,
+      penSize,
+      isPenMode,
+      isEraserMode,
+      isSearchOpen,
+      searchResults,
+      activeHitIndex,
+    ]
   );
 
   // Render Page onto Canvas (with optional Auto-Crop White Margins)
@@ -758,7 +830,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     }
   }, [currentPage, totalPages, goToPage]);
 
-  // Highlighter pointer handlers on overlay canvas
+  // Highlighter, Pen & Eraser pointer handlers on overlay canvas
   const getNormalizedPoint = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     return {
@@ -767,38 +839,73 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     };
   };
 
+  const eraseStrokeAtPoint = (pt: { x: number; y: number }) => {
+    if (!onUpdatePageHighlights || currentPageStrokes.length === 0) return;
+    const threshold = 0.026;
+    const remaining = currentPageStrokes.filter(stroke => {
+      return !stroke.points.some(sp => Math.hypot(sp.x - pt.x, sp.y - pt.y) <= threshold);
+    });
+    if (remaining.length !== currentPageStrokes.length) {
+      onUpdatePageHighlights(currentPage, remaining);
+    }
+  };
+
   const handleOverlayPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isHighlightMode) return;
+    if (!isDrawingMode) return;
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
     const pt = getNormalizedPoint(e);
+    if (isEraserMode) {
+      isErasingRef.current = true;
+      eraseStrokeAtPoint(pt);
+      return;
+    }
     activeStrokeRef.current = [pt];
+    if (isPenMode) {
+      drawHighlightOverlay(activeStrokeRef.current);
+    }
   };
 
   const handleOverlayPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isHighlightMode || !activeStrokeRef.current) return;
+    if (!isDrawingMode) return;
     e.stopPropagation();
     const pt = getNormalizedPoint(e);
+    if (isEraserMode) {
+      if (isErasingRef.current) {
+        eraseStrokeAtPoint(pt);
+      }
+      return;
+    }
+    if (!activeStrokeRef.current) return;
     activeStrokeRef.current.push(pt);
     drawHighlightOverlay(activeStrokeRef.current);
   };
 
   const handleOverlayPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isHighlightMode || !activeStrokeRef.current) return;
+    if (!isDrawingMode) return;
     e.stopPropagation();
+    if (isEraserMode) {
+      isErasingRef.current = false;
+      return;
+    }
+    if (!activeStrokeRef.current) return;
     const pts = activeStrokeRef.current;
     activeStrokeRef.current = null;
-    if (pts.length > 1 && onUpdatePageHighlights) {
-      const updated = [...currentPageStrokes, { color: highlightColor, points: pts }];
+    const minPoints = isPenMode ? 1 : 2;
+    if (pts.length >= minPoints && onUpdatePageHighlights) {
+      const newStroke: PageHighlightStroke = isPenMode
+        ? { color: penColor, points: pts, tool: 'pen', size: penSize }
+        : { color: highlightColor, points: pts, tool: 'highlight' };
+      const updated = [...currentPageStrokes, newStroke];
       onUpdatePageHighlights(currentPage, updated);
     } else {
       drawHighlightOverlay(null);
     }
   };
 
-  // Tap Left / Right side of book or Swipe to turn pages (when not in Highlighter mode)
+  // Tap Left / Right side of book or Swipe to turn pages (when not in Highlighter or Pen mode)
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (isHighlightMode) return;
+    if (isDrawingMode) return;
     pointerStartRef.current = {
       x: e.clientX,
       y: e.clientY,
@@ -807,7 +914,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (isHighlightMode) return;
+    if (isDrawingMode) return;
     const start = pointerStartRef.current;
     pointerStartRef.current = null;
     if (!start || !containerRef.current) return;
@@ -1953,34 +2060,36 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             </button>
           )}
 
-          {/* Open Table of Contents / Chapters Drawer (enabled only if the book has a Chapters / Table of Contents section) */}
+          {/* Interactive Chapters Button (User chooses when AI analyzes the book for a Chapters / Table of Contents list) */}
           <button
             type="button"
-            disabled={pdfChapters.length === 0}
             onClick={() => {
-              if (pdfChapters.length === 0) return;
               setIsChaptersDrawerOpen(v => !v);
               setIsBookmarksDrawerOpen(false);
               setIsSearchOpen(false);
               setIsDictionaryOpen(false);
             }}
             className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
-              pdfChapters.length === 0
-                ? 'bg-white/5 text-white/35 cursor-not-allowed opacity-50'
-                : isChaptersDrawerOpen
+              isChaptersDrawerOpen
                 ? 'bg-[#1DB954] text-black'
+                : pdfChapters.length > 0
+                ? 'bg-[#1DB954]/20 text-[#1DB954] border border-[#1DB954]/40 hover:bg-[#1DB954]/30'
                 : 'bg-white/10 hover:bg-white/20 text-white'
             }`}
             title={
               pdfChapters.length > 0
                 ? `Open Chapters (${pdfChapters.length} chapters detected)`
-                : isAiRecognizingChapters
-                ? 'Checking opening pages for a Table of Contents...'
-                : 'No Table of Contents / Chapters section found in this book'
+                : 'Open Chapters & choose to analyze book for a Table of Contents list with AI'
             }
           >
-            <ListTree className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Chapters</span>
+            {isAiRecognizingChapters ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-[#1DB954]" />
+            ) : (
+              <ListTree className="w-3.5 h-3.5" />
+            )}
+            <span className="hidden sm:inline">
+              {pdfChapters.length > 0 ? `Chapters (${pdfChapters.length})` : 'Chapters'}
+            </span>
           </button>
 
           {/* Open Bookmarks & Notes Drawer */}
@@ -1996,7 +2105,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                 ? 'bg-white text-black'
                 : 'bg-white/10 hover:bg-white/20 text-white'
             }`}
-            title="View all pinned pages & highlights"
+            title="View all pinned pages, pen writings & highlights"
           >
             <span>Pins ({bookmarks.length + highlightedPageNumbers.length})</span>
           </button>
@@ -2004,16 +2113,37 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           {/* Apple Pencil / Finger Highlighter Toggle */}
           <button
             type="button"
-            onClick={() => setIsHighlightMode(v => !v)}
+            onClick={() => {
+              setIsEraserMode(false);
+              setActiveDrawingTool(prev => (prev === 'highlight' ? null : 'highlight'));
+            }}
             className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
               isHighlightMode
                 ? 'bg-yellow-400 text-black'
                 : 'bg-white/10 hover:bg-white/20 text-white'
             }`}
-            title="Draw or highlight directly on the page"
+            title="Highlight text on the page"
           >
             <Highlighter className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">Highlight</span>
+          </button>
+
+          {/* Write on Book with Pen Toggle (Right next to Highlight) */}
+          <button
+            type="button"
+            onClick={() => {
+              setIsEraserMode(false);
+              setActiveDrawingTool(prev => (prev === 'pen' ? null : 'pen'));
+            }}
+            className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
+              isPenMode
+                ? 'bg-sky-400 text-black'
+                : 'bg-white/10 hover:bg-white/20 text-white'
+            }`}
+            title="Write notes, underlines, or annotations directly on the book page with a Pen"
+          >
+            <PenTool className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Pen</span>
           </button>
 
           {/* Search Inside PDF Toggle */}
@@ -2110,30 +2240,102 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         </div>
       </div>
 
-      {/* Secondary Highlighter Palette Strip (when Highlighter is active) */}
-      {isHighlightMode && (
-        <div className="px-4 py-1.5 bg-black/75 border-b border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] font-semibold text-yellow-300">
-              Highlighter Active (draw with finger or Apple Pencil):
-            </span>
-            <div className="flex items-center gap-1.5">
-              {HIGHLIGHT_COLORS.map(c => (
-                <button
-                  key={c.hex}
-                  type="button"
-                  onClick={() => setHighlightColor(c.hex)}
-                  className={`w-5 h-5 rounded-full border transition-transform ${
-                    highlightColor === c.hex ? 'scale-125 ring-2 ring-white' : 'border-white/30'
-                  }`}
-                  style={{ backgroundColor: c.hex }}
-                  title={c.name}
-                />
-              ))}
+      {/* Secondary Highlighter OR Pen Writing Palette Strip */}
+      {isDrawingMode && (
+        <div className="px-4 py-1.5 bg-black/80 border-b border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
+          {isPenMode ? (
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-[11px] font-semibold text-sky-300 flex items-center gap-1">
+                <PenTool className="w-3.5 h-3.5" />
+                <span>Pen Ink (write on page):</span>
+              </span>
+
+              {/* Pen Ink Colors */}
+              <div className="flex items-center gap-1.5">
+                {PEN_COLORS.map(c => (
+                  <button
+                    key={c.hex}
+                    type="button"
+                    onClick={() => {
+                      setIsEraserMode(false);
+                      setPenColor(c.hex);
+                    }}
+                    className={`w-5 h-5 rounded-full border transition-transform ${
+                      !isEraserMode && penColor === c.hex
+                        ? 'scale-125 ring-2 ring-sky-400 border-white'
+                        : 'border-white/40'
+                    }`}
+                    style={{ backgroundColor: c.hex }}
+                    title={c.name}
+                  />
+                ))}
+              </div>
+
+              {/* Pen Nib Thickness Presets */}
+              <div className="flex items-center gap-1 bg-white/10 p-0.5 rounded-lg">
+                {PEN_SIZES.map(sz => (
+                  <button
+                    key={sz.label}
+                    type="button"
+                    onClick={() => {
+                      setIsEraserMode(false);
+                      setPenSize(sz.value);
+                    }}
+                    className={`px-2 py-0.5 rounded-md text-[10px] font-semibold transition-colors ${
+                      !isEraserMode && penSize === sz.value
+                        ? 'bg-sky-400 text-black'
+                        : 'text-white/80 hover:text-white'
+                    }`}
+                  >
+                    {sz.label}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-semibold text-yellow-300 flex items-center gap-1">
+                <Highlighter className="w-3.5 h-3.5" />
+                <span>Highlighter Active:</span>
+              </span>
+              <div className="flex items-center gap-1.5">
+                {HIGHLIGHT_COLORS.map(c => (
+                  <button
+                    key={c.hex}
+                    type="button"
+                    onClick={() => {
+                      setIsEraserMode(false);
+                      setHighlightColor(c.hex);
+                    }}
+                    className={`w-5 h-5 rounded-full border transition-transform ${
+                      !isEraserMode && highlightColor === c.hex
+                        ? 'scale-125 ring-2 ring-white'
+                        : 'border-white/30'
+                    }`}
+                    style={{ backgroundColor: c.hex }}
+                    title={c.name}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="flex items-center gap-2">
+            {/* Stroke Eraser Toggle */}
+            <button
+              type="button"
+              onClick={() => setIsEraserMode(v => !v)}
+              className={`px-2.5 py-1 rounded text-[11px] font-semibold flex items-center gap-1 transition-colors ${
+                isEraserMode
+                  ? 'bg-amber-400 text-black'
+                  : 'bg-white/10 hover:bg-white/20 text-white'
+              }`}
+              title="Tap or drag over any pen writing or highlight stroke to erase it"
+            >
+              <Eraser className="w-3 h-3" />
+              <span>{isEraserMode ? 'Eraser On' : 'Eraser'}</span>
+            </button>
+
             {currentPageStrokes.length > 0 && onUpdatePageHighlights && (
               <>
                 <button
@@ -2158,10 +2360,13 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             )}
             <button
               type="button"
-              onClick={() => setIsHighlightMode(false)}
+              onClick={() => {
+                setIsEraserMode(false);
+                setActiveDrawingTool(null);
+              }}
               className="px-2.5 py-1 rounded bg-white text-black font-semibold text-[11px]"
             >
-              Done Drawing
+              {isPenMode ? 'Done Writing' : 'Done Highlighting'}
             </button>
           </div>
         </div>
@@ -2564,9 +2769,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         </div>
       )}
 
-      {/* Floating Table of Contents / Chapters & Sections Drawer */}
-      {isChaptersDrawerOpen && pdfChapters.length > 0 && (
-        <div className="w-full sm:w-88 sm:left-4 sm:top-12 sm:absolute z-30 bg-[#181818] text-white border border-[#333333] sm:rounded-xl shadow-2xl p-3.5 space-y-3 max-h-[75vh] overflow-y-auto">
+      {/* Interactive Table of Contents / Chapters Drawer (User chooses whether AI should analyze the book for a chapters list) */}
+      {isChaptersDrawerOpen && (
+        <div className="w-full sm:w-92 sm:left-4 sm:top-12 sm:absolute z-30 bg-[#181818] text-white border border-[#333333] sm:rounded-xl shadow-2xl p-3.5 space-y-3 max-h-[78vh] overflow-y-auto">
           <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
             <div>
               <h4 className="text-xs font-bold flex items-center gap-1.5">
@@ -2574,47 +2779,69 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                 <span>
                   {hasEmbeddedOutline
                     ? 'Table of Contents & Chapters'
-                    : 'Book Chapters & Page Ranges'}
+                    : 'Book Chapters & Topic List'}
                 </span>
               </h4>
               <p className="text-[10px] text-[#B3B3B3] mt-0.5">
                 {isAiRecognizingChapters
-                  ? 'Reading opening Table of Contents...'
-                  : `${pdfChapters.length} chapters detected`}
+                  ? 'AI is scanning pages for a chapter list...'
+                  : pdfChapters.length > 0
+                  ? `${pdfChapters.length} chapters detected`
+                  : 'Choose below if this book has a Table of Contents list'}
               </p>
             </div>
             <div className="flex items-center gap-1">
-              {pdfDoc && (
-                <button
-                  type="button"
-                  disabled={isAiRecognizingChapters}
-                  onClick={() => {
-                    setIsAiRecognizingChapters(true);
-                    try {
-                      localStorage.removeItem(`folio_book_chapters_v4_${docCacheKey}`);
-                    } catch {
-                      // ignore
-                    }
-                    recognizeAndCacheBookChapters(
-                      docCacheKey,
-                      bookTitle || 'Book',
-                      totalPages,
-                      pdfDoc,
-                      currentPage
-                    )
-                      .then(aiCh => {
-                        if (aiCh.length > 0) {
-                          setPdfChapters(aiCh);
-                          setHasEmbeddedOutline(true);
-                        }
-                      })
-                      .finally(() => setIsAiRecognizingChapters(false));
-                  }}
-                  className="p-1 rounded hover:bg-white/10 text-[#B3B3B3] hover:text-white disabled:opacity-40"
-                  title="Re-scan opening Table of Contents"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isAiRecognizingChapters ? 'animate-spin text-[#1DB954]' : ''}`} />
-                </button>
+              {pdfDoc && pdfChapters.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    disabled={isAiRecognizingChapters}
+                    onClick={() => {
+                      setIsAiRecognizingChapters(true);
+                      clearCachedBookChapters(docCacheKey);
+                      recognizeAndCacheBookChapters(
+                        docCacheKey,
+                        bookTitle || 'Book',
+                        totalPages,
+                        pdfDoc,
+                        currentPage,
+                        { forceRefresh: true }
+                      )
+                        .then(aiCh => {
+                          setHasCheckedChaptersOnce(true);
+                          if (aiCh.length > 0) {
+                            setPdfChapters(aiCh);
+                            setHasEmbeddedOutline(true);
+                          } else {
+                            setPdfChapters([]);
+                            setHasEmbeddedOutline(false);
+                          }
+                        })
+                        .finally(() => setIsAiRecognizingChapters(false));
+                    }}
+                    className="p-1 rounded hover:bg-white/10 text-[#B3B3B3] hover:text-white disabled:opacity-40"
+                    title="Re-analyze book for Chapters list with AI"
+                  >
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 ${
+                        isAiRecognizingChapters ? 'animate-spin text-[#1DB954]' : ''
+                      }`}
+                    />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      clearCachedBookChapters(docCacheKey);
+                      setPdfChapters([]);
+                      setHasEmbeddedOutline(false);
+                      setHasCheckedChaptersOnce(false);
+                    }}
+                    className="p-1 rounded hover:bg-rose-500/20 text-rose-400"
+                    title="Clear detected chapter list"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </>
               )}
               <button
                 type="button"
@@ -2627,14 +2854,96 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             </div>
           </div>
 
-          <div className="space-y-1">
-            {isAiRecognizingChapters && (
-              <div className="px-3 py-2 rounded-lg bg-[#242424] border border-amber-400/30 flex items-center gap-2 text-[11px] text-amber-300 mb-2">
-                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-                <span>Reading the opening Table of Contents pages...</span>
+          {isAiRecognizingChapters ? (
+            <div className="p-4 rounded-xl bg-[#242424] border border-[#1DB954]/30 flex flex-col items-center text-center gap-2.5">
+              <Loader2 className="w-6 h-6 animate-spin text-[#1DB954]" />
+              <div className="space-y-1">
+                <p className="text-xs font-bold text-white">
+                  AI is reading the book&apos;s Table of Contents...
+                </p>
+                <p className="text-[11px] text-[#B3B3B3] leading-relaxed">
+                  Extracting chapter titles and matching their starting &amp; ending page numbers.
+                </p>
               </div>
-            )}
+            </div>
+          ) : pdfChapters.length === 0 ? (
+            <div className="p-3.5 rounded-xl bg-[#242424] border border-white/10 space-y-3">
+              <div className="space-y-1">
+                <h5 className="text-xs font-bold text-white flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Analyze Book for Chapters List?</span>
+                </h5>
+                <p className="text-[11px] text-[#B3B3B3] leading-relaxed">
+                  {hasCheckedChaptersOnce
+                    ? 'No Table of Contents list was found on those pages. If this book has a chapters list (فهرست مطالب) on a specific page, turn to that page and click "Scan Current Page as List" below:'
+                    : 'If this book has a Table of Contents / Chapters section (فهرست مطالب), let AI analyze the book to extract all chapters and their page ranges:'}
+                </p>
+              </div>
 
+              <div className="space-y-2">
+                {pdfDoc && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsAiRecognizingChapters(true);
+                        recognizeAndCacheBookChapters(
+                          docCacheKey,
+                          bookTitle || 'Book',
+                          totalPages,
+                          pdfDoc,
+                          currentPage,
+                          { forceRefresh: true }
+                        )
+                          .then(aiCh => {
+                            setHasCheckedChaptersOnce(true);
+                            if (aiCh.length > 0) {
+                              setPdfChapters(aiCh);
+                              setHasEmbeddedOutline(true);
+                            }
+                          })
+                          .finally(() => setIsAiRecognizingChapters(false));
+                      }}
+                      className="w-full py-2 px-3 rounded-lg bg-[#1DB954] hover:bg-[#1ed760] text-black font-bold text-xs flex items-center justify-center gap-1.5 transition-colors shadow-sm"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Analyze Book for Chapters (AI)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsAiRecognizingChapters(true);
+                        recognizeAndCacheBookChapters(
+                          docCacheKey,
+                          bookTitle || 'Book',
+                          totalPages,
+                          pdfDoc,
+                          currentPage,
+                          { forceRefresh: true, scanSpecificPageOnly: currentPage }
+                        )
+                          .then(aiCh => {
+                            setHasCheckedChaptersOnce(true);
+                            if (aiCh.length > 0) {
+                              setPdfChapters(aiCh);
+                              setHasEmbeddedOutline(true);
+                            }
+                          })
+                          .finally(() => setIsAiRecognizingChapters(false));
+                      }}
+                      className="w-full py-2 px-3 rounded-lg bg-white/10 hover:bg-white/15 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors border border-white/10"
+                    >
+                      <ListTree className="w-3.5 h-3.5 text-amber-300" />
+                      <span>
+                        Scan Current Page (p. {formatBookPageNumber(currentPage)}) as List
+                      </span>
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-1">
               {pdfChapters.map((ch, idx) => {
                 const rawStart = ch.startPage || ch.page || 1;
                 const nextChRawStart =
@@ -2696,7 +3005,38 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                   </button>
                 );
               })}
-          </div>
+
+              {pdfDoc && (
+                <div className="pt-2 mt-2 border-t border-white/10 flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAiRecognizingChapters(true);
+                      recognizeAndCacheBookChapters(
+                        docCacheKey,
+                        bookTitle || 'Book',
+                        totalPages,
+                        pdfDoc,
+                        currentPage,
+                        { forceRefresh: true, scanSpecificPageOnly: currentPage }
+                      )
+                        .then(aiCh => {
+                          if (aiCh.length > 0) {
+                            setPdfChapters(aiCh);
+                            setHasEmbeddedOutline(true);
+                          }
+                        })
+                        .finally(() => setIsAiRecognizingChapters(false));
+                    }}
+                    className="w-full py-1.5 px-2.5 rounded-lg bg-white/10 hover:bg-white/15 text-[11px] font-medium text-white/85 flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                    <Sparkles className="w-3 h-3 text-amber-300" />
+                    <span>Scan Current Page (p. {formatBookPageNumber(currentPage)}) as List</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -2756,7 +3096,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           <div className="space-y-1.5">
             {bookmarks.length === 0 && highlightedPageNumbers.length === 0 ? (
               <p className="text-[11px] text-[#B3B3B3] text-center py-3">
-                No pinned or highlighted pages yet. Tap &ldquo;Pin Page&rdquo; or &ldquo;Highlight&rdquo; while reading.
+                No pinned or annotated pages yet. Tap &ldquo;Pin Page&rdquo;, &ldquo;Highlight&rdquo;, or &ldquo;Pen&rdquo; while reading.
               </p>
             ) : (
               <>
@@ -2793,7 +3133,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                 {highlightedPageNumbers.length > 0 && (
                   <div className="pt-2 border-t border-white/10">
                     <p className="text-[10px] uppercase tracking-wider text-[#B3B3B3] mb-1.5">
-                      Highlighted Pages
+                      Highlighted &amp; Pen-Annotated Pages
                     </p>
                     <div className="flex flex-wrap gap-1.5">
                       {highlightedPageNumbers.map(pageNum => (
@@ -2825,7 +3165,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         onPointerDown={handlePointerDown}
         onPointerUp={handlePointerUp}
         className={`flex-1 overflow-auto p-3 sm:p-6 flex items-start justify-center relative ${
-          isHighlightMode ? 'cursor-crosshair touch-none' : 'cursor-pointer'
+          isDrawingMode ? 'cursor-crosshair touch-none' : 'cursor-pointer'
         }`}
       >
         {/* Subtle Visual Left/Right Page Turn Feedback Pill */}
@@ -2859,7 +3199,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           <div
             data-pdf-page-surface="true"
             className={`relative shadow-2xl rounded-xs transition-all duration-200 ${
-              isHighlightMode ? 'cursor-crosshair' : 'cursor-default'
+              isDrawingMode ? 'cursor-crosshair' : 'cursor-default'
             }`}
             style={{ filter: getThemeFilter() }}
           >
@@ -2890,14 +3230,14 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               className="block bg-white shadow-2xl transition-transform origin-top"
             />
 
-            {/* Transparent Highlighter Overlay Canvas */}
+            {/* Transparent Highlighter & Pen Writing Overlay Canvas */}
             <canvas
               ref={overlayCanvasRef}
               onPointerDown={handleOverlayPointerDown}
               onPointerMove={handleOverlayPointerMove}
               onPointerUp={handleOverlayPointerUp}
               className={`absolute inset-0 ${
-                isHighlightMode ? 'pointer-events-auto touch-none' : 'pointer-events-none'
+                isDrawingMode ? 'pointer-events-auto touch-none' : 'pointer-events-none'
               }`}
             />
           </div>
