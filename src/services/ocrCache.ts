@@ -13,8 +13,8 @@ const STORE_NAME = 'book_ocr_pages';
 const OCR_UPDATED_EVENT = 'folio-ocr-updated';
 const CHAPTERS_UPDATED_EVENT = 'folio-chapters-updated';
 const PAGE_OFFSET_UPDATED_EVENT = 'folio-page-offset-updated';
-const CHAPTERS_STORAGE_PREFIX = 'folio_book_chapters_v2_';
-const PAGE_OFFSET_STORAGE_PREFIX = 'folio_page_offset_v1_';
+const CHAPTERS_STORAGE_PREFIX = 'folio_book_chapters_v3_';
+const PAGE_OFFSET_STORAGE_PREFIX = 'folio_page_offset_v2_';
 
 export interface StoredBookOcr {
   docKey: string;
@@ -51,7 +51,7 @@ export interface PageOffsetUpdateEventDetail {
 
 export function normalizeDigitsToAsciiClient(str: string): string {
   return str
-    .replace(/([۱-۹١-٩])[.٫•·](?=\s|$)/g, '$1۰')
+    .replace(/([۱-۹١-٩0-9])[.٫•·∙⋅](?=\s|$)/g, '$10')
     .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06f0))
     .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660));
 }
@@ -381,7 +381,7 @@ export function subscribeToOcrUpdates(
 }
 
 // ============================================================================
-// Background Book Word & Page Indexer + Printed Book Page Number Calibrator
+// Background Book Word & Page Indexer + 4-Corner Page Number Analyzer
 // ============================================================================
 
 const backgroundQueue: Book[] = [];
@@ -422,19 +422,25 @@ async function renderPdfPageToJpegDataUrl(
   }
 }
 
+export interface CornerCropCandidate {
+  corner: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'top-center' | 'bottom-center';
+  dataUrl: string;
+  hasTrailingZeroDot: boolean;
+}
+
 /**
- * Renders a high-clarity composite image of the page's Top Header Line and Bottom Footer Line,
- * plus 2.8x magnified corner/center page-number clusters (so both Gemini Vision and Tesseract
- * can read small printed page numbers like "۱۰" at the top-right corner with ~100% accuracy).
+ * Analyzes the 4 corners (Top-Right, Top-Left, Bottom-Right, Bottom-Left) of a PDF page
+ * and crops any compact corner page-number cluster at 3.5x magnification on a clean white canvas.
+ * Filters out wide book-title running headers (like "شهد شورستان") and full body paragraph lines.
  */
-export async function renderPageHeaderFooterStripToJpeg(
+export async function extractCornerNumberCropsFromPage(
   pdfDoc: pdfjsLib.PDFDocumentProxy,
   pageNum: number
-): Promise<string | null> {
-  if (typeof document === 'undefined') return null;
+): Promise<CornerCropCandidate[]> {
+  if (typeof document === 'undefined') return [];
   try {
     const page = await pdfDoc.getPage(pageNum);
-    const vp = page.getViewport({ scale: 1.6 });
+    const vp = page.getViewport({ scale: 1.8 });
     const w = Math.max(1, Math.floor(vp.width));
     const h = Math.max(1, Math.floor(vp.height));
 
@@ -442,7 +448,7 @@ export async function renderPageHeaderFooterStripToJpeg(
     srcCanvas.width = w;
     srcCanvas.height = h;
     const srcCtx = srcCanvas.getContext('2d');
-    if (!srcCtx) return null;
+    if (!srcCtx) return [];
     srcCtx.fillStyle = '#FFFFFF';
     srcCtx.fillRect(0, 0, w, h);
     await page.render({ canvasContext: srcCtx, viewport: vp, canvas: srcCanvas }).promise;
@@ -450,7 +456,6 @@ export async function renderPageHeaderFooterStripToJpeg(
     const imgData = srcCtx.getImageData(0, 0, w, h);
     const data = imgData.data;
 
-    // Count dark ink pixels per row (ignoring outer 3% border noise)
     const xMargin = Math.floor(w * 0.03);
     const rowInkCounts = new Int32Array(h);
     for (let y = 0; y < h; y++) {
@@ -464,73 +469,85 @@ export async function renderPageHeaderFooterStripToJpeg(
       rowInkCounts[y] = count;
     }
 
-    const minRowInk = Math.max(3, Math.floor(w * 0.003));
-    let firstInkY = Math.floor(h * 0.04);
-    for (let y = Math.floor(h * 0.02); y < Math.floor(h * 0.45); y++) {
+    const minRowInk = Math.max(2, Math.floor(w * 0.0025));
+
+    // Find top header ink band in top 32% of page
+    let firstInkY = -1;
+    for (let y = Math.floor(h * 0.02); y < Math.floor(h * 0.32); y++) {
       if (rowInkCounts[y] >= minRowInk) {
         firstInkY = y;
         break;
       }
     }
 
-    // Isolate the single top header line by finding the white gap after firstInkY
-    let headerLineEndY = Math.min(h - 1, firstInkY + Math.floor(h * 0.055));
-    let blankRun = 0;
-    for (let y = firstInkY + 8; y < Math.min(h - 1, firstInkY + Math.floor(h * 0.12)); y++) {
-      if (rowInkCounts[y] < minRowInk) {
-        blankRun++;
-        if (blankRun >= 6) {
-          headerLineEndY = y;
-          break;
+    let headerLineEndY = firstInkY !== -1 ? Math.min(h - 1, firstInkY + Math.floor(h * 0.05)) : -1;
+    if (firstInkY !== -1) {
+      let blankRun = 0;
+      for (let y = firstInkY + 6; y < Math.min(h - 1, firstInkY + Math.floor(h * 0.1)); y++) {
+        if (rowInkCounts[y] < minRowInk) {
+          blankRun++;
+          if (blankRun >= 6) {
+            headerLineEndY = y - blankRun + 1;
+            break;
+          }
+        } else {
+          blankRun = 0;
         }
-      } else {
-        blankRun = 0;
       }
     }
 
-    let lastInkY = Math.floor(h * 0.96);
-    for (let y = Math.floor(h * 0.98); y > Math.floor(h * 0.55); y--) {
+    // Find bottom footer ink band in bottom 32% of page
+    let lastInkY = -1;
+    for (let y = Math.floor(h * 0.98); y > Math.floor(h * 0.68); y--) {
       if (rowInkCounts[y] >= minRowInk) {
         lastInkY = y;
         break;
       }
     }
 
-    // Isolate the single bottom footer line by finding the white gap above lastInkY
-    let footerLineStartY = Math.max(0, lastInkY - Math.floor(h * 0.055));
-    blankRun = 0;
-    for (let y = lastInkY - 8; y > Math.max(0, lastInkY - Math.floor(h * 0.12)); y--) {
-      if (rowInkCounts[y] < minRowInk) {
-        blankRun++;
-        if (blankRun >= 6) {
-          footerLineStartY = y;
-          break;
+    let footerLineStartY = lastInkY !== -1 ? Math.max(0, lastInkY - Math.floor(h * 0.05)) : -1;
+    if (lastInkY !== -1) {
+      let blankRun = 0;
+      for (let y = lastInkY - 6; y > Math.max(0, lastInkY - Math.floor(h * 0.1)); y--) {
+        if (rowInkCounts[y] < minRowInk) {
+          blankRun++;
+          if (blankRun >= 6) {
+            footerLineStartY = y + blankRun - 1;
+            break;
+          }
+        } else {
+          blankRun = 0;
         }
-      } else {
-        blankRun = 0;
       }
     }
 
-    const headerY0 = Math.max(0, firstInkY - 10);
-    const headerY1 = Math.min(h, headerLineEndY + 10);
-    const headerH = Math.max(24, headerY1 - headerY0);
+    const candidates: CornerCropCandidate[] = [];
 
-    const footerY0 = Math.max(0, footerLineStartY - 10);
-    const footerY1 = Math.min(h, lastInkY + 10);
-    const footerH = Math.max(24, footerY1 - footerY0);
+    const extractCornersFromBand = (y0Raw: number, y1Raw: number, isTop: boolean) => {
+      if (y0Raw < 0 || y1Raw <= y0Raw) return;
+      const y0 = Math.max(0, y0Raw - 6);
+      const y1 = Math.min(h, y1Raw + 6);
+      const bandH = y1 - y0;
+      if (bandH < 8) return;
 
-    // Find horizontal ink clusters in a band so isolated corner numbers (like "۱۰" at top-right) can be magnified 2.8x
-    const findCompactSegments = (y0: number, y1: number) => {
       const colHasInk = new Uint8Array(w);
+      let activeCols = 0;
       for (let x = xMargin; x < w - xMargin; x++) {
         let darkPixels = 0;
         for (let y = y0; y < y1; y++) {
           const idx = (y * w + x) * 4;
           const lum = (data[idx] * 299 + data[idx + 1] * 587 + data[idx + 2] * 114) / 1000;
-          if (lum < 205) darkPixels++;
+          if (lum < 208) darkPixels++;
         }
-        if (darkPixels >= 2) colHasInk[x] = 1;
+        if (darkPixels >= 2) {
+          colHasInk[x] = 1;
+          activeCols++;
+        }
       }
+
+      // Skip full-width body text lines (a paragraph line covers > 40% of the page width)
+      const inkCoverage = activeCols / Math.max(1, w - 2 * xMargin);
+      if (inkCoverage > 0.4) return;
 
       const segments: Array<{ x0: number; x1: number }> = [];
       let inSeg = false;
@@ -545,90 +562,250 @@ export async function renderPageHeaderFooterStripToJpeg(
           gap = 0;
         } else if (inSeg) {
           gap++;
-          if (gap >= 18) {
-            segments.push({ x0: Math.max(0, segStart - 8), x1: Math.min(w, x - gap + 8) });
+          if (gap >= 16) {
+            segments.push({ x0: segStart, x1: x - gap });
             inSeg = false;
           }
         }
       }
       if (inSeg) {
-        segments.push({ x0: Math.max(0, segStart - 8), x1: Math.min(w, w - xMargin) });
+        segments.push({ x0: segStart, x1: w - xMargin });
       }
-      // Return compact segments likely to be page numbers (width <= 18% of page width)
-      return segments.filter(s => s.x1 - s.x0 >= 6 && s.x1 - s.x0 <= w * 0.18);
+
+      for (const seg of segments) {
+        const segW = seg.x1 - seg.x0;
+        // Printed corner page numbers (1 to 4 digits) are compact: between 0.4% and 11% of page width.
+        // Wide segments like book titles ("شهد شورستان" = ~17% of page width) are automatically excluded!
+        if (segW < Math.max(4, w * 0.004) || segW > w * 0.115) continue;
+
+        const cx = (seg.x0 + seg.x1) / (2 * w);
+        let corner: CornerCropCandidate['corner'] | null = null;
+        if (cx >= 0.6) {
+          corner = isTop ? 'top-right' : 'bottom-right';
+        } else if (cx <= 0.4) {
+          corner = isTop ? 'top-left' : 'bottom-left';
+        } else if (segments.length === 1 && segW <= w * 0.09) {
+          corner = isTop ? 'top-center' : 'bottom-center';
+        }
+        if (!corner) continue;
+
+        // Inspect horizontal sub-blobs inside this corner segment to detect Persian zero dot '۰' (e.g. "۱۰", "۲۰", "۳۰")
+        const subBlobs: Array<{ bx0: number; bx1: number; by0: number; by1: number }> = [];
+        let inSub = false;
+        let sbStart = seg.x0;
+        for (let x = seg.x0; x <= seg.x1; x++) {
+          let hasDark = false;
+          for (let y = y0; y < y1; y++) {
+            const idx = (y * w + x) * 4;
+            const lum = (data[idx] * 299 + data[idx + 1] * 587 + data[idx + 2] * 114) / 1000;
+            if (lum < 205) {
+              hasDark = true;
+              break;
+            }
+          }
+          if (hasDark && !inSub) {
+            inSub = true;
+            sbStart = x;
+          } else if (!hasDark && inSub) {
+            subBlobs.push({ bx0: sbStart, bx1: x - 1, by0: y1, by1: y0 });
+            inSub = false;
+          }
+        }
+        if (inSub) {
+          subBlobs.push({ bx0: sbStart, bx1: seg.x1, by0: y1, by1: y0 });
+        }
+
+        for (const sb of subBlobs) {
+          for (let y = y0; y < y1; y++) {
+            for (let x = sb.bx0; x <= sb.bx1; x++) {
+              const idx = (y * w + x) * 4;
+              const lum = (data[idx] * 299 + data[idx + 1] * 587 + data[idx + 2] * 114) / 1000;
+              if (lum < 205) {
+                if (y < sb.by0) sb.by0 = y;
+                if (y > sb.by1) sb.by1 = y;
+              }
+            }
+          }
+        }
+
+        let hasTrailingZeroDot = false;
+        if (subBlobs.length === 2) {
+          const leftBlob = subBlobs[0];
+          const rightBlob = subBlobs[1];
+          const leftH = Math.max(1, leftBlob.by1 - leftBlob.by0 + 1);
+          const rightH = Math.max(1, rightBlob.by1 - rightBlob.by0 + 1);
+          const rightW = Math.max(1, rightBlob.bx1 - rightBlob.bx0 + 1);
+          // In Persian/Arabic fonts, '۰' (0) is a small diamond dot ~25%..58% the height of the left digit
+          if (
+            leftH >= 12 &&
+            rightH >= 3 &&
+            rightH <= leftH * 0.62 &&
+            rightW >= 3 &&
+            rightW <= rightH * 1.85
+          ) {
+            hasTrailingZeroDot = true;
+          }
+        }
+
+        // Render 3.5x magnified corner number on a clean white canvas with generous padding
+        const cropX0 = Math.max(0, seg.x0 - 12);
+        const cropX1 = Math.min(w, seg.x1 + 12);
+        const cropW = Math.max(16, cropX1 - cropX0);
+        const scaleUp = 3.5;
+        const pad = 36;
+        const outW = Math.round(cropW * scaleUp) + pad * 2;
+        const outH = Math.round(bandH * scaleUp) + pad * 2;
+
+        const cornerCanvas = document.createElement('canvas');
+        cornerCanvas.width = outW;
+        cornerCanvas.height = outH;
+        const cCtx = cornerCanvas.getContext('2d');
+        if (!cCtx) continue;
+
+        cCtx.fillStyle = '#FFFFFF';
+        cCtx.fillRect(0, 0, outW, outH);
+        cCtx.imageSmoothingEnabled = true;
+        cCtx.imageSmoothingQuality = 'high';
+        cCtx.drawImage(
+          srcCanvas,
+          cropX0,
+          y0,
+          cropW,
+          bandH,
+          pad,
+          pad,
+          Math.round(cropW * scaleUp),
+          Math.round(bandH * scaleUp)
+        );
+
+        // Gentle contrast stretch that preserves thin Persian strokes and zero dots
+        const cImg = cCtx.getImageData(0, 0, outW, outH);
+        const cd = cImg.data;
+        for (let i = 0; i < cd.length; i += 4) {
+          const lum = (cd[i] * 299 + cd[i + 1] * 587 + cd[i + 2] * 114) / 1000;
+          const v = lum > 228 ? 255 : Math.max(0, Math.min(255, Math.round((lum - 110) * 1.45)));
+          cd[i] = v;
+          cd[i + 1] = v;
+          cd[i + 2] = v;
+        }
+        cCtx.putImageData(cImg, 0, 0);
+
+        candidates.push({
+          corner,
+          dataUrl: cornerCanvas.toDataURL('image/png'),
+          hasTrailingZeroDot,
+        });
+        cornerCanvas.width = 0;
+        cornerCanvas.height = 0;
+      }
     };
 
-    const headerNumSegs = findCompactSegments(headerY0, headerY1);
-    const footerNumSegs = findCompactSegments(footerY0, footerY1);
+    extractCornersFromBand(firstInkY, headerLineEndY, true);
+    extractCornersFromBand(footerLineStartY, lastInkY, false);
 
-    const outW = w;
-    const zoomSegH = 84;
-    const outH = zoomSegH + headerH + 20 + zoomSegH + footerH + 32;
-    const outCanvas = document.createElement('canvas');
-    outCanvas.width = outW;
-    outCanvas.height = outH;
-    const outCtx = outCanvas.getContext('2d');
-    if (!outCtx) return null;
-
-    outCtx.fillStyle = '#FFFFFF';
-    outCtx.fillRect(0, 0, outW, outH);
-
-    let cursorY = 10;
-
-    // 1. Draw magnified compact header segments (e.g. top-right "۱۰" or top-left number)
-    let cursorX = 24;
-    for (const seg of headerNumSegs) {
-      const sw = seg.x1 - seg.x0;
-      const dw = Math.round(sw * 2.6);
-      const dh = Math.min(zoomSegH - 12, Math.round(headerH * 2.2));
-      if (cursorX + dw < outW - 24) {
-        outCtx.drawImage(srcCanvas, seg.x0, headerY0, sw, headerH, cursorX, cursorY, dw, dh);
-        cursorX += dw + 48;
-      }
-    }
-    cursorY += zoomSegH;
-
-    // 2. Draw full top header line
-    outCtx.drawImage(srcCanvas, 0, headerY0, w, headerH, 0, cursorY, w, headerH);
-    cursorY += headerH + 20;
-
-    // 3. Draw magnified compact footer segments
-    cursorX = 24;
-    for (const seg of footerNumSegs) {
-      const sw = seg.x1 - seg.x0;
-      const dw = Math.round(sw * 2.6);
-      const dh = Math.min(zoomSegH - 12, Math.round(footerH * 2.2));
-      if (cursorX + dw < outW - 24) {
-        outCtx.drawImage(srcCanvas, seg.x0, footerY0, sw, footerH, cursorX, cursorY, dw, dh);
-        cursorX += dw + 48;
-      }
-    }
-    cursorY += zoomSegH;
-
-    // 4. Draw full bottom footer line
-    outCtx.drawImage(srcCanvas, 0, footerY0, w, footerH, 0, cursorY, w, footerH);
-
-    // Enhance contrast on outCanvas so gray scan ink becomes crisp black on pure white
-    const outImg = outCtx.getImageData(0, 0, outW, outH);
-    const od = outImg.data;
-    for (let i = 0; i < od.length; i += 4) {
-      const lum = (od[i] * 299 + od[i + 1] * 587 + od[i + 2] * 114) / 1000;
-      const v = lum < 195 ? Math.max(0, Math.floor((lum - 90) * 1.3)) : 255;
-      od[i] = v;
-      od[i + 1] = v;
-      od[i + 2] = v;
-    }
-    outCtx.putImageData(outImg, 0, 0);
-
-    const dataUrl = outCanvas.toDataURL('image/jpeg', 0.82);
     srcCanvas.width = 0;
     srcCanvas.height = 0;
-    outCanvas.width = 0;
-    outCanvas.height = 0;
-    return dataUrl;
+    return candidates;
   } catch {
-    return null;
+    return [];
   }
+}
+
+/**
+ * Legacy helper kept for compatibility: combines extracted corner crops into a single JPEG strip if needed.
+ */
+export async function renderPageHeaderFooterStripToJpeg(
+  pdfDoc: pdfjsLib.PDFDocumentProxy,
+  pageNum: number
+): Promise<string | null> {
+  const crops = await extractCornerNumberCropsFromPage(pdfDoc, pageNum);
+  return crops[0]?.dataUrl || null;
+}
+
+/**
+ * Quickly inspects the 4 corners of a single PDF page (native text first, then 4-corner visual crops)
+ * to read the printed page number written on that page.
+ */
+export async function detectPrintedPageNumberFromCorners(
+  pdfDoc: pdfjsLib.PDFDocumentProxy,
+  pageNum: number,
+  totalPages: number
+): Promise<number | null> {
+  if (pageNum < 2 || pageNum > totalPages) return null;
+  const maxReasonableOffset = Math.min(45, Math.max(15, Math.floor(totalPages * 0.25)));
+
+  // 1. Fast check: Native PDF text items in the 4 corners (top-right, top-left, bottom-right, bottom-left)
+  try {
+    const page = await pdfDoc.getPage(pageNum);
+    const vp = page.getViewport({ scale: 1 });
+    const pageW = Math.max(1, vp.width);
+    const pageH = Math.max(1, vp.height);
+    const content = await page.getTextContent();
+
+    for (const rawIt of content.items) {
+      const it = rawIt as { str?: string; transform?: number[] };
+      const rawStr = (it.str || '').trim();
+      if (!rawStr || rawStr.length > 18) continue;
+      const tx = it.transform ? it.transform[4] : 0;
+      const ty = it.transform ? it.transform[5] : 0;
+      const pt = vp.convertToViewportPoint(tx, ty);
+      const nx = pt[0] / pageW;
+      const ny = pt[1] / pageH;
+
+      const isTopOrBottomEdge = ny <= 0.16 || ny >= 0.84;
+      const isCornerOrCenter = nx <= 0.38 || nx >= 0.62 || (nx >= 0.42 && nx <= 0.58);
+      if (!isTopOrBottomEdge || !isCornerOrCenter) continue;
+
+      const clean = normalizeDigitsToAsciiClient(rawStr).trim();
+      const m = clean.match(/^(?:[-–—~•*[\]()\s]|صفحه|ص\.?|page|p\.?)*(\d{1,4})(?:[-–—~•*[\]()\s])*$/i);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        const offset = pageNum - n;
+        if (n >= 1 && n <= totalPages && offset >= -2 && offset <= maxReasonableOffset) {
+          return n;
+        }
+      }
+    }
+  } catch {
+    // ignore native text error
+  }
+
+  // 2. Scanned page 4-corner visual analysis
+  const cornerCrops = await extractCornerNumberCropsFromPage(pdfDoc, pageNum);
+  if (cornerCrops.length === 0) return null;
+
+  try {
+    const worker = await getSharedTesseractWorker();
+    for (const crop of cornerCrops) {
+      const rec = await worker.recognize(crop.dataUrl);
+      const rawText = (rec?.data?.text || '').trim();
+      const norm = normalizeDigitsToAsciiClient(rawText)
+        .replace(/[|lI!]/g, '1')
+        .replace(/[^0-9]/g, '');
+
+      if (!norm) continue;
+      let n = parseInt(norm, 10);
+      if (!Number.isFinite(n) || n <= 0) continue;
+
+      // If Tesseract read a single digit (e.g. "1" from "۱۰") and our sub-blob geometry detected the trailing Persian zero dot '۰', multiply by 10
+      if (n >= 1 && n <= 9 && crop.hasTrailingZeroDot) {
+        const withZero = n * 10;
+        const offsetWithZero = pageNum - withZero;
+        if (offsetWithZero >= -2 && offsetWithZero <= maxReasonableOffset) {
+          n = withZero;
+        }
+      }
+
+      const offset = pageNum - n;
+      if (n >= 1 && n <= totalPages && offset >= -2 && offset <= maxReasonableOffset) {
+        return n;
+      }
+    }
+  } catch {
+    // ignore OCR error
+  }
+
+  return null;
 }
 
 async function extractNativePageLines(
@@ -692,8 +869,9 @@ async function extractNativePageLines(
 }
 
 /**
- * Automatically detects the exact printed book page offset (`pdfPage - printedBookPage`,
- * e.g. 5 when PDF page 15 has printed page 10) for any book and caches it.
+ * Automatically detects the printed book page offset (`pdfPage - printedBookPage`,
+ * e.g. 5 when PDF page 15 has printed page 10 at its corner) by checking the 4 corners
+ * of the current page and sample body pages.
  */
 export async function detectAndCacheBookPageOffset(
   docKey: string,
@@ -715,15 +893,15 @@ export async function detectAndCacheBookPageOffset(
     return 0;
   }
 
-  // Pick sample body pages where printed page numbers are clearly visible (preferring pages 11..19 and preferredCurrentPage)
+  // Prioritize the page the user is currently viewing (if >= 4), plus nearby body pages
   const samplePagesSet = new Set<number>();
-  if (preferredCurrentPage >= 5 && preferredCurrentPage <= totalPages) {
+  if (preferredCurrentPage >= 4 && preferredCurrentPage <= totalPages) {
     samplePagesSet.add(preferredCurrentPage);
     if (preferredCurrentPage + 1 <= totalPages) samplePagesSet.add(preferredCurrentPage + 1);
     if (preferredCurrentPage + 2 <= totalPages) samplePagesSet.add(preferredCurrentPage + 2);
   }
-  for (const p of [15, 16, 17, 13, 14, 18, 11, 12, 8, 9]) {
-    if (p <= totalPages && samplePagesSet.size < 6) {
+  for (const p of [15, 17, 16, 14, 12, 10, 8]) {
+    if (p <= totalPages && samplePagesSet.size < 5) {
       samplePagesSet.add(p);
     }
   }
@@ -734,27 +912,46 @@ export async function detectAndCacheBookPageOffset(
   }
 
   const samplePages = Array.from(samplePagesSet);
-  const cachedOcr = await loadCachedOcrPages(docKey);
-  const linesMap: Record<number, string[]> = { ...cachedOcr };
+  const offsetVotes = new Map<number, number>();
 
-  // 1. Check native PDF text on sample pages first
+  // 1. Analyze the 4 corners of each sample page directly
   for (const p of samplePages) {
-    if (!linesMap[p] || linesMap[p].length === 0) {
-      const nativeLines = await extractNativePageLines(pdfDoc, p);
-      if (nativeLines.length > 0) {
-        linesMap[p] = nativeLines;
+    const printedNum = await detectPrintedPageNumberFromCorners(pdfDoc, p, totalPages);
+    if (printedNum !== null) {
+      const offset = p - printedNum;
+      const nextCount = (offsetVotes.get(offset) || 0) + 1;
+      offsetVotes.set(offset, nextCount);
+
+      // If the user's current page gave a clear corner page number, or 2 pages agree on the exact offset, lock it in immediately!
+      if (p === preferredCurrentPage || nextCount >= 2) {
+        saveCachedBookPageOffset(docKey, offset);
+        return offset;
       }
     }
   }
 
-  const initialConsensus = computePageOffsetFromLinesMap(linesMap, totalPages);
-  if (initialConsensus && initialConsensus.distinctPages >= 2) {
-    saveCachedBookPageOffset(docKey, initialConsensus.offset);
-    return initialConsensus.offset;
+  // If at least one sample page yielded a valid corner number, use the best offset vote
+  if (offsetVotes.size > 0) {
+    let bestOffset = 0;
+    let bestCount = 0;
+    for (const [off, cnt] of offsetVotes.entries()) {
+      if (cnt > bestCount) {
+        bestOffset = off;
+        bestCount = cnt;
+      }
+    }
+    saveCachedBookPageOffset(docKey, bestOffset);
+    return bestOffset;
   }
 
-  // 2. Render crisp Header + Footer strip images for up to 4 sample body pages
-  const stripPagesToRender = samplePages.slice(0, 4);
+  // 2. Fallback: Check cached OCR lines or Server AI if corner crops needed server vision
+  const cachedOcr = await loadCachedOcrPages(docKey);
+  const consensus = computePageOffsetFromLinesMap(cachedOcr, totalPages);
+  if (consensus && consensus.distinctPages >= 2) {
+    saveCachedBookPageOffset(docKey, consensus.offset);
+    return consensus.offset;
+  }
+
   const bodySamplePayload: Array<{
     page: number;
     lines: string[];
@@ -762,19 +959,18 @@ export async function detectAndCacheBookPageOffset(
     mimeType?: string;
   }> = [];
 
-  for (const p of stripPagesToRender) {
-    const stripB64 = await renderPageHeaderFooterStripToJpeg(pdfDoc, p);
-    if (stripB64) {
+  for (const p of samplePages.slice(0, 3)) {
+    const crops = await extractCornerNumberCropsFromPage(pdfDoc, p);
+    if (crops.length > 0) {
       bodySamplePayload.push({
         page: p,
-        lines: linesMap[p] || [],
-        imageBase64: stripB64,
-        mimeType: 'image/jpeg',
+        lines: cachedOcr[p] || [],
+        imageBase64: crops[0].dataUrl,
+        mimeType: 'image/png',
       });
     }
   }
 
-  // 3. Try Server Gemini AI (/api/chapters in offset_only mode) for instant visual page number reading
   if (bodySamplePayload.length > 0) {
     try {
       const res = await fetch('/api/chapters', {
@@ -788,53 +984,24 @@ export async function detectAndCacheBookPageOffset(
         }),
       });
       if (res.ok) {
-        const data = (await res.json()) as { pageOffset?: number | null; source?: string };
+        const data = (await res.json()) as { pageOffset?: number | null };
         if (typeof data.pageOffset === 'number' && Number.isFinite(data.pageOffset)) {
           saveCachedBookPageOffset(docKey, data.pageOffset);
           return data.pageOffset;
         }
       }
     } catch {
-      // fall through to client Tesseract OCR on the header/footer strips
-    }
-
-    // 4. Client-side Tesseract OCR on the magnified Header + Footer strips (works offline & without GEMINI_API_KEY)
-    try {
-      const worker = await getSharedTesseractWorker();
-      const stripLinesMap: Record<number, string[]> = { ...linesMap };
-
-      for (const sp of bodySamplePayload) {
-        if (!sp.imageBase64) continue;
-        const rec = await worker.recognize(sp.imageBase64);
-        const recognizedLines = (rec?.data?.text || '')
-          .split(/\r?\n/)
-          .map(l => l.trim())
-          .filter(Boolean);
-        if (recognizedLines.length > 0) {
-          stripLinesMap[sp.page] = [...recognizedLines, ...(stripLinesMap[sp.page] || [])];
-        }
-
-        // Check if we already achieved multi-page consensus after at least 2 strips
-        const partialConsensus = computePageOffsetFromLinesMap(stripLinesMap, totalPages);
-        if (partialConsensus && partialConsensus.distinctPages >= 2) {
-          saveCachedBookPageOffset(docKey, partialConsensus.offset);
-          return partialConsensus.offset;
-        }
-      }
-
-      const finalConsensus = computePageOffsetFromLinesMap(stripLinesMap, totalPages);
-      if (finalConsensus && (finalConsensus.distinctPages >= 2 || finalConsensus.weight >= 4)) {
-        saveCachedBookPageOffset(docKey, finalConsensus.offset);
-        return finalConsensus.offset;
-      }
-    } catch {
-      // ignore client OCR error
+      // ignore
     }
   }
 
   return loadCachedBookPageOffset(docKey) ?? 0;
 }
 
+/**
+ * Recognizes the book's Table of Contents / Chapters ONLY if the book actually has a chapters
+ * section in its opening pages. Returns [] if the book has no Table of Contents.
+ */
 export async function recognizeAndCacheBookChapters(
   docKey: string,
   bookTitle: string,
@@ -852,7 +1019,7 @@ export async function recognizeAndCacheBookChapters(
     return existingChapters;
   }
 
-  const frontLimit = Math.min(15, totalPages);
+  const frontLimit = Math.min(12, totalPages);
   const cachedPages = await loadCachedOcrPages(docKey);
   const frontPagesPayload: Array<{
     page: number;
@@ -870,7 +1037,7 @@ export async function recognizeAndCacheBookChapters(
       }
     }
     let imageBase64: string | undefined;
-    if (lines.length < 3 && pdfDoc && p >= 2 && p <= 9) {
+    if (lines.length < 3 && pdfDoc && p >= 2 && p <= 8) {
       const b64 = await renderPdfPageToJpegDataUrl(pdfDoc, p);
       if (b64) imageBase64 = b64;
     }
@@ -884,33 +1051,7 @@ export async function recognizeAndCacheBookChapters(
     }
   }
 
-  // Also include 3 sample body page header/footer strips so /api/chapters can calibrate pageOffset at the same time
-  const bodySamplePayload: Array<{
-    page: number;
-    lines: string[];
-    imageBase64?: string;
-    mimeType?: string;
-  }> = [];
-
-  if (pdfDoc && totalPages >= 8) {
-    const bodyCandidates = [
-      preferredCurrentPage >= 6 ? preferredCurrentPage : 15,
-      16,
-      17,
-    ].filter((p, idx, arr) => p <= totalPages && arr.indexOf(p) === idx);
-
-    for (const bp of bodyCandidates.slice(0, 3)) {
-      const stripB64 = await renderPageHeaderFooterStripToJpeg(pdfDoc, bp);
-      bodySamplePayload.push({
-        page: bp,
-        lines: cachedPages[bp] || [],
-        imageBase64: stripB64 || undefined,
-        mimeType: 'image/jpeg',
-      });
-    }
-  }
-
-  if (frontPagesPayload.length === 0 && bodySamplePayload.length === 0) return [];
+  if (frontPagesPayload.length === 0) return [];
 
   try {
     const res = await fetch('/api/chapters', {
@@ -920,7 +1061,7 @@ export async function recognizeAndCacheBookChapters(
         bookTitle,
         totalPages,
         frontPages: frontPagesPayload,
-        bodySamplePages: bodySamplePayload,
+        bodySamplePages: [],
       }),
     });
     if (res.ok) {
@@ -940,7 +1081,6 @@ export async function recognizeAndCacheBookChapters(
     // ignore network error
   }
 
-  // Ensure page offset calibration still completes via client header/footer OCR if server AI was unavailable
   if (pdfDoc && loadCachedBookPageOffset(docKey) === null) {
     detectAndCacheBookPageOffset(docKey, bookTitle, totalPages, pdfDoc, preferredCurrentPage).catch(
       () => {}

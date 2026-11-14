@@ -13,6 +13,7 @@ import {
   saveCachedBookPageOffset,
   clearCachedBookPageOffset,
   detectAndCacheBookPageOffset,
+  detectPrintedPageNumberFromCorners,
   subscribeToPageOffsetUpdates,
   normalizeDigitsToAsciiClient,
 } from '../services/ocrCache';
@@ -34,7 +35,6 @@ import {
   Search,
   Bookmark,
   ListTree,
-  Lock,
   Undo2,
   Trash2,
   X,
@@ -221,13 +221,11 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [isBookmarksDrawerOpen, setIsBookmarksDrawerOpen] = useState<boolean>(false);
   const [bookmarkNoteDraft, setBookmarkNoteDraft] = useState<string>('');
 
-  // Table of Contents / Chapters Drawer state + Reading Milestone Unlock
+  // Table of Contents / Chapters Drawer state (only enabled when book has a real chapters section)
   const [isChaptersDrawerOpen, setIsChaptersDrawerOpen] = useState<boolean>(false);
   const [pdfChapters, setPdfChapters] = useState<PdfChapterItem[]>([]);
   const [hasEmbeddedOutline, setHasEmbeddedOutline] = useState<boolean>(false);
   const [isAiRecognizingChapters, setIsAiRecognizingChapters] = useState<boolean>(false);
-  const [pagesReadCount, setPagesReadCount] = useState<number>(1);
-  const readPagesSetRef = useRef<Set<number>>(new Set([initialPage || 1]));
 
   // Printed Book Page Number Calibration (pageOffset = pdfPage - printedBookPage, e.g. 15 - 10 = 5)
   const [pageOffset, setPageOffset] = useState<number>(0);
@@ -275,28 +273,6 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     setManualPrintedPageInput(String(currentBookPage));
   }, [currentBookPage, effectiveOffset]);
 
-  // Track unique pages read for the Reading Milestone Reward that unlocks Smart Chapters
-  useEffect(() => {
-    const storageKey = `folio_read_pages_v1_${docCacheKey}`;
-    try {
-      const stored = localStorage.getItem(storageKey);
-      const parsed: number[] = stored ? JSON.parse(stored) : [];
-      const nextSet = new Set<number>(Array.isArray(parsed) ? parsed : []);
-      if (initialPage && initialPage >= 1) nextSet.add(initialPage);
-      if (currentPage && currentPage >= 1) nextSet.add(currentPage);
-      readPagesSetRef.current = nextSet;
-      setPagesReadCount(Math.max(nextSet.size, currentPage || 1));
-      localStorage.setItem(storageKey, JSON.stringify(Array.from(nextSet)));
-    } catch {
-      readPagesSetRef.current.add(currentPage || 1);
-      setPagesReadCount(Math.max(readPagesSetRef.current.size, currentPage || 1));
-    }
-  }, [docCacheKey, currentPage, initialPage]);
-
-  const chaptersUnlockThreshold = Math.min(5, Math.max(2, totalPages));
-  const isChaptersUnlocked =
-    pagesReadCount >= chaptersUnlockThreshold || currentPage >= chaptersUnlockThreshold;
-
   // Load PDF Document + Cached AI OCR pages & AI Chapters from IndexedDB/localStorage
   useEffect(() => {
     if (!arrayBuffer) return;
@@ -311,6 +287,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     aiScanAbortRef.current++;
     setIsAiScanning(false);
     setAiScanProgress(null);
+    setIsChaptersDrawerOpen(false);
 
     loadCachedOcrPages(docCacheKey).then(cachedPages => {
       if (!isMounted) return;
@@ -330,6 +307,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     if (cachedAiChapters.length > 0) {
       setPdfChapters(cachedAiChapters);
       setHasEmbeddedOutline(true);
+    } else {
+      setPdfChapters([]);
+      setHasEmbeddedOutline(false);
     }
 
     const unsubOcr = subscribeToOcrUpdates(detail => {
@@ -458,7 +438,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             };
             await walkOutline(outline, 0);
             if (!isMounted) return;
-            if (rawOutline.length > 0) {
+            if (rawOutline.length >= 2) {
               const extractedChapters: PdfChapterItem[] = rawOutline.map((ch, idx) => {
                 const nextStart = rawOutline[idx + 1]?.startPage;
                 const endPage =
@@ -481,40 +461,6 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               return;
             }
           }
-
-          // Fallback: Generate smart reading sections with page–page ranges while AI finishes reading opening pages
-          const fallbackSections: PdfChapterItem[] = [];
-          const numPages = doc.numPages;
-          if (numPages <= 15) {
-            const step = Math.max(1, Math.floor(numPages / 5));
-            for (let p = 1; p <= numPages; p += step) {
-              const endP = Math.min(numPages, p + step - 1);
-              fallbackSections.push({
-                id: `sec_${p}`,
-                title: p === 1 ? 'Opening Section' : `Reading Section`,
-                page: p,
-                startPage: p,
-                endPage: endP,
-                level: 0,
-              });
-            }
-          } else {
-            const step = Math.max(10, Math.round(numPages / 10 / 5) * 5);
-            let sectionNum = 1;
-            for (let p = 1; p <= numPages; p += step) {
-              const endP = Math.min(numPages, p + step - 1);
-              fallbackSections.push({
-                id: `sec_${p}`,
-                title: p === 1 ? 'Section 1 — Opening Pages' : `Section ${sectionNum}`,
-                page: p,
-                startPage: p,
-                endPage: endP,
-                level: 0,
-              });
-              sectionNum++;
-            }
-          }
-          setPdfChapters(prev => (prev.length > 0 ? prev : fallbackSections));
         } catch {
           // ignore
         }
@@ -540,24 +486,42 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     };
   }, [arrayBuffer, docCacheKey, bookTitle]);
 
-  // If user jumps to a body page (>= 5) and pageOffset wasn't confirmed yet, inspect the current page's header/footer
+  // Fast 4-corner page number check (top-right, top-left, bottom-right, bottom-left) when viewing a page
   useEffect(() => {
-    if (!pdfDoc || currentPage < 5 || isCalibratingPageOffset) return;
-    if (loadCachedBookPageOffset(docCacheKey) !== null) return;
+    if (!pdfDoc || currentPage < 3 || isCalibratingPageOffset) return;
+    const cached = loadCachedBookPageOffset(docCacheKey);
+    if (cached !== null && cached !== 0) return;
+
+    let cancelled = false;
     setIsCalibratingPageOffset(true);
-    detectAndCacheBookPageOffset(
-      docCacheKey,
-      bookTitle || 'Book',
-      totalPages,
-      pdfDoc,
-      currentPage
-    )
-      .then(detected => {
-        setPageOffset(detected);
+    detectPrintedPageNumberFromCorners(pdfDoc, currentPage, totalPages)
+      .then(printedNum => {
+        if (cancelled) return;
+        if (printedNum !== null) {
+          const detectedOffset = currentPage - printedNum;
+          saveCachedBookPageOffset(docCacheKey, detectedOffset);
+          setPageOffset(detectedOffset);
+          return;
+        }
+        if (cached === null && currentPage >= 5) {
+          return detectAndCacheBookPageOffset(
+            docCacheKey,
+            bookTitle || 'Book',
+            totalPages,
+            pdfDoc,
+            currentPage
+          ).then(detected => {
+            if (!cancelled) setPageOffset(detected);
+          });
+        }
       })
       .finally(() => {
-        setIsCalibratingPageOffset(false);
+        if (!cancelled) setIsCalibratingPageOffset(false);
       });
+
+    return () => {
+      cancelled = true;
+    };
   }, [pdfDoc, currentPage, docCacheKey, bookTitle, totalPages, isCalibratingPageOffset]);
 
   // Draw highlighter strokes AND active search match boxes on the transparent overlay canvas
@@ -1846,10 +1810,10 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               value={pageInput}
               onChange={e => setPageInput(e.target.value)}
               onBlur={() => goToBookPageInput(pageInput)}
-              title="Book Page Number (matches the page number written in the book)"
+              title="Current Book Page Number (detected from page corners)"
               className="w-11 text-center py-0.5 rounded border border-white/20 bg-white text-black text-xs font-semibold focus:outline-hidden focus:ring-1 focus:ring-[#1DB954]"
             />
-            <span className="opacity-60 text-xs">/ {totalBookPages}</span>
+            <span className="opacity-60 text-xs">/ {totalPages}</span>
           </form>
 
           <button
@@ -1868,7 +1832,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             className="hidden sm:inline-flex px-1.5 py-0.5 rounded text-[11px] opacity-70 hover:opacity-100 hover:bg-white/10 disabled:opacity-30 transition-colors"
             title="Last page"
           >
-            {totalBookPages}
+            {totalPages}
           </button>
 
           {/* Book Page Number Calibration Badge & 1-Click Manual Match Popover */}
@@ -2031,38 +1995,34 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             </button>
           )}
 
-          {/* Open Table of Contents / Chapters Drawer (with Reading Milestone Unlock) */}
+          {/* Open Table of Contents / Chapters Drawer (enabled only if the book has a Chapters / Table of Contents section) */}
           <button
             type="button"
+            disabled={pdfChapters.length === 0}
             onClick={() => {
+              if (pdfChapters.length === 0) return;
               setIsChaptersDrawerOpen(v => !v);
               setIsBookmarksDrawerOpen(false);
               setIsSearchOpen(false);
               setIsDictionaryOpen(false);
             }}
             className={`px-2.5 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1 transition-colors ${
-              isChaptersDrawerOpen
+              pdfChapters.length === 0
+                ? 'bg-white/5 text-white/35 cursor-not-allowed opacity-50'
+                : isChaptersDrawerOpen
                 ? 'bg-[#1DB954] text-black'
-                : !isChaptersUnlocked
-                ? 'bg-amber-400/15 hover:bg-amber-400/25 text-amber-300 border border-amber-400/30'
                 : 'bg-white/10 hover:bg-white/20 text-white'
             }`}
             title={
-              isChaptersUnlocked
-                ? 'Open AI Table of Contents & Chapters'
-                : `Read ${Math.max(1, chaptersUnlockThreshold - pagesReadCount)} more pages to unlock Smart Chapters (${pagesReadCount}/${chaptersUnlockThreshold})`
+              pdfChapters.length > 0
+                ? `Open Chapters (${pdfChapters.length} chapters detected)`
+                : isAiRecognizingChapters
+                ? 'Checking opening pages for a Table of Contents...'
+                : 'No Table of Contents / Chapters section found in this book'
             }
           >
-            {!isChaptersUnlocked ? (
-              <Lock className="w-3 h-3 text-amber-300" />
-            ) : (
-              <ListTree className="w-3.5 h-3.5" />
-            )}
-            <span className="hidden sm:inline">
-              {!isChaptersUnlocked
-                ? `Chapters (${Math.min(pagesReadCount, chaptersUnlockThreshold)}/${chaptersUnlockThreshold})`
-                : 'Chapters'}
-            </span>
+            <ListTree className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Chapters</span>
           </button>
 
           {/* Open Bookmarks & Notes Drawer */}
@@ -2647,43 +2607,33 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       )}
 
       {/* Floating Table of Contents / Chapters & Sections Drawer */}
-      {isChaptersDrawerOpen && (
+      {isChaptersDrawerOpen && pdfChapters.length > 0 && (
         <div className="w-full sm:w-88 sm:left-4 sm:top-12 sm:absolute z-30 bg-[#181818] text-white border border-[#333333] sm:rounded-xl shadow-2xl p-3.5 space-y-3 max-h-[75vh] overflow-y-auto">
           <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
             <div>
               <h4 className="text-xs font-bold flex items-center gap-1.5">
-                {!isChaptersUnlocked ? (
-                  <Lock className="w-3.5 h-3.5 text-amber-400" />
-                ) : (
-                  <ListTree className="w-3.5 h-3.5 text-[#1DB954]" />
-                )}
+                <ListTree className="w-3.5 h-3.5 text-[#1DB954]" />
                 <span>
-                  {!isChaptersUnlocked
-                    ? 'Smart Chapters (Reading Reward)'
-                    : hasEmbeddedOutline
-                    ? 'AI Table of Contents & Chapters'
+                  {hasEmbeddedOutline
+                    ? 'Table of Contents & Chapters'
                     : 'Book Chapters & Page Ranges'}
                 </span>
               </h4>
               <p className="text-[10px] text-[#B3B3B3] mt-0.5">
-                {!isChaptersUnlocked
-                  ? `Read ${Math.max(1, chaptersUnlockThreshold - pagesReadCount)} more ${
-                      chaptersUnlockThreshold - pagesReadCount === 1 ? 'page' : 'pages'
-                    } to unlock (${pagesReadCount}/${chaptersUnlockThreshold} pages)`
-                  : isAiRecognizingChapters
-                  ? 'AI is mapping the opening Table of Contents...'
-                  : `${pdfChapters.length} chapters mapped across ${totalBookPages} book pages`}
+                {isAiRecognizingChapters
+                  ? 'Reading opening Table of Contents...'
+                  : `${pdfChapters.length} chapters detected`}
               </p>
             </div>
             <div className="flex items-center gap-1">
-              {isChaptersUnlocked && pdfDoc && (
+              {pdfDoc && (
                 <button
                   type="button"
                   disabled={isAiRecognizingChapters}
                   onClick={() => {
                     setIsAiRecognizingChapters(true);
                     try {
-                      localStorage.removeItem(`folio_book_chapters_v2_${docCacheKey}`);
+                      localStorage.removeItem(`folio_book_chapters_v3_${docCacheKey}`);
                     } catch {
                       // ignore
                     }
@@ -2703,7 +2653,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                       .finally(() => setIsAiRecognizingChapters(false));
                   }}
                   className="p-1 rounded hover:bg-white/10 text-[#B3B3B3] hover:text-white disabled:opacity-40"
-                  title="Re-scan opening Table of Contents with AI"
+                  title="Re-scan opening Table of Contents"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${isAiRecognizingChapters ? 'animate-spin text-[#1DB954]' : ''}`} />
                 </button>
@@ -2719,47 +2669,13 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             </div>
           </div>
 
-          {!isChaptersUnlocked ? (
-            <div className="p-4 rounded-xl bg-[#222222] border border-amber-400/25 space-y-3 text-center">
-              <div className="w-10 h-10 rounded-full bg-amber-400/15 text-amber-300 flex items-center justify-center mx-auto">
-                <Sparkles className="w-5 h-5" />
+          <div className="space-y-1">
+            {isAiRecognizingChapters && (
+              <div className="px-3 py-2 rounded-lg bg-[#242424] border border-amber-400/30 flex items-center gap-2 text-[11px] text-amber-300 mb-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                <span>Reading the opening Table of Contents pages...</span>
               </div>
-              <div className="space-y-1">
-                <p className="text-xs font-bold text-amber-300">
-                  Keep Reading to Unlock Smart Chapters!
-                </p>
-                <p className="text-[11px] text-[#B3B3B3] leading-relaxed">
-                  Read <span className="text-white font-semibold">{chaptersUnlockThreshold} pages</span> of this book to unlock the full chapter breakdown. While you read the opening pages, Folio&apos;s AI is reading the book&apos;s Table of Contents and ordering every topic with its exact page-to-page range.
-                </p>
-              </div>
-              <div className="space-y-1.5 pt-1">
-                <div className="flex items-center justify-between text-[10px] font-mono">
-                  <span className="text-[#B3B3B3]">Reading Progress</span>
-                  <span className="text-amber-300 font-bold">
-                    {Math.min(pagesReadCount, chaptersUnlockThreshold)} / {chaptersUnlockThreshold} pages
-                  </span>
-                </div>
-                <div className="w-full h-2 rounded-full bg-black/50 overflow-hidden">
-                  <div
-                    className="h-full bg-amber-400 rounded-full transition-all duration-300"
-                    style={{
-                      width: `${Math.min(
-                        100,
-                        Math.round((pagesReadCount / chaptersUnlockThreshold) * 100)
-                      )}%`,
-                    }}
-                  />
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-1">
-              {isAiRecognizingChapters && (
-                <div className="px-3 py-2 rounded-lg bg-[#242424] border border-amber-400/30 flex items-center gap-2 text-[11px] text-amber-300 mb-2">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-                  <span>AI is reading the opening Table of Contents pages...</span>
-                </div>
-              )}
+            )}
 
               {pdfChapters.map((ch, idx) => {
                 const rawStart = ch.startPage || ch.page || 1;
@@ -2822,8 +2738,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                   </button>
                 );
               })}
-            </div>
-          )}
+          </div>
         </div>
       )}
 
