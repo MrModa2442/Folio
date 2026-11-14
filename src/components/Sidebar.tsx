@@ -1,7 +1,6 @@
 import React from 'react';
 import {
   BookOpen,
-  Bookmark,
   CheckCircle2,
   Lock,
   Globe,
@@ -27,7 +26,7 @@ interface SidebarProps {
   isNotesHubActive?: boolean;
   isVocabularyHubActive?: boolean;
   totalBooksCount: number;
-  readingBooksCount: number;
+  readingBooksCount?: number;
   finishedBooksCount: number;
   annotationsCount: number;
   vocabularyCount?: number;
@@ -50,7 +49,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   isNotesHubActive = false,
   isVocabularyHubActive = false,
   totalBooksCount,
-  readingBooksCount,
   finishedBooksCount,
   annotationsCount,
   vocabularyCount = 0,
@@ -105,34 +103,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
             {totalBooksCount}
           </span>
         </button>
-
-        {uiPreferences.showReadingTab && (
-          <button
-            onClick={() => {
-              onSelectList(null);
-              onSelectStatus('reading');
-            }}
-            className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-[13px] font-medium transition-all ${
-              !isSpecialHubActive && selectedListId === null && selectedStatus === 'reading'
-                ? isDark ? 'bg-[#282828] text-white font-semibold shadow-xs' : 'bg-zinc-200/90 text-zinc-950 font-semibold'
-                : isDark ? 'text-[#B3B3B3] hover:text-white hover:bg-[#1A1A1A]' : 'text-zinc-600 hover:text-zinc-950 hover:bg-zinc-100'
-            }`}
-          >
-            <span className="flex items-center gap-2.5">
-              <Bookmark className="w-4 h-4 text-amber-500 shrink-0" />
-              <span className="tracking-tight">Reading</span>
-            </span>
-            <span
-              className={`text-xs px-2 py-0.5 rounded-full font-medium tabular-nums ${
-                !isSpecialHubActive && selectedListId === null && selectedStatus === 'reading'
-                  ? isDark ? 'bg-amber-500/20 text-amber-300' : 'bg-amber-100 text-amber-800'
-                  : isDark ? 'bg-white/5 text-[#A0A0A0]' : 'bg-zinc-200/60 text-zinc-600'
-              }`}
-            >
-              {readingBooksCount}
-            </span>
-          </button>
-        )}
 
         {uiPreferences.showFinishedTab && (
           <button

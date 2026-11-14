@@ -8,6 +8,7 @@ import telegramHandler, { normalizeTelegramChannel } from './api/telegram.js';
 import ocrHandler from './api/ocr.js';
 import dictionaryHandler from './api/dictionary.js';
 import chaptersHandler from './api/chapters.js';
+import cloudsqlHandler from './api/cloudsql.js';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
 import {
   getUserLibraryFromSql,
@@ -47,7 +48,12 @@ async function startServer() {
     return chaptersHandler(req, res);
   });
 
-  // Authenticated Cloud SQL (PostgreSQL) endpoints
+  // Cloud PDF upload/download endpoint for cross-device PDF sync
+  app.all('/api/cloudsql/pdf', (req, res) => {
+    return cloudsqlHandler(req, res);
+  });
+
+  // Authenticated Cloud SQL (PostgreSQL) endpoints with automatic fallback store
   app.get('/api/cloudsql/library', requireAuth, async (req: AuthRequest, res) => {
     try {
       const uid = req.user?.uid || '';
@@ -56,10 +62,8 @@ async function startServer() {
       const data = await getUserLibraryFromSql(uid, email, displayName);
       res.json(data);
     } catch (error) {
-      console.error('Failed to fetch Cloud SQL library:', error);
-      res.status(500).json({
-        error: error instanceof Error ? error.message : 'Failed to fetch Cloud SQL library',
-      });
+      console.warn('Cloud SQL library fallback to local cloud store:', error);
+      return cloudsqlHandler(req, res);
     }
   });
 
@@ -74,10 +78,8 @@ async function startServer() {
       const data = await syncUserLibraryToSql(uid, email, displayName, booksInput, notesInput);
       res.json(data);
     } catch (error) {
-      console.error('Failed to sync library to Cloud SQL:', error);
-      res.status(500).json({
-        error: error instanceof Error ? error.message : 'Failed to sync library to Cloud SQL',
-      });
+      console.warn('Cloud SQL sync fallback to local cloud store:', error);
+      return cloudsqlHandler(req, res);
     }
   });
 
@@ -96,10 +98,8 @@ async function startServer() {
       });
       res.json({ entry: saved });
     } catch (error) {
-      console.error('Failed to save vocabulary to Cloud SQL:', error);
-      res.status(500).json({
-        error: error instanceof Error ? error.message : 'Failed to save vocabulary to Cloud SQL',
-      });
+      console.warn('Cloud SQL vocabulary fallback to local cloud store:', error);
+      return cloudsqlHandler(req, res);
     }
   });
 

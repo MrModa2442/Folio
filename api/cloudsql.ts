@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
+import type { PageBookmark, PageHighlightStroke, SpineTexture, CoverPattern } from '../src/types/library';
 
-interface StoredCloudBook {
+export interface StoredCloudBook {
   id: number;
   bookKey: string;
   title: string;
@@ -11,10 +12,21 @@ interface StoredCloudBook {
   totalPages: number;
   bookmarkCount: number;
   highlightCount: number;
+  fileName?: string;
+  fileSize?: number;
+  spineColor?: string;
+  spineTexture?: SpineTexture;
+  coverPattern?: CoverPattern;
+  coverImage?: string;
+  telegramChannel?: string;
+  telegramMessageId?: number;
+  bookmarks?: PageBookmark[];
+  highlights?: Record<number, PageHighlightStroke[]>;
+  hasCloudPdf?: boolean;
   updatedAt: string;
 }
 
-interface StoredCloudNote {
+export interface StoredCloudNote {
   id: number;
   noteKey: string;
   bookKey: string;
@@ -24,7 +36,7 @@ interface StoredCloudNote {
   createdAt: string;
 }
 
-interface StoredCloudVocab {
+export interface StoredCloudVocab {
   id: number;
   word: string;
   partOfSpeech: string;
@@ -53,7 +65,13 @@ const FALLBACK_STORE_PATHS = [
   '/tmp/folio-cloud-store.json',
 ];
 
+const PDF_CACHE_DIRS = [
+  path.resolve(process.cwd(), '.folio-cloud-pdfs'),
+  '/tmp/folio-cloud-pdfs',
+];
+
 const memoryCloudStore = new Map<string, StoredUserCloudRecord>();
+const memoryPdfStore = new Map<string, Buffer>();
 let fallbackLoaded = false;
 
 function loadFallbackStoreOnce() {
@@ -90,6 +108,48 @@ function saveFallbackStore() {
   }
 }
 
+function makePdfCacheKey(userKey: string, bookKey: string): string {
+  const safeUser = userKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
+  const safeBook = bookKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+  return `${safeUser}__${safeBook}`;
+}
+
+function saveCloudPdfBuffer(userKey: string, bookKey: string, buf: Buffer): void {
+  const key = makePdfCacheKey(userKey, bookKey);
+  memoryPdfStore.set(key, buf);
+  for (const dir of PDF_CACHE_DIRS) {
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(path.join(dir, `${key}.pdf`), buf);
+      break;
+    } catch {
+      // ignore fs error
+    }
+  }
+}
+
+function loadCloudPdfBuffer(userKey: string, bookKey: string): Buffer | null {
+  const key = makePdfCacheKey(userKey, bookKey);
+  const inMem = memoryPdfStore.get(key);
+  if (inMem) return inMem;
+
+  for (const dir of PDF_CACHE_DIRS) {
+    try {
+      const filePath = path.join(dir, `${key}.pdf`);
+      if (fs.existsSync(filePath)) {
+        const buf = fs.readFileSync(filePath);
+        memoryPdfStore.set(key, buf);
+        return buf;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+}
+
 function decodeJwtPayload(token: string): { sub?: string; user_id?: string; email?: string; name?: string } | null {
   try {
     const parts = token.split('.');
@@ -108,8 +168,8 @@ function resolveUserFromRequest(req: any): { uid: string; email: string; display
     const token = authHeader.slice(7).trim();
     const decoded = decodeJwtPayload(token);
     if (decoded && (decoded.user_id || decoded.sub || decoded.email)) {
-      const email = decoded.email || 'reader@folio.app';
-      const uid = decoded.user_id || decoded.sub || email.toLowerCase();
+      const email = (decoded.email || 'reader@folio.app').toLowerCase();
+      const uid = decoded.user_id || decoded.sub || email;
       const displayName = decoded.name || email.split('@')[0] || 'Reader';
       return { uid, email, displayName };
     }
@@ -129,12 +189,12 @@ function resolveUserFromRequest(req: any): { uid: string; email: string; display
   return null;
 }
 
-// Vercel Serverless Handler for /api/cloudsql/*
+// Vercel & Express Unified Handler for /api/cloudsql/*
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export default async function handler(req: any, res: any) {
   const rawUrl = req.originalUrl || req.url || '/';
   const urlObj = new URL(rawUrl, 'http://localhost');
-  const actionParam = String(req.query?.action || '');
+  const actionParam = String(req.query?.action || urlObj.searchParams.get('action') || '');
   const pathname =
     urlObj.pathname.replace(/^\/api\/cloudsql\/?/, '').replace(/^\//, '') || actionParam;
 
@@ -144,7 +204,8 @@ export default async function handler(req: any, res: any) {
   }
 
   loadFallbackStoreOnce();
-  const userKey = user.email.toLowerCase() || user.uid;
+  // Always key by normalized lowercase email so iPad and PC using the same Gmail share the exact same record
+  const userKey = (user.email || user.uid).trim().toLowerCase();
   const existingRecord: StoredUserCloudRecord = memoryCloudStore.get(userKey) || {
     user: {
       id: 1,
@@ -162,6 +223,46 @@ export default async function handler(req: any, res: any) {
     return res.status(200).json(existingRecord);
   }
 
+  if (pathname === 'pdf' && req.method === 'POST') {
+    try {
+      const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+      const bookKey = String(body.bookKey || '').trim();
+      const pdfBase64 = String(body.pdfBase64 || '').trim();
+      if (!bookKey || !pdfBase64) {
+        return res.status(400).json({ error: 'bookKey and pdfBase64 are required' });
+      }
+      const cleanBase64 = pdfBase64.replace(/^data:application\/pdf;base64,/, '');
+      const buf = Buffer.from(cleanBase64, 'base64');
+      if (buf.byteLength > 0 && buf.byteLength <= 22 * 1024 * 1024) {
+        saveCloudPdfBuffer(userKey, bookKey, buf);
+        const targetBook = existingRecord.books.find(b => b.bookKey === bookKey);
+        if (targetBook) {
+          targetBook.hasCloudPdf = true;
+          saveFallbackStore();
+        }
+      }
+      return res.status(200).json({ ok: true, size: buf.byteLength });
+    } catch (err) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to store cloud PDF',
+      });
+    }
+  }
+
+  if (pathname === 'pdf' && req.method === 'GET') {
+    const bookKey = String(req.query?.bookKey || urlObj.searchParams.get('bookKey') || '').trim();
+    if (!bookKey) {
+      return res.status(400).json({ error: 'bookKey query parameter is required' });
+    }
+    const buf = loadCloudPdfBuffer(userKey, bookKey);
+    if (!buf) {
+      return res.status(404).json({ error: 'PDF not found in cloud storage for this book' });
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Length', String(buf.byteLength));
+    return res.status(200).send(buf);
+  }
+
   if (pathname === 'sync' && req.method === 'POST') {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
     const booksInput = Array.isArray(body.books) ? body.books : [];
@@ -177,30 +278,80 @@ export default async function handler(req: any, res: any) {
     for (const b of booksInput.slice(0, 200)) {
       const bookKey = String(b.bookKey || b.title || `book_${nextBookId}`);
       const prev = bookMap.get(bookKey);
+
+      // Merge bookmarks from both previous cloud record and incoming book
+      const incomingBookmarks: PageBookmark[] = Array.isArray(b.bookmarks) ? b.bookmarks : [];
+      const prevBookmarks: PageBookmark[] = Array.isArray(prev?.bookmarks) ? prev.bookmarks : [];
+      const mergedBookmarksMap = new Map<number, PageBookmark>();
+      for (const bm of prevBookmarks) {
+        if (bm && typeof bm.page === 'number') mergedBookmarksMap.set(bm.page, bm);
+      }
+      for (const bm of incomingBookmarks) {
+        if (bm && typeof bm.page === 'number') mergedBookmarksMap.set(bm.page, bm);
+      }
+      const mergedBookmarks = Array.from(mergedBookmarksMap.values()).sort((a, c) => a.page - c.page);
+
+      // Merge highlights per page
+      const mergedHighlights: Record<number, PageHighlightStroke[]> = {
+        ...(prev?.highlights || {}),
+        ...(b.highlights && typeof b.highlights === 'object' ? b.highlights : {}),
+      };
+
+      const hasPdfInCloud = Boolean(
+        prev?.hasCloudPdf || loadCloudPdfBuffer(userKey, bookKey) !== null
+      );
+
       bookMap.set(bookKey, {
         id: prev ? prev.id : nextBookId++,
         bookKey,
-        title: String(b.title || 'Untitled'),
-        author: String(b.author || 'Unknown'),
-        category: String(b.category || 'reading'),
+        title: String(b.title || prev?.title || 'Untitled'),
+        author: String(b.author || prev?.author || 'Unknown'),
+        category: String(b.category || prev?.category || 'reading'),
         currentPage: Math.max(prev?.currentPage || 1, Number(b.currentPage) || 1),
-        totalPages: Math.max(1, Number(b.totalPages) || 1),
-        bookmarkCount: Number(b.bookmarkCount) || 0,
-        highlightCount: Number(b.highlightCount) || 0,
+        totalPages: Math.max(prev?.totalPages || 1, Number(b.totalPages) || 1),
+        bookmarkCount: Math.max(mergedBookmarks.length, Number(b.bookmarkCount) || 0),
+        highlightCount: Math.max(
+          Object.keys(mergedHighlights).filter(k => (mergedHighlights[Number(k)] || []).length > 0)
+            .length,
+          Number(b.highlightCount) || 0
+        ),
+        fileName: String(b.fileName || prev?.fileName || `${b.title || 'book'}.pdf`),
+        fileSize: Number(b.fileSize) || prev?.fileSize || 0,
+        spineColor: String(b.spineColor || prev?.spineColor || '#4A3525'),
+        spineTexture: (b.spineTexture || prev?.spineTexture || 'linen') as SpineTexture,
+        coverPattern: (b.coverPattern || prev?.coverPattern || 'minimal') as CoverPattern,
+        coverImage: b.coverImage || prev?.coverImage || undefined,
+        telegramChannel: b.telegramChannel || prev?.telegramChannel || undefined,
+        telegramMessageId: Number(b.telegramMessageId) || prev?.telegramMessageId || undefined,
+        bookmarks: mergedBookmarks,
+        highlights: mergedHighlights,
+        hasCloudPdf: hasPdfInCloud,
         updatedAt: nowIso,
       });
     }
 
     existingRecord.books = Array.from(bookMap.values());
-    existingRecord.notes = notesInput.slice(0, 250).map((n: Record<string, unknown>, idx: number) => ({
-      id: idx + 1,
-      noteKey: String(n.noteKey || `note_${idx + 1}`),
-      bookKey: String(n.bookKey || ''),
-      bookTitle: String(n.bookTitle || ''),
-      page: Number(n.page) || 1,
-      noteText: String(n.noteText || ''),
-      createdAt: nowIso,
-    }));
+
+    // Merge notes so syncing from an empty second device (like a PC) never wipes out notes created on the iPad
+    const noteMap = new Map<string, StoredCloudNote>();
+    for (const n of existingRecord.notes) {
+      noteMap.set(n.noteKey, n);
+    }
+    let nextNoteId = existingRecord.notes.length + 1;
+    for (const n of notesInput.slice(0, 250)) {
+      const noteKey = String(n.noteKey || `note_${nextNoteId}`);
+      const prevN = noteMap.get(noteKey);
+      noteMap.set(noteKey, {
+        id: prevN ? prevN.id : nextNoteId++,
+        noteKey,
+        bookKey: String(n.bookKey || prevN?.bookKey || ''),
+        bookTitle: String(n.bookTitle || prevN?.bookTitle || ''),
+        page: Number(n.page) || prevN?.page || 1,
+        noteText: String(n.noteText || prevN?.noteText || ''),
+        createdAt: prevN?.createdAt || nowIso,
+      });
+    }
+    existingRecord.notes = Array.from(noteMap.values());
 
     memoryCloudStore.set(userKey, existingRecord);
     saveFallbackStore();

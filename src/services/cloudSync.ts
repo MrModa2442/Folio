@@ -22,7 +22,14 @@ import {
   handleFirestoreError,
   OperationType,
 } from '../lib/firebase';
-import { Book } from '../types/library';
+import {
+  Book,
+  CoverPattern,
+  PageBookmark,
+  PageHighlightStroke,
+  SpineTexture,
+} from '../types/library';
+import { getPdfBlob } from './db';
 
 export function sanitizeFirestoreId(raw: string): string {
   const cleaned = (raw || 'item')
@@ -412,6 +419,17 @@ export interface CloudSqlSyncResponse {
     totalPages: number;
     bookmarkCount: number;
     highlightCount: number;
+    fileName?: string;
+    fileSize?: number;
+    spineColor?: string;
+    spineTexture?: SpineTexture;
+    coverPattern?: CoverPattern;
+    coverImage?: string;
+    telegramChannel?: string;
+    telegramMessageId?: number;
+    bookmarks?: PageBookmark[];
+    highlights?: Record<number, PageHighlightStroke[]>;
+    hasCloudPdf?: boolean;
     updatedAt: string;
   }>;
   notes: Array<{
@@ -436,6 +454,212 @@ export interface CloudSqlSyncResponse {
   }>;
 }
 
+const uploadedPdfBookKeys = new Set<string>();
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i += chunkSize) {
+    const sub = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, Array.from(sub));
+  }
+  return btoa(binary);
+}
+
+export async function uploadBookPdfToCloud(book: Book): Promise<boolean> {
+  const currentUser = getActiveCloudUser();
+  if (!currentUser) return false;
+
+  const bookKey = sanitizeFirestoreId(book.id || book.title);
+  if (uploadedPdfBookKeys.has(bookKey)) return true;
+
+  try {
+    const blob = await getPdfBlob(book.pdfBlobKey || book.id);
+    if (!blob || blob.size === 0 || blob.size > 16 * 1024 * 1024) {
+      return false;
+    }
+    const buffer = await blob.arrayBuffer();
+    const pdfBase64 = arrayBufferToBase64(buffer);
+    const authHeaders = await getCloudAuthHeaders();
+
+    const res = await fetch('/api/cloudsql/pdf', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders,
+      },
+      body: JSON.stringify({
+        bookKey,
+        pdfBase64,
+      }),
+    });
+    if (res.ok) {
+      uploadedPdfBookKeys.add(bookKey);
+      return true;
+    }
+  } catch {
+    // ignore background upload errors
+  }
+  return false;
+}
+
+export async function downloadBookPdfFromCloud(book: Book): Promise<Blob | null> {
+  const currentUser = getActiveCloudUser();
+  if (!currentUser) return null;
+
+  const candidateKeys = Array.from(
+    new Set([
+      sanitizeFirestoreId(book.id || book.title),
+      book.id,
+      book.pdfBlobKey || '',
+      sanitizeFirestoreId(book.title),
+    ])
+  ).filter(Boolean);
+
+  try {
+    const authHeaders = await getCloudAuthHeaders();
+    for (const key of candidateKeys) {
+      const res = await fetch(`/api/cloudsql/pdf?bookKey=${encodeURIComponent(key)}`, {
+        headers: {
+          ...authHeaders,
+        },
+      });
+      if (res.ok) {
+        const blob = await res.blob();
+        if (blob && blob.size > 100) {
+          return blob;
+        }
+      }
+    }
+  } catch {
+    // ignore download errors
+  }
+  return null;
+}
+
+export function mergeCloudLibraryIntoLocalBooks(
+  localBooks: Book[],
+  cloudData: CloudSqlSyncResponse
+): Book[] {
+  if (!cloudData || !Array.isArray(cloudData.books) || cloudData.books.length === 0) {
+    return localBooks;
+  }
+
+  // Group cloud notes by bookKey and lowercase title so any note is also restored as a bookmark
+  const notesByBookKey = new Map<string, PageBookmark[]>();
+  for (const n of cloudData.notes || []) {
+    const key = (n.bookKey || '').toLowerCase();
+    const list = notesByBookKey.get(key) || [];
+    list.push({
+      id: n.noteKey || `bm_${n.page}`,
+      page: Number(n.page) || 1,
+      note: n.noteText || '',
+      createdAt: n.createdAt || new Date().toISOString(),
+    });
+    notesByBookKey.set(key, list);
+  }
+
+  const result: Book[] = [...localBooks];
+  const matchedLocalIndices = new Set<number>();
+
+  for (const cb of cloudData.books) {
+    const cbKeyLower = (cb.bookKey || '').toLowerCase();
+    const cbTitleLower = (cb.title || '').trim().toLowerCase();
+
+    // Combine bookmarks from cb.bookmarks and cloudData.notes
+    const bmByPage = new Map<number, PageBookmark>();
+    for (const nBm of notesByBookKey.get(cbKeyLower) || []) {
+      bmByPage.set(nBm.page, nBm);
+    }
+    for (const cBm of cb.bookmarks || []) {
+      if (cBm && typeof cBm.page === 'number') {
+        bmByPage.set(cBm.page, cBm);
+      }
+    }
+
+    const existingIdx = result.findIndex((lb, idx) => {
+      if (matchedLocalIndices.has(idx)) return false;
+      const lbSafeKey = sanitizeFirestoreId(lb.id || lb.title).toLowerCase();
+      const lbIdLower = (lb.id || '').toLowerCase();
+      const lbTitleLower = (lb.title || '').trim().toLowerCase();
+      return (
+        lbSafeKey === cbKeyLower ||
+        lbIdLower === cbKeyLower ||
+        (cbTitleLower.length > 0 && lbTitleLower === cbTitleLower)
+      );
+    });
+
+    if (existingIdx >= 0) {
+      matchedLocalIndices.add(existingIdx);
+      const lb = result[existingIdx];
+
+      for (const localBm of lb.bookmarks || []) {
+        if (localBm && typeof localBm.page === 'number') {
+          const existingCloudBm = bmByPage.get(localBm.page);
+          if (!existingCloudBm || (localBm.note && !existingCloudBm.note)) {
+            bmByPage.set(localBm.page, localBm);
+          }
+        }
+      }
+      const mergedBookmarks = Array.from(bmByPage.values()).sort((a, b) => a.page - b.page);
+
+      const mergedHighlights: Record<number, PageHighlightStroke[]> = {
+        ...(cb.highlights || {}),
+        ...(lb.highlights || {}),
+      };
+
+      const mergedTotalPages = Math.max(lb.pageCount || 1, cb.totalPages || 1);
+      const mergedCurrentPage = Math.max(lb.currentPage || 1, cb.currentPage || 1);
+
+      result[existingIdx] = {
+        ...lb,
+        currentPage: mergedCurrentPage,
+        pageCount: mergedTotalPages,
+        status:
+          mergedCurrentPage >= mergedTotalPages && mergedTotalPages > 1
+            ? 'completed'
+            : 'reading',
+        coverImage: lb.coverImage || cb.coverImage,
+        telegramChannel: lb.telegramChannel || cb.telegramChannel,
+        telegramMessageId: lb.telegramMessageId || cb.telegramMessageId,
+        bookmarks: mergedBookmarks,
+        highlights: mergedHighlights,
+      };
+    } else {
+      // Book was synced from another device (e.g., imported on iPad and opened on PC) — add it to library!
+      const mergedBookmarks = Array.from(bmByPage.values()).sort((a, b) => a.page - b.page);
+      const totalPages = Math.max(1, cb.totalPages || 1);
+      const currentPage = Math.max(1, cb.currentPage || 1);
+      const dateStr = (cb.updatedAt || new Date().toISOString()).split('T')[0];
+
+      result.push({
+        id: cb.bookKey,
+        title: cb.title || 'Untitled Book',
+        author: cb.author || 'Unknown Author',
+        fileName: cb.fileName || `${cb.title || 'book'}.pdf`,
+        fileSize: cb.fileSize || 0,
+        pageCount: totalPages,
+        currentPage,
+        status: currentPage >= totalPages && totalPages > 1 ? 'completed' : 'reading',
+        spineColor: cb.spineColor || '#4A3525',
+        spineTexture: cb.spineTexture || 'linen',
+        coverPattern: cb.coverPattern || 'minimal',
+        coverImage: cb.coverImage,
+        dateAdded: dateStr,
+        lastRead: dateStr,
+        pdfBlobKey: cb.bookKey,
+        telegramChannel: cb.telegramChannel,
+        telegramMessageId: cb.telegramMessageId,
+        bookmarks: mergedBookmarks,
+        highlights: cb.highlights || {},
+      });
+    }
+  }
+
+  return result;
+}
+
 export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSyncResponse> {
   const currentUser = getActiveCloudUser();
   if (!currentUser) {
@@ -454,6 +678,16 @@ export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSync
     highlightCount: Object.values(b.highlights || {}).filter(
       arr => Array.isArray(arr) && arr.length > 0
     ).length,
+    fileName: b.fileName,
+    fileSize: b.fileSize,
+    spineColor: b.spineColor,
+    spineTexture: b.spineTexture,
+    coverPattern: b.coverPattern,
+    coverImage: b.coverImage,
+    telegramChannel: b.telegramChannel,
+    telegramMessageId: b.telegramMessageId,
+    bookmarks: b.bookmarks || [],
+    highlights: b.highlights || {},
   }));
 
   const notesPayload = books.flatMap(b =>
@@ -483,6 +717,12 @@ export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSync
   if (!res.ok) {
     throw new Error(data.error || 'Failed to sync with Cloud');
   }
+
+  // Trigger background upload of local PDF blobs so other devices can open the PDF
+  for (const b of books.slice(0, 15)) {
+    uploadBookPdfToCloud(b).catch(() => {});
+  }
+
   return data as CloudSqlSyncResponse;
 }
 

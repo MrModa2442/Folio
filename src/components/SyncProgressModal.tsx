@@ -34,13 +34,23 @@ interface SyncProgressModalProps {
   booklists: Booklist[];
   currentUser?: User | null;
   theme?: AppTheme;
+  onApplyCloudLibrary?: (cloudData: CloudSqlSyncResponse) => void;
   onApplySyncPayload: (payload: {
     booksProgress: Array<{
       id: string;
       title: string;
+      author?: string;
       currentPage: number;
       pageCount: number;
       status: Book['status'];
+      fileName?: string;
+      fileSize?: number;
+      spineColor?: string;
+      spineTexture?: Book['spineTexture'];
+      coverPattern?: Book['coverPattern'];
+      coverImage?: string;
+      telegramChannel?: string;
+      telegramMessageId?: number;
       bookmarks?: Book['bookmarks'];
       highlights?: Book['highlights'];
     }>;
@@ -73,6 +83,7 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
   booklists,
   currentUser = null,
   theme = 'spotify-dark',
+  onApplyCloudLibrary,
   onApplySyncPayload,
 }) => {
   const [activeTab, setActiveTab] = useState<'cloud' | 'export' | 'import'>('cloud');
@@ -91,7 +102,6 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
       return '';
     }
   });
-  const [showDirectEmailBox, setShowDirectEmailBox] = useState(false);
 
   const isDark = theme === 'spotify-dark';
   const isWarm = theme === 'warm-minimal';
@@ -137,7 +147,11 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
     let mounted = true;
     fetchCloudSqlLibrary()
       .then(res => {
-        if (mounted) setCloudData(res);
+        if (!mounted) return;
+        setCloudData(res);
+        if (res.books && res.books.length > 0) {
+          onApplyCloudLibrary?.(res);
+        }
       })
       .catch(() => {});
     return () => {
@@ -152,9 +166,17 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
       booksProgress: books.map(b => ({
         id: b.id,
         title: b.title,
+        author: b.author,
         currentPage: b.currentPage,
         pageCount: b.pageCount,
         status: b.status,
+        fileName: b.fileName,
+        fileSize: b.fileSize,
+        spineColor: b.spineColor,
+        spineTexture: b.spineTexture,
+        coverPattern: b.coverPattern,
+        telegramChannel: b.telegramChannel,
+        telegramMessageId: b.telegramMessageId,
         bookmarks: b.bookmarks,
         highlights: b.highlights,
       })),
@@ -223,46 +245,72 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
     const sqlSynced = await syncBooksWithCloudSql(books);
     setCloudData(sqlSynced);
     if (sqlSynced.books.length > 0) {
-      onApplySyncPayload({
-        booksProgress: sqlSynced.books.map(sb => ({
-          id: sb.bookKey,
-          title: sb.title,
-          currentPage: sb.currentPage,
-          pageCount: sb.totalPages,
-          status: sb.currentPage >= sb.totalPages ? 'completed' : 'reading',
-        })),
-      });
+      if (onApplyCloudLibrary) {
+        onApplyCloudLibrary(sqlSynced);
+      } else {
+        onApplySyncPayload({
+          booksProgress: sqlSynced.books.map(sb => ({
+            id: sb.bookKey,
+            title: sb.title,
+            author: sb.author,
+            currentPage: sb.currentPage,
+            pageCount: sb.totalPages,
+            status: sb.currentPage >= sb.totalPages && sb.totalPages > 1 ? 'completed' : 'reading',
+            fileName: sb.fileName,
+            fileSize: sb.fileSize,
+            spineColor: sb.spineColor,
+            spineTexture: sb.spineTexture,
+            coverPattern: sb.coverPattern,
+            coverImage: sb.coverImage,
+            telegramChannel: sb.telegramChannel,
+            telegramMessageId: sb.telegramMessageId,
+            bookmarks: sb.bookmarks,
+            highlights: sb.highlights,
+          })),
+        });
+      }
     }
     setStatusMessage(
-      `Signed in as ${user.displayName || user.email} and synced ${sqlSynced.books.length} books!`
+      `Signed in as ${user.email || user.displayName} — synced ${sqlSynced.books.length} ${
+        sqlSynced.books.length === 1 ? 'book' : 'books'
+      } & ${sqlSynced.notes.length} pinned ${sqlSynced.notes.length === 1 ? 'note' : 'notes'}!`
     );
   };
 
-  const handleGoogleSignIn = async () => {
+  const handleDirectEmailSignIn = async () => {
+    setErrorMessage(null);
+    setStatusMessage(null);
+    const cleanTypedEmail = googleEmailInput.trim().toLowerCase();
+    if (!cleanTypedEmail || !cleanTypedEmail.includes('@')) {
+      setErrorMessage('Please enter your Gmail / Google email address in the box above first.');
+      return;
+    }
+    setIsCloudWorking(true);
+    try {
+      // Sign in directly with the typed email — no popup window opened or closed!
+      const user = signInWithDirectGoogleEmail(cleanTypedEmail);
+      await completePostSignInSync(user);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'Sign-In failed.');
+    } finally {
+      setIsCloudWorking(false);
+    }
+  };
+
+  const handleGooglePopupSignIn = async () => {
     setErrorMessage(null);
     setStatusMessage(null);
     setIsCloudWorking(true);
     try {
-      const cleanTypedEmail = googleEmailInput.trim();
-      if (showDirectEmailBox && cleanTypedEmail) {
-        const user = signInWithDirectGoogleEmail(cleanTypedEmail);
-        await completePostSignInSync(user);
-        setShowDirectEmailBox(false);
-        return;
-      }
-
+      const cleanTypedEmail = googleEmailInput.trim().toLowerCase();
       const user = await signInWithGooglePopup(cleanTypedEmail || undefined);
       await completePostSignInSync(user);
-      setShowDirectEmailBox(false);
     } catch (err) {
-      const code = (err as { code?: string })?.code || '';
-      if (code === 'DIRECT_EMAIL_NEEDED') {
-        setShowDirectEmailBox(true);
-        setErrorMessage(null);
-      } else {
-        setShowDirectEmailBox(true);
-        setErrorMessage(err instanceof Error ? err.message : 'Google Sign-In failed.');
-      }
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : 'Google Popup was blocked on this domain. Enter your Gmail above and click Sign In with Email.'
+      );
     } finally {
       setIsCloudWorking(false);
     }
@@ -281,19 +329,36 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
       setCloudData(sqlSynced);
 
       if (sqlSynced.books.length > 0) {
-        onApplySyncPayload({
-          booksProgress: sqlSynced.books.map(sb => ({
-            id: sb.bookKey,
-            title: sb.title,
-            currentPage: sb.currentPage,
-            pageCount: sb.totalPages,
-            status: sb.currentPage >= sb.totalPages ? 'completed' : 'reading',
-          })),
-        });
+        if (onApplyCloudLibrary) {
+          onApplyCloudLibrary(sqlSynced);
+        } else {
+          onApplySyncPayload({
+            booksProgress: sqlSynced.books.map(sb => ({
+              id: sb.bookKey,
+              title: sb.title,
+              author: sb.author,
+              currentPage: sb.currentPage,
+              pageCount: sb.totalPages,
+              status: sb.currentPage >= sb.totalPages && sb.totalPages > 1 ? 'completed' : 'reading',
+              fileName: sb.fileName,
+              fileSize: sb.fileSize,
+              spineColor: sb.spineColor,
+              spineTexture: sb.spineTexture,
+              coverPattern: sb.coverPattern,
+              coverImage: sb.coverImage,
+              telegramChannel: sb.telegramChannel,
+              telegramMessageId: sb.telegramMessageId,
+              bookmarks: sb.bookmarks,
+              highlights: sb.highlights,
+            })),
+          });
+        }
       }
 
       setStatusMessage(
-        `Synced ${sqlSynced.books.length} books & ${sqlSynced.notes.length} pinned notes to Cloud!`
+        `Synced ${sqlSynced.books.length} ${
+          sqlSynced.books.length === 1 ? 'book' : 'books'
+        } & ${sqlSynced.notes.length} pinned ${sqlSynced.notes.length === 1 ? 'note' : 'notes'} with Cloud!`
       );
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Cloud sync failed.');
@@ -613,9 +678,7 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
 
                   <div className="text-left space-y-1.5 pt-1">
                     <label className={`block text-[11px] font-semibold ${mutedText}`}>
-                      {showDirectEmailBox
-                        ? 'Enter your Google Email to connect directly (VPN / iPad Safari compatible):'
-                        : 'Google Email (optional — used if VPN or Safari blocks popup):'}
+                      Enter your Google / Gmail address to sync across iPad, PC &amp; Phone:
                     </label>
                     <input
                       type="email"
@@ -624,7 +687,7 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
                       onKeyDown={e => {
                         if (e.key === 'Enter') {
                           e.preventDefault();
-                          handleGoogleSignIn();
+                          handleDirectEmailSignIn();
                         }
                       }}
                       placeholder="yourname@gmail.com"
@@ -635,17 +698,22 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
                   <button
                     type="button"
                     disabled={isCloudWorking}
-                    onClick={handleGoogleSignIn}
+                    onClick={handleDirectEmailSignIn}
                     className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all disabled:opacity-50 ${primaryBtn}`}
                   >
                     <UserCheck className="w-4 h-4" />
                     <span>
-                      {isCloudWorking
-                        ? 'Connecting...'
-                        : showDirectEmailBox
-                        ? 'Continue with Google Email'
-                        : 'Sign in with Google'}
+                      {isCloudWorking ? 'Syncing your library...' : 'Sign In & Sync with Gmail'}
                     </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isCloudWorking}
+                    onClick={handleGooglePopupSignIn}
+                    className={`w-full py-1.5 px-3 rounded-lg font-medium text-[11px] transition-colors ${mutedText} hover:opacity-100`}
+                  >
+                    Or sign in via Google OAuth Popup
                   </button>
                 </div>
               ) : (

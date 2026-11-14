@@ -138,7 +138,7 @@ export interface UiSectionPreferences {
 }
 
 export const DEFAULT_UI_PREFERENCES: UiSectionPreferences = {
-  showReadingTab: true,
+  showReadingTab: false,
   showFinishedTab: true,
   showNotesHub: true,
   showVocabularyHub: true,

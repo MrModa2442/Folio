@@ -51,6 +51,7 @@ import {
   syncBookToFirestore,
   syncBooksWithCloudSql,
   fetchCloudSqlLibrary,
+  mergeCloudLibraryIntoLocalBooks,
   sanitizeFirestoreId,
 } from './services/cloudSync';
 import {
@@ -184,27 +185,60 @@ export default function App() {
               const merged = mergeCloudVocabularyIntoLocal(res.vocabulary);
               setVocabulary(merged);
             }
+            if (res.books && res.books.length > 0) {
+              setBooks(prev => deduplicateBooks(mergeCloudLibraryIntoLocalBooks(prev, res)));
+            }
           })
           .catch(() => {});
 
         unsubFirestore = subscribeToFirestoreReadingProgress(user, progressDocs => {
           if (progressDocs.length === 0) return;
-          setBooks(prev =>
-            prev.map(b => {
-              const safeId = sanitizeFirestoreId(b.id || b.title);
-              const match = progressDocs.find(
-                d =>
-                  d.bookId === safeId ||
-                  d.title.toLowerCase() === b.title.toLowerCase()
+          setBooks(prev => {
+            const next = [...prev];
+            for (const docItem of progressDocs) {
+              const idx = next.findIndex(
+                b =>
+                  sanitizeFirestoreId(b.id || b.title) === docItem.bookId ||
+                  b.title.toLowerCase() === (docItem.title || '').toLowerCase()
               );
-              if (!match || match.currentPage <= b.currentPage) return b;
-              return {
-                ...b,
-                currentPage: match.currentPage,
-                status: match.currentPage >= b.pageCount ? 'completed' : b.status,
-              };
-            })
-          );
+              if (idx >= 0) {
+                if (docItem.currentPage > next[idx].currentPage) {
+                  next[idx] = {
+                    ...next[idx],
+                    currentPage: docItem.currentPage,
+                    pageCount: Math.max(next[idx].pageCount || 1, docItem.totalPages || 1),
+                    status:
+                      docItem.currentPage >= Math.max(next[idx].pageCount || 1, docItem.totalPages || 1)
+                        ? 'completed'
+                        : next[idx].status,
+                  };
+                }
+              } else if (docItem.title) {
+                const totalPages = Math.max(1, docItem.totalPages || 1);
+                const currentPage = Math.max(1, docItem.currentPage || 1);
+                const today = new Date().toISOString().split('T')[0];
+                next.push({
+                  id: docItem.bookId,
+                  title: docItem.title,
+                  author: docItem.author || 'Unknown Author',
+                  fileName: `${docItem.title}.pdf`,
+                  fileSize: 0,
+                  pageCount: totalPages,
+                  currentPage,
+                  status: currentPage >= totalPages && totalPages > 1 ? 'completed' : 'reading',
+                  spineColor: '#4A3525',
+                  spineTexture: 'linen',
+                  coverPattern: 'minimal',
+                  dateAdded: today,
+                  lastRead: today,
+                  pdfBlobKey: docItem.bookId,
+                  bookmarks: [],
+                  highlights: {},
+                });
+              }
+            }
+            return deduplicateBooks(next);
+          });
         });
       }
     });
@@ -234,7 +268,7 @@ export default function App() {
     if (!uiPreferences.showExploreTab && currentTab === 'explore') {
       setCurrentTab('library');
     }
-    if (!uiPreferences.showReadingTab && selectedStatus === 'reading') {
+    if (selectedStatus === 'reading') {
       setSelectedStatus('all');
     }
     if (!uiPreferences.showFinishedTab && selectedStatus === 'completed') {
@@ -879,26 +913,85 @@ export default function App() {
         booklists={booklists}
         currentUser={currentUser}
         theme={theme}
+        onApplyCloudLibrary={cloudData => {
+          if (cloudData.vocabulary && cloudData.vocabulary.length > 0) {
+            const mergedVocab = mergeCloudVocabularyIntoLocal(cloudData.vocabulary);
+            setVocabulary(mergedVocab);
+          }
+          setBooks(prev => {
+            const next = deduplicateBooks(mergeCloudLibraryIntoLocalBooks(prev, cloudData));
+            if (!activeReadingBook && next.length > 0) {
+              setActiveReadingBook(next[0]);
+            }
+            return next;
+          });
+        }}
         onApplySyncPayload={({ booksProgress, booklists: syncedLists }) => {
-          setBooks(prev =>
-            prev.map(book => {
-              const match = booksProgress.find(
-                p => p.id === book.id || p.title.toLowerCase() === book.title.toLowerCase()
+          setBooks(prev => {
+            const next = [...prev];
+            const today = new Date().toISOString().split('T')[0];
+
+            for (const item of booksProgress) {
+              const existingIdx = next.findIndex(
+                b =>
+                  b.id === item.id ||
+                  sanitizeFirestoreId(b.id || b.title) === sanitizeFirestoreId(item.id || item.title) ||
+                  b.title.toLowerCase() === (item.title || '').toLowerCase()
               );
-              if (!match) return book;
-              const mergedPage = Math.max(book.currentPage, match.currentPage || 1);
-              return {
-                ...book,
-                currentPage: mergedPage,
-                status: mergedPage >= book.pageCount ? 'completed' : match.status || book.status,
-                bookmarks: match.bookmarks && match.bookmarks.length > 0 ? match.bookmarks : book.bookmarks,
-                highlights:
-                  match.highlights && Object.keys(match.highlights).length > 0
-                    ? { ...(book.highlights || {}), ...match.highlights }
-                    : book.highlights,
-              };
-            })
-          );
+              if (existingIdx >= 0) {
+                const book = next[existingIdx];
+                const mergedTotal = Math.max(book.pageCount || 1, item.pageCount || 1);
+                const mergedPage = Math.max(book.currentPage || 1, item.currentPage || 1);
+                next[existingIdx] = {
+                  ...book,
+                  pageCount: mergedTotal,
+                  currentPage: mergedPage,
+                  status:
+                    mergedPage >= mergedTotal && mergedTotal > 1
+                      ? 'completed'
+                      : item.status || book.status,
+                  coverImage: book.coverImage || item.coverImage,
+                  telegramChannel: book.telegramChannel || item.telegramChannel,
+                  telegramMessageId: book.telegramMessageId || item.telegramMessageId,
+                  bookmarks:
+                    item.bookmarks && item.bookmarks.length > 0 ? item.bookmarks : book.bookmarks,
+                  highlights:
+                    item.highlights && Object.keys(item.highlights).length > 0
+                      ? { ...(book.highlights || {}), ...item.highlights }
+                      : book.highlights,
+                };
+              } else {
+                const totalPages = Math.max(1, item.pageCount || 1);
+                const currentPage = Math.max(1, item.currentPage || 1);
+                next.push({
+                  id: item.id || `sync_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                  title: sanitizeBookTitle(item.title || 'Untitled Book'),
+                  author: sanitizeBookAuthor(item.author || 'Unknown Author'),
+                  fileName: item.fileName || `${item.title || 'book'}.pdf`,
+                  fileSize: item.fileSize || 0,
+                  pageCount: totalPages,
+                  currentPage,
+                  status: currentPage >= totalPages && totalPages > 1 ? 'completed' : 'reading',
+                  spineColor: item.spineColor || '#4A3525',
+                  spineTexture: item.spineTexture || 'linen',
+                  coverPattern: item.coverPattern || 'minimal',
+                  coverImage: item.coverImage,
+                  dateAdded: today,
+                  lastRead: today,
+                  pdfBlobKey: item.id,
+                  telegramChannel: item.telegramChannel,
+                  telegramMessageId: item.telegramMessageId,
+                  bookmarks: item.bookmarks || [],
+                  highlights: item.highlights || {},
+                });
+              }
+            }
+            const deduped = deduplicateBooks(next);
+            if (!activeReadingBook && deduped.length > 0) {
+              setActiveReadingBook(deduped[0]);
+            }
+            return deduped;
+          });
           if (syncedLists && syncedLists.length > 0) {
             setBooklists(prev => {
               const existingIds = new Set(prev.map(l => l.id));

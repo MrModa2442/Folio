@@ -11,7 +11,6 @@ import {
   ListMusic,
   BookOpen,
   Compass,
-  Bookmark,
   CheckCircle2,
   Sparkles,
   PanelBottom,
@@ -79,7 +78,6 @@ export const CustomizeAppearanceModal: React.FC<CustomizeAppearanceModalProps> =
     !preferences.showPlaylistsSection;
 
   const isFullPreset =
-    preferences.showReadingTab &&
     preferences.showFinishedTab &&
     preferences.showNotesHub &&
     preferences.showVocabularyHub &&
@@ -91,7 +89,7 @@ export const CustomizeAppearanceModal: React.FC<CustomizeAppearanceModalProps> =
   const applyMinimalistPreset = () => {
     onChangePreferences({
       ...preferences,
-      showReadingTab: true,
+      showReadingTab: false,
       showFinishedTab: true,
       showNotesHub: false,
       showVocabularyHub: false,
@@ -129,12 +127,6 @@ export const CustomizeAppearanceModal: React.FC<CustomizeAppearanceModalProps> =
       label: 'Reading Playlists',
       description: 'Show custom booklists & collections in the lower sidebar',
       icon: <ListMusic className="w-4 h-4 text-emerald-400" />,
-    },
-    {
-      key: 'showReadingTab',
-      label: 'Reading Filter',
-      description: 'Quick sidebar filter for books currently in progress',
-      icon: <Bookmark className="w-4 h-4 text-amber-400" />,
     },
     {
       key: 'showFinishedTab',

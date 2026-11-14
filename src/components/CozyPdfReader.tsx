@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Book, PageBookmark, PageHighlightStroke } from '../types/library';
-import { getPdfBlob, createSamplePdfBlob } from '../services/db';
+import { getPdfBlob, storePdfBlob, createSamplePdfBlob } from '../services/db';
+import { downloadBookPdfFromCloud } from '../services/cloudSync';
 import { ambientSound } from '../services/ambientAudio';
 import { RealPdfViewer } from './RealPdfViewer';
 import { X, ChevronLeft, CloudRain, Flame, Building2, Check, BookOpen, Trash2 } from 'lucide-react';
@@ -28,14 +29,46 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
   const [isLoadingPdf, setIsLoadingPdf] = useState<boolean>(true);
   const [confirmRemove, setConfirmRemove] = useState<boolean>(false);
 
-  // Load PDF Blob as ArrayBuffer
+  // Load PDF Blob as ArrayBuffer (checking local IndexedDB -> Cloud Sync PDF -> Telegram Channel -> Fallback)
   useEffect(() => {
     let active = true;
 
     async function loadPdf() {
       setIsLoadingPdf(true);
       try {
-        let blob = book.pdfBlobKey ? await getPdfBlob(book.pdfBlobKey) : null;
+        const blobKey = book.pdfBlobKey || book.id;
+        let blob = blobKey ? await getPdfBlob(blobKey) : null;
+        if (!blob && book.id && book.id !== blobKey) {
+          blob = await getPdfBlob(book.id);
+        }
+
+        // 1. If book was synced from another device (e.g. iPad -> PC), download PDF from Cloud Sync store
+        if (!blob) {
+          const cloudBlob = await downloadBookPdfFromCloud(book);
+          if (cloudBlob) {
+            blob = cloudBlob;
+            await storePdfBlob(blobKey, cloudBlob).catch(() => {});
+          }
+        }
+
+        // 2. If book came from a Telegram catalog channel, fetch the original PDF from /api/telegram/download
+        if (!blob && book.telegramChannel && book.telegramMessageId) {
+          try {
+            const res = await fetch(
+              `/api/telegram/download?channel=${encodeURIComponent(book.telegramChannel)}&messageId=${book.telegramMessageId}`
+            );
+            if (res.ok) {
+              const tgBlob = await res.blob();
+              if (tgBlob && tgBlob.size > 100) {
+                blob = tgBlob;
+                await storePdfBlob(blobKey, tgBlob).catch(() => {});
+              }
+            }
+          } catch {
+            // ignore telegram download error
+          }
+        }
+
         if (!blob) {
           blob = createSamplePdfBlob(
             book.title,
@@ -62,7 +95,7 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
     return () => {
       active = false;
     };
-  }, [book.id, book.pdfBlobKey]);
+  }, [book.id, book.pdfBlobKey, book.telegramChannel, book.telegramMessageId]);
 
   const handleSoundToggle = (soundType: 'rain' | 'fireplace' | 'library') => {
     if (activeSound === soundType) {
