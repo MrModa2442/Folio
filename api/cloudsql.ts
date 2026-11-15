@@ -23,6 +23,10 @@ export interface StoredCloudBook {
   bookmarks?: PageBookmark[];
   highlights?: Record<number, PageHighlightStroke[]>;
   hasCloudPdf?: boolean;
+  pageOffset?: number;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  chapters?: any[];
+  chaptersLocked?: boolean;
   updatedAt: string;
 }
 
@@ -58,6 +62,7 @@ interface StoredUserCloudRecord {
   books: StoredCloudBook[];
   notes: StoredCloudNote[];
   vocabulary: StoredCloudVocab[];
+  deletedBookKeys?: string[];
 }
 
 const FALLBACK_STORE_PATHS = [
@@ -150,6 +155,36 @@ function loadCloudPdfBuffer(userKey: string, bookKey: string): Buffer | null {
   return null;
 }
 
+export function deleteCloudPdfBuffer(userKey: string, bookKey: string): void {
+  const key = makePdfCacheKey(userKey, bookKey);
+  memoryPdfStore.delete(key);
+  for (const dir of PDF_CACHE_DIRS) {
+    try {
+      const filePath = path.join(dir, `${key}.pdf`);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function normalizeComparisonKey(raw: string): string {
+  return String(raw || '')
+    .trim()
+    .toLowerCase();
+}
+
+function sanitizeComparisonKey(raw: string): string {
+  return String(raw || '')
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .slice(0, 120)
+    .toLowerCase();
+}
+
 function decodeJwtPayload(token: string): { sub?: string; user_id?: string; email?: string; name?: string } | null {
   try {
     const parts = token.split('.');
@@ -216,9 +251,21 @@ export default async function handler(req: any, res: any) {
     books: [],
     notes: [],
     vocabulary: [],
+    deletedBookKeys: [],
   };
+  if (!Array.isArray(existingRecord.deletedBookKeys)) {
+    existingRecord.deletedBookKeys = [];
+  }
 
   if (pathname === 'library' && req.method === 'GET') {
+    const deletedSet = new Set(existingRecord.deletedBookKeys.map(normalizeComparisonKey));
+    existingRecord.books = existingRecord.books.filter(
+      b =>
+        !deletedSet.has(normalizeComparisonKey(b.bookKey)) &&
+        !deletedSet.has(sanitizeComparisonKey(b.bookKey)) &&
+        !deletedSet.has(normalizeComparisonKey(b.title)) &&
+        !deletedSet.has(sanitizeComparisonKey(b.title))
+    );
     memoryCloudStore.set(userKey, existingRecord);
     return res.status(200).json(existingRecord);
   }
@@ -267,16 +314,76 @@ export default async function handler(req: any, res: any) {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
     const booksInput = Array.isArray(body.books) ? body.books : [];
     const notesInput = Array.isArray(body.notes) ? body.notes : [];
+    const deletedBookKeysInput: string[] = Array.isArray(body.deletedBookKeys)
+      ? body.deletedBookKeys.map(String)
+      : [];
+    const readdedBookKeysInput: string[] = Array.isArray(body.readdedBookKeys)
+      ? body.readdedBookKeys.map(String)
+      : [];
     const nowIso = new Date().toISOString();
+
+    const deletedSet = new Set<string>(
+      (existingRecord.deletedBookKeys || []).map(normalizeComparisonKey).filter(Boolean)
+    );
+    const readdedSet = new Set<string>();
+    for (const rk of readdedBookKeysInput) {
+      const n1 = normalizeComparisonKey(rk);
+      const n2 = sanitizeComparisonKey(rk);
+      if (n1) {
+        deletedSet.delete(n1);
+        readdedSet.add(n1);
+      }
+      if (n2) {
+        deletedSet.delete(n2);
+        readdedSet.add(n2);
+      }
+    }
+    for (const dk of deletedBookKeysInput) {
+      const n1 = normalizeComparisonKey(dk);
+      const n2 = sanitizeComparisonKey(dk);
+      if (n1 && !readdedSet.has(n1)) deletedSet.add(n1);
+      if (n2 && !readdedSet.has(n2)) deletedSet.add(n2);
+    }
+
+    const isBookKeyDeleted = (bookKey: string, title?: string): boolean => {
+      const k1 = normalizeComparisonKey(bookKey);
+      const k2 = sanitizeComparisonKey(bookKey);
+      const t1 = normalizeComparisonKey(title || '');
+      const t2 = sanitizeComparisonKey(title || '');
+      if (
+        (k1 && readdedSet.has(k1)) ||
+        (k2 && readdedSet.has(k2)) ||
+        (t1 && readdedSet.has(t1)) ||
+        (t2 && readdedSet.has(t2))
+      ) {
+        return false;
+      }
+      return Boolean(
+        (k1 && deletedSet.has(k1)) ||
+          (k2 && deletedSet.has(k2)) ||
+          (t1 && deletedSet.has(t1)) ||
+          (t2 && deletedSet.has(t2))
+      );
+    };
 
     const bookMap = new Map<string, StoredCloudBook>();
     for (const b of existingRecord.books) {
+      if (isBookKeyDeleted(b.bookKey, b.title)) {
+        deleteCloudPdfBuffer(userKey, b.bookKey);
+        continue;
+      }
       bookMap.set(b.bookKey, b);
     }
 
     let nextBookId = existingRecord.books.length + 1;
     for (const b of booksInput.slice(0, 200)) {
       const bookKey = String(b.bookKey || b.title || `book_${nextBookId}`);
+      const bookTitle = String(b.title || '');
+      if (isBookKeyDeleted(bookKey, bookTitle)) {
+        deleteCloudPdfBuffer(userKey, bookKey);
+        continue;
+      }
+
       const prev = bookMap.get(bookKey);
 
       // Merge bookmarks from both previous cloud record and incoming book
@@ -326,19 +433,33 @@ export default async function handler(req: any, res: any) {
         bookmarks: mergedBookmarks,
         highlights: mergedHighlights,
         hasCloudPdf: hasPdfInCloud,
+        pageOffset:
+          typeof b.pageOffset === 'number'
+            ? b.pageOffset
+            : typeof prev?.pageOffset === 'number'
+            ? prev.pageOffset
+            : undefined,
+        chapters: Array.isArray(b.chapters) && b.chapters.length > 0 ? b.chapters : prev?.chapters,
+        chaptersLocked:
+          typeof b.chaptersLocked === 'boolean' ? b.chaptersLocked : prev?.chaptersLocked,
         updatedAt: nowIso,
       });
     }
 
     existingRecord.books = Array.from(bookMap.values());
+    existingRecord.deletedBookKeys = Array.from(deletedSet);
 
-    // Merge notes so syncing from an empty second device (like a PC) never wipes out notes created on the iPad
+    // Merge notes while stripping notes belonging to deleted books
     const noteMap = new Map<string, StoredCloudNote>();
     for (const n of existingRecord.notes) {
+      if (isBookKeyDeleted(n.bookKey, n.bookTitle)) continue;
       noteMap.set(n.noteKey, n);
     }
     let nextNoteId = existingRecord.notes.length + 1;
     for (const n of notesInput.slice(0, 250)) {
+      const noteBookKey = String(n.bookKey || '');
+      const noteBookTitle = String(n.bookTitle || '');
+      if (isBookKeyDeleted(noteBookKey, noteBookTitle)) continue;
       const noteKey = String(n.noteKey || `note_${nextNoteId}`);
       const prevN = noteMap.get(noteKey);
       noteMap.set(noteKey, {

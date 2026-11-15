@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Book,
   Booklist,
@@ -50,9 +50,14 @@ import {
   subscribeToFirestoreReadingProgress,
   syncBookToFirestore,
   syncBooksWithCloudSql,
-  fetchCloudSqlLibrary,
   mergeCloudLibraryIntoLocalBooks,
   sanitizeFirestoreId,
+  isBookDeletedLocally,
+  markBookDeletedLocally,
+  markBookReaddedLocally,
+  deleteBookFromCloud,
+  getDeletedBookKeys,
+  CloudSqlSyncResponse,
 } from './services/cloudSync';
 import {
   loadSavedVocabulary,
@@ -73,6 +78,20 @@ const STORAGE_THEME_KEY = 'folio_theme_v3';
 const STORAGE_TG_CHANNEL_KEY = 'folio_tg_channel_v1';
 const STORAGE_TG_AUTOSYNC_KEY = 'folio_tg_autosync_v1';
 const STORAGE_UI_PREFS_KEY = 'folio_ui_prefs_v1';
+
+function computeLibrarySyncSignature(booksList: Book[]): string {
+  const booksPart = booksList
+    .map(b => {
+      const bmSig = (b.bookmarks || []).map(m => `${m.page}:${m.note || ''}`).join(',');
+      const hlSig = Object.entries(b.highlights || {})
+        .map(([pg, arr]) => `${pg}:${Array.isArray(arr) ? arr.length : 0}`)
+        .join(',');
+      return `${b.id}|${b.title}|${b.currentPage}/${b.pageCount}|${b.pageOffset ?? ''}|${bmSig}|${hlSig}`;
+    })
+    .join(';;');
+  const deletedPart = getDeletedBookKeys().sort().join(',');
+  return `${booksPart}##DEL:${deletedPart}`;
+}
 
 export default function App() {
   // Theme state: defaults to spotify-dark
@@ -96,16 +115,24 @@ export default function App() {
   });
 
   // Zero-state initialization: starts completely empty for first-time user
-  // Also sanitizes and deduplicates any previously stored books so duplicates, @handles, and channel names are removed
+  // Also sanitizes, deduplicates, and filters out any deleted books
   const [books, setBooks] = useState<Book[]>(() => {
     try {
       const stored = localStorage.getItem(STORAGE_BOOKS_KEY);
       const parsed: Book[] = stored ? JSON.parse(stored) : INITIAL_BOOKS;
-      return deduplicateBooks(parsed);
+      return deduplicateBooks(parsed.filter(b => !isBookDeletedLocally(b.id, b.title)));
     } catch {
       return INITIAL_BOOKS;
     }
   });
+
+  const booksRef = useRef<Book[]>(books);
+  useEffect(() => {
+    booksRef.current = books;
+  }, [books]);
+
+  const lastSyncedSignatureRef = useRef<string>('');
+  const isSyncingCloudRef = useRef<boolean>(false);
 
   const [booklists, setBooklists] = useState<Booklist[]>(() => {
     try {
@@ -161,6 +188,48 @@ export default function App() {
   const [autoSyncedNotice, setAutoSyncedNotice] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
 
+  const applyCloudResponseToState = useCallback((cloudData: CloudSqlSyncResponse) => {
+    if (cloudData.vocabulary && cloudData.vocabulary.length > 0) {
+      const mergedVocab = mergeCloudVocabularyIntoLocal(cloudData.vocabulary);
+      setVocabulary(mergedVocab);
+    }
+    setBooks(prev => {
+      const merged = deduplicateBooks(mergeCloudLibraryIntoLocalBooks(prev, cloudData));
+      lastSyncedSignatureRef.current = computeLibrarySyncSignature(merged);
+      booksRef.current = merged;
+      setActiveReadingBook(curr => {
+        if (curr && merged.some(b => b.id === curr.id)) {
+          return merged.find(b => b.id === curr.id) || curr;
+        }
+        return merged[0] || null;
+      });
+      return merged;
+    });
+  }, []);
+
+  const runAutomaticCloudSync = useCallback(
+    async (userOverride?: User | null, booksOverride?: Book[]) => {
+      const activeUser = userOverride ?? currentUser;
+      if (!activeUser || isSyncingCloudRef.current) return;
+      isSyncingCloudRef.current = true;
+      try {
+        const snapshotBooks = (booksOverride ?? booksRef.current).filter(
+          b => !isBookDeletedLocally(b.id, b.title)
+        );
+        for (const b of snapshotBooks.slice(0, 25)) {
+          syncBookToFirestore(activeUser, b).catch(() => {});
+        }
+        const syncedData = await syncBooksWithCloudSql(snapshotBooks);
+        applyCloudResponseToState(syncedData);
+      } catch {
+        // ignore transient network errors during background auto-sync
+      } finally {
+        isSyncingCloudRef.current = false;
+      }
+    },
+    [currentUser, applyCloudResponseToState]
+  );
+
   // Listen for local vocabulary updates (e.g. when looking up words inside the PDF reader)
   useEffect(() => {
     fetchTelegramStatus().catch(() => {});
@@ -169,7 +238,7 @@ export default function App() {
     });
   }, []);
 
-  // Firebase Auth listener + Real-time Firestore readingProgress subscription + Cloud SQL Vocabulary sync
+  // Firebase Auth listener + Immediate Automatic Two-Way Cloud Sync on Login + Real-time Firestore subscription
   useEffect(() => {
     let unsubFirestore: (() => void) | null = null;
     const unsubAuth = subscribeToAuthChanges(user => {
@@ -179,23 +248,17 @@ export default function App() {
         unsubFirestore = null;
       }
       if (user) {
-        fetchCloudSqlLibrary()
-          .then(res => {
-            if (res.vocabulary && res.vocabulary.length > 0) {
-              const merged = mergeCloudVocabularyIntoLocal(res.vocabulary);
-              setVocabulary(merged);
-            }
-            if (res.books && res.books.length > 0) {
-              setBooks(prev => deduplicateBooks(mergeCloudLibraryIntoLocalBooks(prev, res)));
-            }
-          })
-          .catch(() => {});
+        // Automatically perform full two-way sync immediately upon login or session restore
+        runAutomaticCloudSync(user, booksRef.current).catch(() => {});
 
         unsubFirestore = subscribeToFirestoreReadingProgress(user, progressDocs => {
           if (progressDocs.length === 0) return;
           setBooks(prev => {
-            const next = [...prev];
+            const next = prev.filter(b => !isBookDeletedLocally(b.id, b.title));
             for (const docItem of progressDocs) {
+              if (isBookDeletedLocally(docItem.bookId, docItem.title)) {
+                continue;
+              }
               const idx = next.findIndex(
                 b =>
                   sanitizeFirestoreId(b.id || b.title) === docItem.bookId ||
@@ -246,7 +309,47 @@ export default function App() {
       unsubAuth();
       if (unsubFirestore) unsubFirestore();
     };
-  }, []);
+  }, [runAutomaticCloudSync]);
+
+  // Automatic debounced cloud push whenever books or deletions change while signed in
+  useEffect(() => {
+    if (!currentUser) return;
+    const currentSig = computeLibrarySyncSignature(books);
+    if (currentSig === lastSyncedSignatureRef.current) return;
+
+    const timer = window.setTimeout(() => {
+      runAutomaticCloudSync(currentUser, booksRef.current).catch(() => {});
+    }, 900);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [books, currentUser, runAutomaticCloudSync]);
+
+  // Automatic background cloud sync on window focus, tab visibility change, and 25s interval
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const handleFocusOrVisible = () => {
+      if (document.visibilityState === 'visible') {
+        runAutomaticCloudSync(currentUser, booksRef.current).catch(() => {});
+      }
+    };
+
+    window.addEventListener('focus', handleFocusOrVisible);
+    document.addEventListener('visibilitychange', handleFocusOrVisible);
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        runAutomaticCloudSync(currentUser, booksRef.current).catch(() => {});
+      }
+    }, 25000);
+
+    return () => {
+      window.removeEventListener('focus', handleFocusOrVisible);
+      document.removeEventListener('visibilitychange', handleFocusOrVisible);
+      window.clearInterval(intervalId);
+    };
+  }, [currentUser, runAutomaticCloudSync]);
 
   // Sync to localStorage
   useEffect(() => {
@@ -321,6 +424,9 @@ export default function App() {
 
   // Handlers
   const handleSaveBook = (book: Book, targetListId?: string) => {
+    // Clear any prior deletion tombstone if the user is saving/importing this book
+    markBookReaddedLocally(book);
+
     // Immediately start reviewing & indexing all pages/words of the book in the background
     enqueueBookForBackgroundScan(book, true);
 
@@ -334,6 +440,7 @@ export default function App() {
             b.telegramChannel.toLowerCase() === book.telegramChannel.toLowerCase() &&
             b.telegramMessageId === book.telegramMessageId)
       );
+      let nextBooks: Book[];
       if (existing >= 0) {
         const copy = [...prev];
         copy[existing] = {
@@ -341,9 +448,12 @@ export default function App() {
           ...book,
           id: copy[existing].id,
         };
-        return deduplicateBooks(copy);
+        nextBooks = deduplicateBooks(copy);
+      } else {
+        nextBooks = deduplicateBooks([book, ...prev]);
       }
-      return deduplicateBooks([book, ...prev]);
+      booksRef.current = nextBooks;
+      return nextBooks;
     });
 
     if (!activeReadingBook || activeReadingBook.id === book.id) {
@@ -363,7 +473,9 @@ export default function App() {
 
     if (currentUser) {
       syncBookToFirestore(currentUser, book).catch(() => {});
-      syncBooksWithCloudSql([book, ...books.filter(b => b.id !== book.id)]).catch(() => {});
+      syncBooksWithCloudSql([book, ...booksRef.current.filter(b => b.id !== book.id)])
+        .then(res => applyCloudResponseToState(res))
+        .catch(() => {});
     }
   };
 
@@ -381,22 +493,55 @@ export default function App() {
   };
 
   const handleDeleteBook = (bookId: string) => {
-    const targetBook = books.find(b => b.id === bookId);
-    if (targetBook?.pdfBlobKey) {
+    const targetBook = booksRef.current.find(b => b.id === bookId) ||
+      books.find(b => b.id === bookId) || {
+        id: bookId,
+        title: bookId,
+        author: 'Unknown',
+        fileName: `${bookId}.pdf`,
+        fileSize: 0,
+        pageCount: 1,
+        currentPage: 1,
+        status: 'reading' as const,
+        spineColor: '#4A3525',
+        spineTexture: 'linen' as const,
+        coverPattern: 'minimal' as const,
+        dateAdded: '',
+        lastRead: '',
+      };
+
+    // Record permanent deletion tombstone so cloud sync never resurrects this book
+    markBookDeletedLocally(targetBook);
+
+    if (targetBook.pdfBlobKey) {
       deletePdfBlob(targetBook.pdfBlobKey).catch(() => {});
     }
     deletePdfBlob(bookId).catch(() => {});
 
-    setBooks(prev => prev.filter(b => b.id !== bookId));
+    const remainingBooks = booksRef.current.filter(
+      b => b.id !== bookId && !isBookDeletedLocally(b.id, b.title)
+    );
+    booksRef.current = remainingBooks;
+    setBooks(remainingBooks);
+
     setBooklists(prev =>
       prev.map(l => ({ ...l, bookIds: l.bookIds.filter(id => id !== bookId) }))
     );
     if (activeReadingBook?.id === bookId) {
-      setActiveReadingBook(null);
+      setActiveReadingBook(remainingBooks[0] || null);
     }
     if (fullscreenReaderBook?.id === bookId) {
       setFullscreenReaderBook(null);
     }
+
+    // Immediately propagate deletion to Cloud SQL and Firestore
+    deleteBookFromCloud(currentUser, targetBook, remainingBooks)
+      .then(res => {
+        if (res) {
+          applyCloudResponseToState(res);
+        }
+      })
+      .catch(() => {});
   };
 
   const handleRemoveFromList = (bookId: string) => {
@@ -912,19 +1057,7 @@ export default function App() {
         booklists={booklists}
         currentUser={currentUser}
         theme={theme}
-        onApplyCloudLibrary={cloudData => {
-          if (cloudData.vocabulary && cloudData.vocabulary.length > 0) {
-            const mergedVocab = mergeCloudVocabularyIntoLocal(cloudData.vocabulary);
-            setVocabulary(mergedVocab);
-          }
-          setBooks(prev => {
-            const next = deduplicateBooks(mergeCloudLibraryIntoLocalBooks(prev, cloudData));
-            if (!activeReadingBook && next.length > 0) {
-              setActiveReadingBook(next[0]);
-            }
-            return next;
-          });
-        }}
+        onApplyCloudLibrary={applyCloudResponseToState}
         onApplySyncPayload={({ booksProgress, booklists: syncedLists }) => {
           setBooks(prev => {
             const next = [...prev];

@@ -51,6 +51,12 @@ export interface SyncBookInput {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   highlights?: Record<number, any[]>;
   hasCloudPdf?: boolean;
+  pageOffset?: number;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  chapters?: any[];
+  chaptersLocked?: boolean;
+  deleted?: boolean;
+  deletedAt?: string;
 }
 
 export interface SyncNoteInput {
@@ -61,7 +67,34 @@ export interface SyncNoteInput {
   noteText: string;
 }
 
-function packBookMetadata(b: SyncBookInput, prevMeta: Partial<SyncBookInput> = {}): string {
+function normalizeBookKey(raw: string): string {
+  return String(raw || '')
+    .trim()
+    .toLowerCase();
+}
+
+function sanitizeBookKey(raw: string): string {
+  return String(raw || '')
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .slice(0, 120)
+    .toLowerCase();
+}
+
+function packBookMetadata(
+  b: SyncBookInput,
+  prevMeta: Partial<SyncBookInput> = {},
+  isDeleted = false
+): string {
+  if (isDeleted) {
+    return JSON.stringify({
+      status: '__deleted__',
+      deleted: true,
+      deletedAt: new Date().toISOString(),
+    });
+  }
+
   const incomingBookmarks = Array.isArray(b.bookmarks) ? b.bookmarks : [];
   const prevBookmarks = Array.isArray(prevMeta.bookmarks) ? prevMeta.bookmarks : [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -80,7 +113,13 @@ function packBookMetadata(b: SyncBookInput, prevMeta: Partial<SyncBookInput> = {
   };
 
   return JSON.stringify({
-    status: b.category && !b.category.startsWith('{') ? b.category : prevMeta.category || 'reading',
+    status:
+      b.category && !b.category.startsWith('{') && b.category !== '__deleted__'
+        ? b.category
+        : prevMeta.category && prevMeta.category !== '__deleted__'
+        ? prevMeta.category
+        : 'reading',
+    deleted: false,
     fileName: b.fileName || prevMeta.fileName,
     fileSize: b.fileSize || prevMeta.fileSize,
     spineColor: b.spineColor || prevMeta.spineColor,
@@ -92,6 +131,16 @@ function packBookMetadata(b: SyncBookInput, prevMeta: Partial<SyncBookInput> = {
     bookmarks: mergedBookmarks,
     highlights: mergedHighlights,
     hasCloudPdf: Boolean(b.hasCloudPdf || prevMeta.hasCloudPdf),
+    pageOffset:
+      typeof b.pageOffset === 'number'
+        ? b.pageOffset
+        : typeof prevMeta.pageOffset === 'number'
+        ? prevMeta.pageOffset
+        : undefined,
+    chapters:
+      Array.isArray(b.chapters) && b.chapters.length > 0 ? b.chapters : prevMeta.chapters,
+    chaptersLocked:
+      typeof b.chaptersLocked === 'boolean' ? b.chaptersLocked : prevMeta.chaptersLocked,
   });
 }
 
@@ -107,9 +156,12 @@ function unpackBookRow(row: typeof sqlBooks.$inferSelect) {
       cleanCategory = 'reading';
     }
   }
+  const isDeleted = Boolean(meta.deleted || cleanCategory === '__deleted__');
   return {
     ...row,
     category: cleanCategory,
+    deleted: isDeleted,
+    deletedAt: meta.deletedAt,
     fileName: meta.fileName,
     fileSize: meta.fileSize,
     spineColor: meta.spineColor,
@@ -121,6 +173,9 @@ function unpackBookRow(row: typeof sqlBooks.$inferSelect) {
     bookmarks: Array.isArray(meta.bookmarks) ? meta.bookmarks : [],
     highlights: meta.highlights && typeof meta.highlights === 'object' ? meta.highlights : {},
     hasCloudPdf: Boolean(meta.hasCloudPdf),
+    pageOffset: typeof meta.pageOffset === 'number' ? meta.pageOffset : undefined,
+    chapters: Array.isArray(meta.chapters) ? meta.chapters : undefined,
+    chaptersLocked: typeof meta.chaptersLocked === 'boolean' ? meta.chaptersLocked : undefined,
   };
 }
 
@@ -129,13 +184,140 @@ export async function syncUserLibraryToSql(
   email: string,
   displayName: string,
   booksInput: SyncBookInput[],
-  notesInput: SyncNoteInput[]
+  notesInput: SyncNoteInput[],
+  deletedBookKeysInput: string[] = [],
+  readdedBookKeysInput: string[] = []
 ) {
   try {
     const userRecord = await getOrCreateUser(uid, email, displayName);
 
-    // Replace or update books for this user (non-destructive merge)
+    const existingRows = await db
+      .select()
+      .from(sqlBooks)
+      .where(eq(sqlBooks.userId, userRecord.id));
+
+    const deletedSet = new Set<string>();
+    const readdedSet = new Set<string>();
+
+    for (const rk of readdedBookKeysInput) {
+      const k1 = normalizeBookKey(rk);
+      const k2 = sanitizeBookKey(rk);
+      if (k1) readdedSet.add(k1);
+      if (k2) readdedSet.add(k2);
+    }
+
+    for (const row of existingRows) {
+      const unpacked = unpackBookRow(row);
+      if (unpacked.deleted) {
+        const k1 = normalizeBookKey(row.bookKey);
+        const k2 = sanitizeBookKey(row.bookKey);
+        const t1 = normalizeBookKey(row.title);
+        const t2 = sanitizeBookKey(row.title);
+        if (k1 && !readdedSet.has(k1)) deletedSet.add(k1);
+        if (k2 && !readdedSet.has(k2)) deletedSet.add(k2);
+        if (t1 && !readdedSet.has(t1)) deletedSet.add(t1);
+        if (t2 && !readdedSet.has(t2)) deletedSet.add(t2);
+      }
+    }
+
+    for (const dk of deletedBookKeysInput) {
+      const k1 = normalizeBookKey(dk);
+      const k2 = sanitizeBookKey(dk);
+      if (k1 && !readdedSet.has(k1)) deletedSet.add(k1);
+      if (k2 && !readdedSet.has(k2)) deletedSet.add(k2);
+    }
+
+    const isBookDeleted = (bookKey: string, title?: string): boolean => {
+      const k1 = normalizeBookKey(bookKey);
+      const k2 = sanitizeBookKey(bookKey);
+      const t1 = normalizeBookKey(title || '');
+      const t2 = sanitizeBookKey(title || '');
+      if (
+        (k1 && readdedSet.has(k1)) ||
+        (k2 && readdedSet.has(k2)) ||
+        (t1 && readdedSet.has(t1)) ||
+        (t2 && readdedSet.has(t2))
+      ) {
+        return false;
+      }
+      return Boolean(
+        (k1 && deletedSet.has(k1)) ||
+          (k2 && deletedSet.has(k2)) ||
+          (t1 && deletedSet.has(t1)) ||
+          (t2 && deletedSet.has(t2))
+      );
+    };
+
+    // Mark any deleted existing books as tombstones in sqlBooks and delete their notes
+    for (const row of existingRows) {
+      const unpacked = unpackBookRow(row);
+      if (isBookDeleted(row.bookKey, row.title)) {
+        if (!unpacked.deleted) {
+          await db
+            .update(sqlBooks)
+            .set({
+              category: packBookMetadata(
+                {
+                  bookKey: row.bookKey,
+                  title: row.title,
+                  author: row.author,
+                  category: '__deleted__',
+                  currentPage: row.currentPage,
+                  totalPages: row.totalPages,
+                  bookmarkCount: 0,
+                  highlightCount: 0,
+                },
+                {},
+                true
+              ),
+              bookmarkCount: 0,
+              highlightCount: 0,
+              updatedAt: new Date(),
+            })
+            .where(eq(sqlBooks.id, row.id));
+        }
+        await db
+          .delete(sqlNotes)
+          .where(and(eq(sqlNotes.userId, userRecord.id), eq(sqlNotes.bookKey, row.bookKey)));
+      }
+    }
+
+    // Also insert tombstones for newly deleted bookKeys that weren't in existingRows yet
+    for (const dk of deletedBookKeysInput.slice(0, 100)) {
+      const cleanKey = sanitizeBookKey(dk) || normalizeBookKey(dk);
+      if (!cleanKey || readdedSet.has(cleanKey)) continue;
+      const alreadyInRows = existingRows.some(
+        r =>
+          normalizeBookKey(r.bookKey) === cleanKey ||
+          sanitizeBookKey(r.bookKey) === cleanKey ||
+          normalizeBookKey(r.title) === cleanKey ||
+          sanitizeBookKey(r.title) === cleanKey
+      );
+      if (!alreadyInRows) {
+        await db.insert(sqlBooks).values({
+          userId: userRecord.id,
+          bookKey: cleanKey,
+          title: dk.slice(0, 200),
+          author: 'Deleted',
+          category: JSON.stringify({
+            status: '__deleted__',
+            deleted: true,
+            deletedAt: new Date().toISOString(),
+          }),
+          currentPage: 1,
+          totalPages: 1,
+          bookmarkCount: 0,
+          highlightCount: 0,
+        });
+      }
+    }
+
+    // Replace or update active books for this user (non-destructive merge for non-deleted books)
     for (const b of booksInput.slice(0, 150)) {
+      if (isBookDeleted(b.bookKey, b.title)) {
+        continue;
+      }
+
       const existing = await db
         .select()
         .from(sqlBooks)
@@ -143,22 +325,34 @@ export async function syncUserLibraryToSql(
 
       if (existing.length > 0) {
         const prevUnpacked = unpackBookRow(existing[0]);
-        const packedCategory = packBookMetadata(b, prevUnpacked);
+        const packedCategory = packBookMetadata(
+          b,
+          prevUnpacked.deleted ? {} : prevUnpacked,
+          false
+        );
         await db
           .update(sqlBooks)
           .set({
             title: b.title || existing[0].title,
             author: b.author || existing[0].author,
             category: packedCategory,
-            currentPage: Math.max(existing[0].currentPage || 1, b.currentPage || 1),
-            totalPages: Math.max(existing[0].totalPages || 1, b.totalPages || 1),
-            bookmarkCount: Math.max(existing[0].bookmarkCount || 0, b.bookmarkCount || 0),
-            highlightCount: Math.max(existing[0].highlightCount || 0, b.highlightCount || 0),
+            currentPage: prevUnpacked.deleted
+              ? b.currentPage || 1
+              : Math.max(existing[0].currentPage || 1, b.currentPage || 1),
+            totalPages: prevUnpacked.deleted
+              ? b.totalPages || 1
+              : Math.max(existing[0].totalPages || 1, b.totalPages || 1),
+            bookmarkCount: prevUnpacked.deleted
+              ? b.bookmarkCount || 0
+              : Math.max(existing[0].bookmarkCount || 0, b.bookmarkCount || 0),
+            highlightCount: prevUnpacked.deleted
+              ? b.highlightCount || 0
+              : Math.max(existing[0].highlightCount || 0, b.highlightCount || 0),
             updatedAt: new Date(),
           })
           .where(eq(sqlBooks.id, existing[0].id));
       } else {
-        const packedCategory = packBookMetadata(b);
+        const packedCategory = packBookMetadata(b, {}, false);
         await db.insert(sqlBooks).values({
           userId: userRecord.id,
           bookKey: b.bookKey,
@@ -173,7 +367,7 @@ export async function syncUserLibraryToSql(
       }
     }
 
-    // Merge study notes for this user (never wipe existing notes when syncing from a 0-book second device)
+    // Merge study notes for this user (skipping notes for deleted books)
     if (notesInput.length > 0) {
       const existingNotes = await db
         .select()
@@ -182,7 +376,9 @@ export async function syncUserLibraryToSql(
       const existingNoteKeys = new Set(existingNotes.map(n => n.noteKey));
       const newNotes = notesInput
         .slice(0, 250)
-        .filter(n => !existingNoteKeys.has(n.noteKey));
+        .filter(
+          n => !existingNoteKeys.has(n.noteKey) && !isBookDeleted(n.bookKey, n.bookTitle)
+        );
 
       if (newNotes.length > 0) {
         await db.insert(sqlNotes).values(
@@ -227,11 +423,36 @@ export async function getUserLibraryFromSql(uid: string, email: string, displayN
         .orderBy(desc(sqlVocabulary.createdAt)),
     ]);
 
+    const unpackedAll = booksRows.map(unpackBookRow);
+    const activeBooks = unpackedAll.filter(b => !b.deleted);
+    const deletedBookKeys = Array.from(
+      new Set(
+        unpackedAll
+          .filter(b => b.deleted)
+          .flatMap(b => [
+            normalizeBookKey(b.bookKey),
+            sanitizeBookKey(b.bookKey),
+            normalizeBookKey(b.title),
+            sanitizeBookKey(b.title),
+          ])
+          .filter(Boolean)
+      )
+    );
+    const deletedSet = new Set(deletedBookKeys);
+    const activeNotes = notesRows.filter(
+      n =>
+        !deletedSet.has(normalizeBookKey(n.bookKey)) &&
+        !deletedSet.has(sanitizeBookKey(n.bookKey)) &&
+        !deletedSet.has(normalizeBookKey(n.bookTitle)) &&
+        !deletedSet.has(sanitizeBookKey(n.bookTitle))
+    );
+
     return {
       user: userRecord,
-      books: booksRows.map(unpackBookRow),
-      notes: notesRows,
+      books: activeBooks,
+      notes: activeNotes,
       vocabulary: vocabRows,
+      deletedBookKeys,
     };
   } catch (error) {
     console.error('Database query failed in getUserLibraryFromSql:', error);

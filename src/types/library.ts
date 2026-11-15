@@ -4,6 +4,14 @@ export type SpineTexture = 'linen' | 'leather' | 'cloth' | 'smooth';
 
 export type CoverPattern = 'minimal' | 'botanical' | 'geometric' | 'classical' | 'embossed';
 
+export interface BookChapter {
+  title: string;
+  startPage: number;
+  endPage: number;
+  printedStartPage?: number;
+  printedEndPage?: number;
+}
+
 export interface Book {
   id: string;
   title: string;
@@ -26,6 +34,9 @@ export interface Book {
   coverImage?: string;
   bookmarks?: PageBookmark[];
   highlights?: Record<number, PageHighlightStroke[]>;
+  pageOffset?: number;
+  chapters?: BookChapter[];
+  chaptersLocked?: boolean;
 }
 
 export interface PageBookmark {

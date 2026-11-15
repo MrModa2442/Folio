@@ -8,7 +8,7 @@ import telegramHandler, { normalizeTelegramChannel } from './api/telegram.js';
 import ocrHandler from './api/ocr.js';
 import dictionaryHandler from './api/dictionary.js';
 import chaptersHandler from './api/chapters.js';
-import cloudsqlHandler from './api/cloudsql.js';
+import cloudsqlHandler, { deleteCloudPdfBuffer } from './api/cloudsql.js';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
 import {
   getUserLibraryFromSql,
@@ -75,7 +75,27 @@ async function startServer() {
         String(req.body?.displayName || req.user?.name || email.split('@')[0] || 'Reader');
       const booksInput = Array.isArray(req.body?.books) ? req.body.books : [];
       const notesInput = Array.isArray(req.body?.notes) ? req.body.notes : [];
-      const data = await syncUserLibraryToSql(uid, email, displayName, booksInput, notesInput);
+      const deletedBookKeys = Array.isArray(req.body?.deletedBookKeys)
+        ? req.body.deletedBookKeys.map(String)
+        : [];
+      const readdedBookKeys = Array.isArray(req.body?.readdedBookKeys)
+        ? req.body.readdedBookKeys.map(String)
+        : [];
+
+      const userKey = (email || uid).trim().toLowerCase();
+      for (const dk of deletedBookKeys) {
+        deleteCloudPdfBuffer(userKey, dk);
+      }
+
+      const data = await syncUserLibraryToSql(
+        uid,
+        email,
+        displayName,
+        booksInput,
+        notesInput,
+        deletedBookKeys,
+        readdedBookKeys
+      );
       res.json(data);
     } catch (error) {
       console.warn('Cloud SQL sync fallback to local cloud store:', error);

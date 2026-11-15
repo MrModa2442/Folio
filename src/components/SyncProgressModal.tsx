@@ -145,15 +145,25 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
   useEffect(() => {
     if (!isOpen || !currentUser) return;
     let mounted = true;
-    fetchCloudSqlLibrary()
+    setIsCloudWorking(true);
+    syncBooksWithCloudSql(books)
       .then(res => {
         if (!mounted) return;
         setCloudData(res);
-        if (res.books && res.books.length > 0) {
-          onApplyCloudLibrary?.(res);
-        }
+        onApplyCloudLibrary?.(res);
       })
-      .catch(() => {});
+      .catch(() => {
+        fetchCloudSqlLibrary()
+          .then(res => {
+            if (!mounted) return;
+            setCloudData(res);
+            onApplyCloudLibrary?.(res);
+          })
+          .catch(() => {});
+      })
+      .finally(() => {
+        if (mounted) setIsCloudWorking(false);
+      });
     return () => {
       mounted = false;
     };
@@ -244,36 +254,34 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
     }
     const sqlSynced = await syncBooksWithCloudSql(books);
     setCloudData(sqlSynced);
-    if (sqlSynced.books.length > 0) {
-      if (onApplyCloudLibrary) {
-        onApplyCloudLibrary(sqlSynced);
-      } else {
-        onApplySyncPayload({
-          booksProgress: sqlSynced.books.map(sb => ({
-            id: sb.bookKey,
-            title: sb.title,
-            author: sb.author,
-            currentPage: sb.currentPage,
-            pageCount: sb.totalPages,
-            status: sb.currentPage >= sb.totalPages && sb.totalPages > 1 ? 'completed' : 'reading',
-            fileName: sb.fileName,
-            fileSize: sb.fileSize,
-            spineColor: sb.spineColor,
-            spineTexture: sb.spineTexture,
-            coverPattern: sb.coverPattern,
-            coverImage: sb.coverImage,
-            telegramChannel: sb.telegramChannel,
-            telegramMessageId: sb.telegramMessageId,
-            bookmarks: sb.bookmarks,
-            highlights: sb.highlights,
-          })),
-        });
-      }
+    if (onApplyCloudLibrary) {
+      onApplyCloudLibrary(sqlSynced);
+    } else if (sqlSynced.books.length > 0) {
+      onApplySyncPayload({
+        booksProgress: sqlSynced.books.map(sb => ({
+          id: sb.bookKey,
+          title: sb.title,
+          author: sb.author,
+          currentPage: sb.currentPage,
+          pageCount: sb.totalPages,
+          status: sb.currentPage >= sb.totalPages && sb.totalPages > 1 ? 'completed' : 'reading',
+          fileName: sb.fileName,
+          fileSize: sb.fileSize,
+          spineColor: sb.spineColor,
+          spineTexture: sb.spineTexture,
+          coverPattern: sb.coverPattern,
+          coverImage: sb.coverImage,
+          telegramChannel: sb.telegramChannel,
+          telegramMessageId: sb.telegramMessageId,
+          bookmarks: sb.bookmarks,
+          highlights: sb.highlights,
+        })),
+      });
     }
     setStatusMessage(
-      `Signed in as ${user.email || user.displayName} — synced ${sqlSynced.books.length} ${
+      `Signed in as ${user.email || user.displayName} — Auto-Sync is now active (${sqlSynced.books.length} ${
         sqlSynced.books.length === 1 ? 'book' : 'books'
-      } & ${sqlSynced.notes.length} pinned ${sqlSynced.notes.length === 1 ? 'note' : 'notes'}!`
+      } synced automatically)!`
     );
   };
 
@@ -328,37 +336,35 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
       const sqlSynced = await syncBooksWithCloudSql(books);
       setCloudData(sqlSynced);
 
-      if (sqlSynced.books.length > 0) {
-        if (onApplyCloudLibrary) {
-          onApplyCloudLibrary(sqlSynced);
-        } else {
-          onApplySyncPayload({
-            booksProgress: sqlSynced.books.map(sb => ({
-              id: sb.bookKey,
-              title: sb.title,
-              author: sb.author,
-              currentPage: sb.currentPage,
-              pageCount: sb.totalPages,
-              status: sb.currentPage >= sb.totalPages && sb.totalPages > 1 ? 'completed' : 'reading',
-              fileName: sb.fileName,
-              fileSize: sb.fileSize,
-              spineColor: sb.spineColor,
-              spineTexture: sb.spineTexture,
-              coverPattern: sb.coverPattern,
-              coverImage: sb.coverImage,
-              telegramChannel: sb.telegramChannel,
-              telegramMessageId: sb.telegramMessageId,
-              bookmarks: sb.bookmarks,
-              highlights: sb.highlights,
-            })),
-          });
-        }
+      if (onApplyCloudLibrary) {
+        onApplyCloudLibrary(sqlSynced);
+      } else if (sqlSynced.books.length > 0) {
+        onApplySyncPayload({
+          booksProgress: sqlSynced.books.map(sb => ({
+            id: sb.bookKey,
+            title: sb.title,
+            author: sb.author,
+            currentPage: sb.currentPage,
+            pageCount: sb.totalPages,
+            status: sb.currentPage >= sb.totalPages && sb.totalPages > 1 ? 'completed' : 'reading',
+            fileName: sb.fileName,
+            fileSize: sb.fileSize,
+            spineColor: sb.spineColor,
+            spineTexture: sb.spineTexture,
+            coverPattern: sb.coverPattern,
+            coverImage: sb.coverImage,
+            telegramChannel: sb.telegramChannel,
+            telegramMessageId: sb.telegramMessageId,
+            bookmarks: sb.bookmarks,
+            highlights: sb.highlights,
+          })),
+        });
       }
 
       setStatusMessage(
-        `Synced ${sqlSynced.books.length} ${
+        `Library verified & synced (${sqlSynced.books.length} ${
           sqlSynced.books.length === 1 ? 'book' : 'books'
-        } & ${sqlSynced.notes.length} pinned ${sqlSynced.notes.length === 1 ? 'note' : 'notes'} with Cloud!`
+        }, ${sqlSynced.notes.length} pinned ${sqlSynced.notes.length === 1 ? 'note' : 'notes'})!`
       );
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Cloud sync failed.');
@@ -753,6 +759,15 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
                     </button>
                   </div>
 
+                  <div className="flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                      <span className="font-semibold text-emerald-500 truncate">
+                        Auto-Sync Active — books, notes &amp; deletions sync automatically
+                      </span>
+                    </div>
+                  </div>
+
                   {cloudData && (
                     <div className="grid grid-cols-3 gap-2 text-center">
                       <div className={`p-2.5 rounded-lg border ${innerCard}`}>
@@ -778,11 +793,11 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
                     type="button"
                     disabled={isCloudWorking}
                     onClick={handleCloudSyncNow}
-                    className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all disabled:opacity-50 ${primaryBtn}`}
+                    className={`w-full py-2 px-4 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 transition-all disabled:opacity-50 border ${innerCard} hover:opacity-90`}
                   >
-                    <RefreshCw className={`w-4 h-4 ${isCloudWorking ? 'animate-spin' : ''}`} />
+                    <RefreshCw className={`w-3.5 h-3.5 ${isCloudWorking ? 'animate-spin' : ''}`} />
                     <span>
-                      {isCloudWorking ? 'Syncing with Cloud...' : 'Sync Library & Notes Now'}
+                      {isCloudWorking ? 'Auto-Syncing with Cloud...' : 'Verify & Refresh Cloud Now'}
                     </span>
                   </button>
                 </div>
