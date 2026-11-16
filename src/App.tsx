@@ -187,6 +187,7 @@ export default function App() {
 
   const [autoSyncedNotice, setAutoSyncedNotice] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const currentUserRef = useRef<User | null>(null);
 
   const applyCloudResponseToState = useCallback((cloudData: CloudSqlSyncResponse) => {
     if (cloudData.vocabulary && cloudData.vocabulary.length > 0) {
@@ -209,7 +210,7 @@ export default function App() {
 
   const runAutomaticCloudSync = useCallback(
     async (userOverride?: User | null, booksOverride?: Book[]) => {
-      const activeUser = userOverride ?? currentUser;
+      const activeUser = userOverride ?? currentUserRef.current;
       if (!activeUser || isSyncingCloudRef.current) return;
       isSyncingCloudRef.current = true;
       try {
@@ -227,7 +228,7 @@ export default function App() {
         isSyncingCloudRef.current = false;
       }
     },
-    [currentUser, applyCloudResponseToState]
+    [applyCloudResponseToState]
   );
 
   // Listen for local vocabulary updates (e.g. when looking up words inside the PDF reader)
@@ -242,7 +243,14 @@ export default function App() {
   useEffect(() => {
     let unsubFirestore: (() => void) | null = null;
     const unsubAuth = subscribeToAuthChanges(user => {
-      setCurrentUser(user);
+      currentUserRef.current = user;
+      setCurrentUser(prev => {
+        if (!prev && !user) return null;
+        if (prev && user && prev.uid === user.uid && prev.email === user.email) {
+          return prev;
+        }
+        return user;
+      });
       if (unsubFirestore) {
         unsubFirestore();
         unsubFirestore = null;

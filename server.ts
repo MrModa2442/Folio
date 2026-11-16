@@ -10,6 +10,7 @@ import dictionaryHandler from './api/dictionary.js';
 import chaptersHandler from './api/chapters.js';
 import cloudsqlHandler, { deleteCloudPdfBuffer } from './api/cloudsql.js';
 import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
+import { isSqlConfigured } from './src/db/index.ts';
 import {
   getUserLibraryFromSql,
   syncUserLibraryToSql,
@@ -22,6 +23,21 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
+
+let sqlCooldownUntil = 0;
+
+function canAttemptSql(): boolean {
+  return isSqlConfigured() && Date.now() >= sqlCooldownUntil;
+}
+
+async function withSqlTimeout<T>(promise: Promise<T>, ms = 2500): Promise<T> {
+  return await Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('SQL operation timed out')), ms)
+    ),
+  ]);
+}
 
 async function startServer() {
   const app = express();
@@ -53,71 +69,90 @@ async function startServer() {
     return cloudsqlHandler(req, res);
   });
 
-  // Authenticated Cloud SQL (PostgreSQL) endpoints with automatic fallback store
+  // Authenticated Cloud SQL (PostgreSQL) endpoints with instant fallback store
   app.get('/api/cloudsql/library', requireAuth, async (req: AuthRequest, res) => {
+    if (!canAttemptSql()) {
+      return cloudsqlHandler(req, res);
+    }
     try {
       const uid = req.user?.uid || '';
       const email = req.user?.email || 'reader@folio.app';
       const displayName = req.user?.name || email.split('@')[0] || 'Reader';
-      const data = await getUserLibraryFromSql(uid, email, displayName);
+      const data = await withSqlTimeout(getUserLibraryFromSql(uid, email, displayName), 2500);
       res.json(data);
     } catch (error) {
+      sqlCooldownUntil = Date.now() + 60_000;
       console.warn('Cloud SQL library fallback to local cloud store:', error);
       return cloudsqlHandler(req, res);
     }
   });
 
   app.post('/api/cloudsql/sync', requireAuth, async (req: AuthRequest, res) => {
+    const uid = req.user?.uid || '';
+    const email = req.user?.email || 'reader@folio.app';
+    const deletedBookKeys = Array.isArray(req.body?.deletedBookKeys)
+      ? req.body.deletedBookKeys.map(String)
+      : [];
+    const userKey = (email || uid).trim().toLowerCase();
+    for (const dk of deletedBookKeys) {
+      deleteCloudPdfBuffer(userKey, dk);
+    }
+
+    if (!canAttemptSql()) {
+      return cloudsqlHandler(req, res);
+    }
+
     try {
-      const uid = req.user?.uid || '';
-      const email = req.user?.email || 'reader@folio.app';
       const displayName =
         String(req.body?.displayName || req.user?.name || email.split('@')[0] || 'Reader');
       const booksInput = Array.isArray(req.body?.books) ? req.body.books : [];
       const notesInput = Array.isArray(req.body?.notes) ? req.body.notes : [];
-      const deletedBookKeys = Array.isArray(req.body?.deletedBookKeys)
-        ? req.body.deletedBookKeys.map(String)
-        : [];
       const readdedBookKeys = Array.isArray(req.body?.readdedBookKeys)
         ? req.body.readdedBookKeys.map(String)
         : [];
 
-      const userKey = (email || uid).trim().toLowerCase();
-      for (const dk of deletedBookKeys) {
-        deleteCloudPdfBuffer(userKey, dk);
-      }
-
-      const data = await syncUserLibraryToSql(
-        uid,
-        email,
-        displayName,
-        booksInput,
-        notesInput,
-        deletedBookKeys,
-        readdedBookKeys
+      const data = await withSqlTimeout(
+        syncUserLibraryToSql(
+          uid,
+          email,
+          displayName,
+          booksInput,
+          notesInput,
+          deletedBookKeys,
+          readdedBookKeys
+        ),
+        2500
       );
       res.json(data);
     } catch (error) {
+      sqlCooldownUntil = Date.now() + 60_000;
       console.warn('Cloud SQL sync fallback to local cloud store:', error);
       return cloudsqlHandler(req, res);
     }
   });
 
   app.post('/api/cloudsql/vocabulary', requireAuth, async (req: AuthRequest, res) => {
+    if (!canAttemptSql()) {
+      return cloudsqlHandler(req, res);
+    }
     try {
       const uid = req.user?.uid || '';
       const email = req.user?.email || 'reader@folio.app';
-      const saved = await saveVocabularyToSql(uid, email, {
-        word: String(req.body?.word || ''),
-        partOfSpeech: String(req.body?.partOfSpeech || ''),
-        persianMeaning: String(req.body?.persianMeaning || ''),
-        englishMeaning: String(req.body?.englishMeaning || ''),
-        contextExplanation: String(req.body?.contextExplanation || ''),
-        bookTitle: String(req.body?.bookTitle || ''),
-        page: Number(req.body?.page) || 1,
-      });
+      const saved = await withSqlTimeout(
+        saveVocabularyToSql(uid, email, {
+          word: String(req.body?.word || ''),
+          partOfSpeech: String(req.body?.partOfSpeech || ''),
+          persianMeaning: String(req.body?.persianMeaning || ''),
+          englishMeaning: String(req.body?.englishMeaning || ''),
+          contextExplanation: String(req.body?.contextExplanation || ''),
+          bookTitle: String(req.body?.bookTitle || ''),
+          page: Number(req.body?.page) || 1,
+        }),
+        2500
+      );
       res.json({ entry: saved });
     } catch (error) {
+      sqlCooldownUntil = Date.now() + 60_000;
       console.warn('Cloud SQL vocabulary fallback to local cloud store:', error);
       return cloudsqlHandler(req, res);
     }

@@ -182,15 +182,29 @@ interface FallbackCloudUser {
 }
 
 const authListeners = new Set<(user: User | null) => void>();
+let cachedFallbackUserRaw: string | null = null;
+let cachedFallbackUserObj: User | null = null;
 
 function loadFallbackCloudUser(): User | null {
   if (typeof window === 'undefined') return null;
   try {
     const raw = localStorage.getItem(STORAGE_CLOUD_USER_KEY);
-    if (!raw) return null;
+    if (!raw) {
+      cachedFallbackUserRaw = null;
+      cachedFallbackUserObj = null;
+      return null;
+    }
+    if (raw === cachedFallbackUserRaw && cachedFallbackUserObj) {
+      return cachedFallbackUserObj;
+    }
     const parsed = JSON.parse(raw) as FallbackCloudUser;
-    if (!parsed || !parsed.email || !parsed.uid) return null;
-    return {
+    if (!parsed || !parsed.email || !parsed.uid) {
+      cachedFallbackUserRaw = null;
+      cachedFallbackUserObj = null;
+      return null;
+    }
+    cachedFallbackUserRaw = raw;
+    cachedFallbackUserObj = {
       uid: parsed.uid,
       email: parsed.email,
       displayName: parsed.displayName || parsed.email.split('@')[0],
@@ -198,6 +212,7 @@ function loadFallbackCloudUser(): User | null {
       emailVerified: true,
       getIdToken: async () => '',
     } as unknown as User;
+    return cachedFallbackUserObj;
   } catch {
     return null;
   }
@@ -207,9 +222,12 @@ function saveFallbackCloudUser(user: FallbackCloudUser | null): void {
   if (typeof window === 'undefined') return;
   try {
     if (!user) {
+      cachedFallbackUserRaw = null;
+      cachedFallbackUserObj = null;
       localStorage.removeItem(STORAGE_CLOUD_USER_KEY);
     } else {
       localStorage.setItem(STORAGE_CLOUD_USER_KEY, JSON.stringify(user));
+      loadFallbackCloudUser();
     }
   } catch {
     // ignore storage errors
@@ -961,20 +979,28 @@ export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSync
     }))
   );
 
-  const res = await fetch('/api/cloudsql/sync', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...authHeaders,
-    },
-    body: JSON.stringify({
-      displayName: currentUser.displayName || 'Reader',
-      books: booksPayload,
-      notes: notesPayload,
-      deletedBookKeys,
-      readdedBookKeys,
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 7000);
+  let res: Response;
+  try {
+    res = await fetch('/api/cloudsql/sync', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders,
+      },
+      body: JSON.stringify({
+        displayName: currentUser.displayName || 'Reader',
+        books: booksPayload,
+        notes: notesPayload,
+        deletedBookKeys,
+        readdedBookKeys,
+      }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   const data = (await res.json()) as CloudSqlSyncResponse & { error?: string };
   if (!res.ok) {
@@ -1004,11 +1030,19 @@ export async function fetchCloudSqlLibrary(): Promise<CloudSqlSyncResponse> {
     throw new Error('Sign in with Google first.');
   }
   const authHeaders = await getCloudAuthHeaders();
-  const res = await fetch('/api/cloudsql/library', {
-    headers: {
-      ...authHeaders,
-    },
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 7000);
+  let res: Response;
+  try {
+    res = await fetch('/api/cloudsql/library', {
+      headers: {
+        ...authHeaders,
+      },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
   const data = (await res.json()) as CloudSqlSyncResponse & { error?: string };
   if (!res.ok) {
     throw new Error(data.error || 'Failed to fetch Cloud library');

@@ -15,7 +15,12 @@ export const requireAuth = async (
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split('Bearer ')[1];
     try {
-      const decodedToken = await adminAuth.verifyIdToken(token);
+      const decodedToken = await Promise.race([
+        adminAuth.verifyIdToken(token),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('verifyIdToken timeout')), 1500)
+        ),
+      ]);
       req.user = decodedToken;
       return next();
     } catch (error) {

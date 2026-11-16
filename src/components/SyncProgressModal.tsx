@@ -142,32 +142,45 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
     ? 'bg-[#3D2817] hover:bg-[#2B1B0E] text-amber-100'
     : 'bg-zinc-900 hover:bg-zinc-800 text-white';
 
+  const userEmailKey = currentUser?.email || '';
+  const userUidKey = currentUser?.uid || '';
+
   useEffect(() => {
-    if (!isOpen || !currentUser) return;
-    let mounted = true;
+    if (!isOpen || !currentUser) {
+      setIsCloudWorking(false);
+      return;
+    }
+    let cancelled = false;
     setIsCloudWorking(true);
+    const safetyTimer = window.setTimeout(() => {
+      if (!cancelled) setIsCloudWorking(false);
+    }, 4500);
+
     syncBooksWithCloudSql(books)
       .then(res => {
-        if (!mounted) return;
+        if (cancelled) return;
         setCloudData(res);
         onApplyCloudLibrary?.(res);
       })
       .catch(() => {
         fetchCloudSqlLibrary()
           .then(res => {
-            if (!mounted) return;
+            if (cancelled) return;
             setCloudData(res);
             onApplyCloudLibrary?.(res);
           })
           .catch(() => {});
       })
       .finally(() => {
-        if (mounted) setIsCloudWorking(false);
+        window.clearTimeout(safetyTimer);
+        if (!cancelled) setIsCloudWorking(false);
       });
+
     return () => {
-      mounted = false;
+      cancelled = true;
+      window.clearTimeout(safetyTimer);
     };
-  }, [isOpen, currentUser]);
+  }, [isOpen, userEmailKey, userUidKey]);
 
   const syncToken = useMemo(() => {
     const payload = {
