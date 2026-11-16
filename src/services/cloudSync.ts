@@ -678,38 +678,65 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-export async function uploadBookPdfToCloud(book: Book): Promise<boolean> {
+export async function uploadBookPdfToCloud(
+  book: Book,
+  onProgress?: (percent: number) => void,
+  force = false
+): Promise<boolean> {
   const currentUser = getActiveCloudUser();
   if (!currentUser) return false;
   if (isBookDeletedLocally(book.id, book.title)) return false;
 
   const bookKey = sanitizeFirestoreId(book.id || book.title);
-  if (uploadedPdfBookKeys.has(bookKey)) return true;
+  if (!force && uploadedPdfBookKeys.has(bookKey)) return true;
 
   try {
-    const blob = await getPdfBlob(book.pdfBlobKey || book.id);
-    if (!blob || blob.size === 0 || blob.size > 16 * 1024 * 1024) {
+    let blob = await getPdfBlob(book.pdfBlobKey || book.id);
+    if (!blob && book.id && book.pdfBlobKey !== book.id) {
+      blob = await getPdfBlob(book.id);
+    }
+    if (!blob || blob.size === 0 || blob.size > 50 * 1024 * 1024) {
       return false;
     }
     const buffer = await blob.arrayBuffer();
-    const pdfBase64 = arrayBufferToBase64(buffer);
     const authHeaders = await getCloudAuthHeaders();
 
-    const res = await fetch('/api/cloudsql/pdf', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...authHeaders,
-      },
-      body: JSON.stringify({
-        bookKey,
-        pdfBase64,
-      }),
-    });
-    if (res.ok) {
-      uploadedPdfBookKeys.add(bookKey);
-      return true;
+    // Split into 1.2 MB raw chunks (~1.6 MB base64 each) so it never exceeds serverless 4.5 MB body limits
+    const CHUNK_BYTE_SIZE = Math.floor(1.2 * 1024 * 1024);
+    const totalChunks = Math.max(1, Math.ceil(buffer.byteLength / CHUNK_BYTE_SIZE));
+
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const start = chunkIndex * CHUNK_BYTE_SIZE;
+      const end = Math.min(buffer.byteLength, start + CHUNK_BYTE_SIZE);
+      const slice = buffer.slice(start, end);
+      const pdfBase64 = arrayBufferToBase64(slice);
+
+      const res = await fetch('/api/cloudsql/pdf', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
+        body: JSON.stringify({
+          bookKey,
+          title: book.title || '',
+          chunkIndex,
+          totalChunks,
+          pdfBase64,
+        }),
+      });
+
+      if (!res.ok) {
+        return false;
+      }
+
+      if (onProgress) {
+        onProgress(Math.round(((chunkIndex + 1) / totalChunks) * 100));
+      }
     }
+
+    uploadedPdfBookKeys.add(bookKey);
+    return true;
   } catch {
     // ignore background upload errors
   }
@@ -732,12 +759,16 @@ export async function downloadBookPdfFromCloud(book: Book): Promise<Blob | null>
 
   try {
     const authHeaders = await getCloudAuthHeaders();
+    const titleParam = encodeURIComponent(book.title || '');
     for (const key of candidateKeys) {
-      const res = await fetch(`/api/cloudsql/pdf?bookKey=${encodeURIComponent(key)}`, {
-        headers: {
-          ...authHeaders,
-        },
-      });
+      const res = await fetch(
+        `/api/cloudsql/pdf?bookKey=${encodeURIComponent(key)}&title=${titleParam}`,
+        {
+          headers: {
+            ...authHeaders,
+          },
+        }
+      );
       if (res.ok) {
         const blob = await res.blob();
         if (blob && blob.size > 100) {
@@ -1017,8 +1048,20 @@ export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSync
   }
 
   // Trigger background upload of local PDF blobs so other devices can open the PDF
+  const cloudPdfStatusByKey = new Map<string, boolean>();
+  for (const cb of data.books || []) {
+    cloudPdfStatusByKey.set((cb.bookKey || '').toLowerCase(), Boolean(cb.hasCloudPdf));
+    if (cb.title) {
+      cloudPdfStatusByKey.set(cb.title.trim().toLowerCase(), Boolean(cb.hasCloudPdf));
+    }
+  }
+
   for (const b of activeBooks.slice(0, 15)) {
-    uploadBookPdfToCloud(b).catch(() => {});
+    const safeKey = sanitizeFirestoreId(b.id || b.title).toLowerCase();
+    const titleLower = (b.title || '').trim().toLowerCase();
+    const cloudHasIt =
+      cloudPdfStatusByKey.get(safeKey) || cloudPdfStatusByKey.get(titleLower) || false;
+    uploadBookPdfToCloud(b, undefined, !cloudHasIt).catch(() => {});
   }
 
   return data;

@@ -2,6 +2,7 @@ import React, { useState, useRef } from 'react';
 import { AppTheme, Book, Booklist, CoverPattern } from '../types/library';
 import { extractPdfMetadata } from '../utils/pdfParser';
 import { storePdfBlob, storeBookCover } from '../services/db';
+import { getActiveCloudUser, uploadBookPdfToCloud } from '../services/cloudSync';
 import { X, Upload, Loader2, Trash2 } from 'lucide-react';
 
 interface ImportPdfModalProps {
@@ -56,7 +57,7 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Fully automatic import: extracts pages, author, title, and cover image
+  // Fully automatic import: extracts pages, author, title, cover image, and uploads PDF to Cloud for cross-device reading
   const handleProcessPdfFile = async (file: File) => {
     if (!file.name.toLowerCase().endsWith('.pdf')) {
       return;
@@ -104,11 +105,19 @@ export const ImportPdfModal: React.FC<ImportPdfModalProps> = ({
         pdfBlobKey: bookId,
       };
 
-      setTimeout(() => {
-        onBookImported(newBook);
-        setIsProcessing(false);
-        onClose();
-      }, 400);
+      onBookImported(newBook);
+
+      if (getActiveCloudUser()) {
+        setStatusMessage('Uploading PDF to Cloud for all devices (0%)...');
+        await uploadBookPdfToCloud(
+          newBook,
+          pct => setStatusMessage(`Uploading PDF to Cloud for all devices (${pct}%)...`),
+          true
+        );
+      }
+
+      setIsProcessing(false);
+      onClose();
     } catch (err) {
       console.error('Failed to import PDF automatically:', err);
       setIsProcessing(false);

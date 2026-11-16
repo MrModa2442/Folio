@@ -77,6 +77,7 @@ const PDF_CACHE_DIRS = [
 
 const memoryCloudStore = new Map<string, StoredUserCloudRecord>();
 const memoryPdfStore = new Map<string, Buffer>();
+const memoryPdfChunks = new Map<string, { totalChunks: number; chunks: Map<number, Buffer> }>();
 let fallbackLoaded = false;
 
 function loadFallbackStoreOnce() {
@@ -113,51 +114,68 @@ function saveFallbackStore() {
   }
 }
 
-function makePdfCacheKey(userKey: string, bookKey: string): string {
-  const safeUser = userKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
-  const safeBook = bookKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
-  return `${safeUser}__${safeBook}`;
+function makePdfCacheKey(userKey: string, rawBookKey: string): string {
+  const safeUser = userKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60);
+  const normalizedBook = String(rawBookKey || '').trim().toLowerCase();
+  const asciiBook = normalizedBook.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').slice(0, 50);
+  const hexSuffix = Buffer.from(normalizedBook, 'utf-8').toString('hex').slice(0, 32);
+  return `${safeUser}__${asciiBook}_${hexSuffix}`;
 }
 
-function saveCloudPdfBuffer(userKey: string, bookKey: string, buf: Buffer): void {
-  const key = makePdfCacheKey(userKey, bookKey);
-  memoryPdfStore.set(key, buf);
-  for (const dir of PDF_CACHE_DIRS) {
-    try {
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+export function saveCloudPdfBuffer(userKey: string, bookKey: string, buf: Buffer, title?: string): void {
+  if (!bookKey || !buf || buf.byteLength === 0) return;
+  const keysToSave = Array.from(
+    new Set([bookKey.trim(), title ? title.trim() : ''].filter(Boolean))
+  );
+  for (const k of keysToSave) {
+    const cacheKey = makePdfCacheKey(userKey, k);
+    memoryPdfStore.set(cacheKey, buf);
+    for (const dir of PDF_CACHE_DIRS) {
+      try {
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.writeFileSync(path.join(dir, `${cacheKey}.pdf`), buf);
+        break;
+      } catch {
+        // ignore fs error
       }
-      fs.writeFileSync(path.join(dir, `${key}.pdf`), buf);
-      break;
-    } catch {
-      // ignore fs error
     }
   }
 }
 
-function loadCloudPdfBuffer(userKey: string, bookKey: string): Buffer | null {
-  const key = makePdfCacheKey(userKey, bookKey);
-  const inMem = memoryPdfStore.get(key);
-  if (inMem) return inMem;
+export function loadCloudPdfBuffer(userKey: string, bookKey: string, title?: string): Buffer | null {
+  const candidates = Array.from(
+    new Set([bookKey ? bookKey.trim() : '', title ? title.trim() : ''].filter(Boolean))
+  );
+  for (const cand of candidates) {
+    const key = makePdfCacheKey(userKey, cand);
+    const inMem = memoryPdfStore.get(key);
+    if (inMem && inMem.byteLength > 100) return inMem;
 
-  for (const dir of PDF_CACHE_DIRS) {
-    try {
-      const filePath = path.join(dir, `${key}.pdf`);
-      if (fs.existsSync(filePath)) {
-        const buf = fs.readFileSync(filePath);
-        memoryPdfStore.set(key, buf);
-        return buf;
+    for (const dir of PDF_CACHE_DIRS) {
+      try {
+        const filePath = path.join(dir, `${key}.pdf`);
+        if (fs.existsSync(filePath)) {
+          const buf = fs.readFileSync(filePath);
+          if (buf.byteLength > 100) {
+            memoryPdfStore.set(key, buf);
+            return buf;
+          }
+        }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
     }
   }
   return null;
 }
 
 export function deleteCloudPdfBuffer(userKey: string, bookKey: string): void {
+  if (!bookKey) return;
   const key = makePdfCacheKey(userKey, bookKey);
   memoryPdfStore.delete(key);
+  memoryPdfChunks.delete(key);
   for (const dir of PDF_CACHE_DIRS) {
     try {
       const filePath = path.join(dir, `${key}.pdf`);
@@ -197,7 +215,7 @@ function decodeJwtPayload(token: string): { sub?: string; user_id?: string; emai
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function resolveUserFromRequest(req: any): { uid: string; email: string; displayName: string } | null {
+export function resolveUserFromRequest(req: any): { uid: string; email: string; displayName: string } | null {
   const authHeader = String(req.headers?.authorization || '');
   if (authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
@@ -259,13 +277,20 @@ export default async function handler(req: any, res: any) {
 
   if (pathname === 'library' && req.method === 'GET') {
     const deletedSet = new Set(existingRecord.deletedBookKeys.map(normalizeComparisonKey));
-    existingRecord.books = existingRecord.books.filter(
-      b =>
-        !deletedSet.has(normalizeComparisonKey(b.bookKey)) &&
-        !deletedSet.has(sanitizeComparisonKey(b.bookKey)) &&
-        !deletedSet.has(normalizeComparisonKey(b.title)) &&
-        !deletedSet.has(sanitizeComparisonKey(b.title))
-    );
+    existingRecord.books = existingRecord.books
+      .filter(
+        b =>
+          !deletedSet.has(normalizeComparisonKey(b.bookKey)) &&
+          !deletedSet.has(sanitizeComparisonKey(b.bookKey)) &&
+          !deletedSet.has(normalizeComparisonKey(b.title)) &&
+          !deletedSet.has(sanitizeComparisonKey(b.title))
+      )
+      .map(b => ({
+        ...b,
+        hasCloudPdf: Boolean(
+          b.hasCloudPdf || loadCloudPdfBuffer(userKey, b.bookKey, b.title) !== null
+        ),
+      }));
     memoryCloudStore.set(userKey, existingRecord);
     return res.status(200).json(existingRecord);
   }
@@ -274,21 +299,72 @@ export default async function handler(req: any, res: any) {
     try {
       const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
       const bookKey = String(body.bookKey || '').trim();
+      const title = String(body.title || '').trim();
       const pdfBase64 = String(body.pdfBase64 || '').trim();
+      const chunkIndex = Math.max(0, Number(body.chunkIndex) || 0);
+      const totalChunks = Math.max(1, Number(body.totalChunks) || 1);
+
       if (!bookKey || !pdfBase64) {
         return res.status(400).json({ error: 'bookKey and pdfBase64 are required' });
       }
       const cleanBase64 = pdfBase64.replace(/^data:application\/pdf;base64,/, '');
-      const buf = Buffer.from(cleanBase64, 'base64');
-      if (buf.byteLength > 0 && buf.byteLength <= 22 * 1024 * 1024) {
-        saveCloudPdfBuffer(userKey, bookKey, buf);
-        const targetBook = existingRecord.books.find(b => b.bookKey === bookKey);
-        if (targetBook) {
-          targetBook.hasCloudPdf = true;
+      const chunkBuf = Buffer.from(cleanBase64, 'base64');
+
+      if (totalChunks === 1) {
+        if (chunkBuf.byteLength > 0 && chunkBuf.byteLength <= 55 * 1024 * 1024) {
+          saveCloudPdfBuffer(userKey, bookKey, chunkBuf, title);
+          for (const b of existingRecord.books) {
+            if (
+              b.bookKey === bookKey ||
+              (title && normalizeComparisonKey(b.title) === normalizeComparisonKey(title))
+            ) {
+              b.hasCloudPdf = true;
+            }
+          }
           saveFallbackStore();
         }
+        return res.status(200).json({ ok: true, complete: true, size: chunkBuf.byteLength });
       }
-      return res.status(200).json({ ok: true, size: buf.byteLength });
+
+      // Multi-chunk assembly
+      const chunkStoreKey = makePdfCacheKey(userKey, bookKey);
+      let entry = memoryPdfChunks.get(chunkStoreKey);
+      if (!entry || chunkIndex === 0 || entry.totalChunks !== totalChunks) {
+        entry = { totalChunks, chunks: new Map<number, Buffer>() };
+        memoryPdfChunks.set(chunkStoreKey, entry);
+      }
+      entry.chunks.set(chunkIndex, chunkBuf);
+
+      if (entry.chunks.size >= totalChunks) {
+        const ordered: Buffer[] = [];
+        for (let i = 0; i < totalChunks; i++) {
+          const part = entry.chunks.get(i);
+          if (part) ordered.push(part);
+        }
+        const fullBuf = Buffer.concat(ordered);
+        memoryPdfChunks.delete(chunkStoreKey);
+        if (fullBuf.byteLength > 0 && fullBuf.byteLength <= 55 * 1024 * 1024) {
+          saveCloudPdfBuffer(userKey, bookKey, fullBuf, title);
+          for (const b of existingRecord.books) {
+            if (
+              b.bookKey === bookKey ||
+              (title && normalizeComparisonKey(b.title) === normalizeComparisonKey(title))
+            ) {
+              b.hasCloudPdf = true;
+            }
+          }
+          saveFallbackStore();
+        }
+        return res.status(200).json({ ok: true, complete: true, size: fullBuf.byteLength });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        complete: false,
+        chunkIndex,
+        receivedChunks: entry.chunks.size,
+        totalChunks,
+      });
     } catch (err) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to store cloud PDF',
@@ -298,10 +374,19 @@ export default async function handler(req: any, res: any) {
 
   if (pathname === 'pdf' && req.method === 'GET') {
     const bookKey = String(req.query?.bookKey || urlObj.searchParams.get('bookKey') || '').trim();
-    if (!bookKey) {
-      return res.status(400).json({ error: 'bookKey query parameter is required' });
+    const title = String(req.query?.title || urlObj.searchParams.get('title') || '').trim();
+    if (!bookKey && !title) {
+      return res.status(400).json({ error: 'bookKey or title query parameter is required' });
     }
-    const buf = loadCloudPdfBuffer(userKey, bookKey);
+    let buf = loadCloudPdfBuffer(userKey, bookKey, title);
+    if (!buf && title) {
+      const matchedBook = existingRecord.books.find(
+        b => normalizeComparisonKey(b.title) === normalizeComparisonKey(title)
+      );
+      if (matchedBook) {
+        buf = loadCloudPdfBuffer(userKey, matchedBook.bookKey, matchedBook.title);
+      }
+    }
     if (!buf) {
       return res.status(404).json({ error: 'PDF not found in cloud storage for this book' });
     }
@@ -405,7 +490,7 @@ export default async function handler(req: any, res: any) {
       };
 
       const hasPdfInCloud = Boolean(
-        prev?.hasCloudPdf || loadCloudPdfBuffer(userKey, bookKey) !== null
+        prev?.hasCloudPdf || loadCloudPdfBuffer(userKey, bookKey, bookTitle) !== null
       );
 
       bookMap.set(bookKey, {

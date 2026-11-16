@@ -191,10 +191,17 @@ export async function syncUserLibraryToSql(
   try {
     const userRecord = await getOrCreateUser(uid, email, displayName);
 
-    const existingRows = await db
+    const allRows = await db
       .select()
       .from(sqlBooks)
       .where(eq(sqlBooks.userId, userRecord.id));
+
+    const existingRows = allRows.filter(
+      r => r.author !== '__pdf_chunk__' && !r.bookKey.startsWith('__pdfchunk__')
+    );
+    const pdfChunkRows = allRows.filter(
+      r => r.author === '__pdf_chunk__' || r.bookKey.startsWith('__pdfchunk__')
+    );
 
     const deletedSet = new Set<string>();
     const readdedSet = new Set<string>();
@@ -247,6 +254,15 @@ export async function syncUserLibraryToSql(
           (t2 && deletedSet.has(t2))
       );
     };
+
+    // Delete any PDF chunks belonging to deleted books
+    for (const chunkRow of pdfChunkRows) {
+      const match = chunkRow.bookKey.match(/^__pdfchunk__(.+)__\d+$/);
+      const chunkBookKey = match ? match[1] : chunkRow.bookKey;
+      if (isBookDeleted(chunkBookKey, chunkRow.title)) {
+        await db.delete(sqlBooks).where(eq(sqlBooks.id, chunkRow.id));
+      }
+    }
 
     // Mark any deleted existing books as tombstones in sqlBooks and delete their notes
     for (const row of existingRows) {
@@ -318,10 +334,7 @@ export async function syncUserLibraryToSql(
         continue;
       }
 
-      const existing = await db
-        .select()
-        .from(sqlBooks)
-        .where(and(eq(sqlBooks.userId, userRecord.id), eq(sqlBooks.bookKey, b.bookKey)));
+      const existing = existingRows.filter(r => r.bookKey === b.bookKey);
 
       if (existing.length > 0) {
         const prevUnpacked = unpackBookRow(existing[0]);
@@ -405,7 +418,7 @@ export async function getUserLibraryFromSql(uid: string, email: string, displayN
   try {
     const userRecord = await getOrCreateUser(uid, email, displayName);
 
-    const [booksRows, notesRows, vocabRows] = await Promise.all([
+    const [allBooksRows, notesRows, vocabRows] = await Promise.all([
       db
         .select()
         .from(sqlBooks)
@@ -423,7 +436,38 @@ export async function getUserLibraryFromSql(uid: string, email: string, displayN
         .orderBy(desc(sqlVocabulary.createdAt)),
     ]);
 
-    const unpackedAll = booksRows.map(unpackBookRow);
+    const pdfChunkRows = allBooksRows.filter(
+      r => r.author === '__pdf_chunk__' || r.bookKey.startsWith('__pdfchunk__')
+    );
+    const booksRows = allBooksRows.filter(
+      r => r.author !== '__pdf_chunk__' && !r.bookKey.startsWith('__pdfchunk__')
+    );
+
+    const keysWithPdfChunks = new Set<string>();
+    const titlesWithPdfChunks = new Set<string>();
+    for (const cr of pdfChunkRows) {
+      const m = cr.bookKey.match(/^__pdfchunk__(.+)__\d+$/);
+      if (m && m[1]) {
+        keysWithPdfChunks.add(normalizeBookKey(m[1]));
+        keysWithPdfChunks.add(sanitizeBookKey(m[1]));
+      }
+      if (cr.title) {
+        titlesWithPdfChunks.add(normalizeBookKey(cr.title));
+      }
+    }
+
+    const unpackedAll = booksRows.map(row => {
+      const unpacked = unpackBookRow(row);
+      const hasChunks =
+        keysWithPdfChunks.has(normalizeBookKey(row.bookKey)) ||
+        keysWithPdfChunks.has(sanitizeBookKey(row.bookKey)) ||
+        (row.title && titlesWithPdfChunks.has(normalizeBookKey(row.title)));
+      return {
+        ...unpacked,
+        hasCloudPdf: Boolean(unpacked.hasCloudPdf || hasChunks),
+      };
+    });
+
     const activeBooks = unpackedAll.filter(b => !b.deleted);
     const deletedBookKeys = Array.from(
       new Set(
@@ -458,6 +502,93 @@ export async function getUserLibraryFromSql(uid: string, email: string, displayN
     console.error('Database query failed in getUserLibraryFromSql:', error);
     throw new Error('Failed to load user library from database.', { cause: error });
   }
+}
+
+export async function saveBookPdfChunkToSql(
+  uid: string,
+  email: string,
+  bookKey: string,
+  title: string,
+  chunkIndex: number,
+  totalChunks: number,
+  chunkBase64: string
+): Promise<void> {
+  const userRecord = await getOrCreateUser(uid, email);
+  const safeKey = sanitizeBookKey(bookKey) || normalizeBookKey(bookKey) || 'book';
+  const chunkRowKey = `__pdfchunk__${safeKey}__${chunkIndex}`;
+
+  if (chunkIndex === 0) {
+    // Clean up any older chunks for this bookKey before writing new chunks
+    const existingAll = await db
+      .select({ id: sqlBooks.id, bookKey: sqlBooks.bookKey })
+      .from(sqlBooks)
+      .where(and(eq(sqlBooks.userId, userRecord.id), eq(sqlBooks.author, '__pdf_chunk__')));
+    for (const r of existingAll) {
+      if (r.bookKey.startsWith(`__pdfchunk__${safeKey}__`)) {
+        await db.delete(sqlBooks).where(eq(sqlBooks.id, r.id));
+      }
+    }
+  }
+
+  await db.insert(sqlBooks).values({
+    userId: userRecord.id,
+    bookKey: chunkRowKey,
+    title: (title || safeKey).slice(0, 200),
+    author: '__pdf_chunk__',
+    category: chunkBase64,
+    currentPage: chunkIndex,
+    totalPages: totalChunks,
+    bookmarkCount: 0,
+    highlightCount: 0,
+  });
+}
+
+export async function loadBookPdfBufferFromSql(
+  uid: string,
+  email: string,
+  bookKey: string,
+  title?: string
+): Promise<Buffer | null> {
+  const userRecord = await getOrCreateUser(uid, email);
+  const chunkRows = await db
+    .select()
+    .from(sqlBooks)
+    .where(and(eq(sqlBooks.userId, userRecord.id), eq(sqlBooks.author, '__pdf_chunk__')));
+
+  if (chunkRows.length === 0) return null;
+
+  const targetSafeKey = sanitizeBookKey(bookKey) || normalizeBookKey(bookKey);
+  const targetTitleLower = normalizeBookKey(title || '');
+
+  let matched = chunkRows.filter(r => {
+    const m = r.bookKey.match(/^__pdfchunk__(.+)__\d+$/);
+    if (!m) return false;
+    return normalizeBookKey(m[1]) === targetSafeKey || sanitizeBookKey(m[1]) === targetSafeKey;
+  });
+
+  if (matched.length === 0 && targetTitleLower) {
+    matched = chunkRows.filter(r => normalizeBookKey(r.title) === targetTitleLower);
+  }
+
+  if (matched.length === 0) return null;
+
+  // Group by chunk prefix in case multiple books shared a title, pick the most recent set
+  const byPrefix = new Map<string, typeof matched>();
+  for (const r of matched) {
+    const m = r.bookKey.match(/^(__pdfchunk__.+__)(\d+)$/);
+    const prefix = m ? m[1] : '__default__';
+    const list = byPrefix.get(prefix) || [];
+    list.push(r);
+    byPrefix.set(prefix, list);
+  }
+
+  const chosenGroup = Array.from(byPrefix.values()).sort((a, b) => b.length - a.length)[0];
+  if (!chosenGroup || chosenGroup.length === 0) return null;
+
+  chosenGroup.sort((a, b) => a.currentPage - b.currentPage);
+  const buffers = chosenGroup.map(r => Buffer.from(r.category || '', 'base64'));
+  const combined = Buffer.concat(buffers);
+  return combined.byteLength > 100 ? combined : null;
 }
 
 export async function saveVocabularyToSql(

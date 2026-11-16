@@ -1,10 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Book, PageBookmark, PageHighlightStroke } from '../types/library';
-import { getPdfBlob, storePdfBlob, createSamplePdfBlob } from '../services/db';
-import { downloadBookPdfFromCloud } from '../services/cloudSync';
+import { getPdfBlob, storePdfBlob } from '../services/db';
+import { downloadBookPdfFromCloud, uploadBookPdfToCloud } from '../services/cloudSync';
 import { ambientSound } from '../services/ambientAudio';
 import { RealPdfViewer } from './RealPdfViewer';
-import { X, ChevronLeft, CloudRain, Flame, Building2, Check, BookOpen, Trash2 } from 'lucide-react';
+import {
+  X,
+  ChevronLeft,
+  CloudRain,
+  Flame,
+  Building2,
+  Check,
+  BookOpen,
+  Trash2,
+  RefreshCw,
+  Upload,
+  CloudDownload,
+} from 'lucide-react';
 
 interface CozyPdfReaderProps {
   book: Book;
@@ -27,75 +39,106 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
   const [theme, setTheme] = useState<ReaderTheme>('cream');
   const [activeSound, setActiveSound] = useState<'none' | 'rain' | 'fireplace' | 'library'>('none');
   const [isLoadingPdf, setIsLoadingPdf] = useState<boolean>(true);
+  const [loadingMessage, setLoadingMessage] = useState<string>('Opening book...');
+  const [missingCloudPdf, setMissingCloudPdf] = useState<boolean>(false);
   const [confirmRemove, setConfirmRemove] = useState<boolean>(false);
+  const attachFileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load PDF Blob as ArrayBuffer (checking local IndexedDB -> Cloud Sync PDF -> Telegram Channel -> Fallback)
-  useEffect(() => {
-    let active = true;
+  const loadPdfFromLocalOrCloud = useCallback(async () => {
+    setIsLoadingPdf(true);
+    setMissingCloudPdf(false);
+    setLoadingMessage('Checking local library...');
 
-    async function loadPdf() {
-      setIsLoadingPdf(true);
-      try {
-        const blobKey = book.pdfBlobKey || book.id;
-        let blob = blobKey ? await getPdfBlob(blobKey) : null;
-        if (!blob && book.id && book.id !== blobKey) {
-          blob = await getPdfBlob(book.id);
-        }
+    try {
+      const blobKey = book.pdfBlobKey || book.id;
+      let blob = blobKey ? await getPdfBlob(blobKey) : null;
+      if (!blob && book.id && book.id !== blobKey) {
+        blob = await getPdfBlob(book.id);
+      }
 
-        // 1. If book was synced from another device (e.g. iPad -> PC), download PDF from Cloud Sync store
-        if (!blob) {
+      // 1. If book was synced from another device (e.g. PC -> iPad), download PDF from Cloud Sync store with automatic retries
+      if (!blob) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          setLoadingMessage(
+            attempt === 1
+              ? 'Downloading book PDF from Cloud...'
+              : `Waiting for Cloud PDF sync (attempt ${attempt}/3)...`
+          );
           const cloudBlob = await downloadBookPdfFromCloud(book);
-          if (cloudBlob) {
+          if (cloudBlob && cloudBlob.size > 100) {
             blob = cloudBlob;
             await storePdfBlob(blobKey, cloudBlob).catch(() => {});
-          }
-        }
-
-        // 2. If book came from a Telegram catalog channel, fetch the original PDF from /api/telegram/download
-        if (!blob && book.telegramChannel && book.telegramMessageId) {
-          try {
-            const res = await fetch(
-              `/api/telegram/download?channel=${encodeURIComponent(book.telegramChannel)}&messageId=${book.telegramMessageId}`
-            );
-            if (res.ok) {
-              const tgBlob = await res.blob();
-              if (tgBlob && tgBlob.size > 100) {
-                blob = tgBlob;
-                await storePdfBlob(blobKey, tgBlob).catch(() => {});
-              }
+            if (book.id !== blobKey) {
+              await storePdfBlob(book.id, cloudBlob).catch(() => {});
             }
-          } catch {
-            // ignore telegram download error
+            break;
+          }
+          if (attempt < 3) {
+            await new Promise(resolve => setTimeout(resolve, 1400));
           }
         }
-
-        if (!blob) {
-          blob = createSamplePdfBlob(
-            book.title,
-            book.author,
-            book.notes || 'A distinguished work from the Folio collection.'
-          );
-        }
-
-        if (active && blob) {
-          const buffer = await blob.arrayBuffer();
-          if (active) {
-            setArrayBuffer(buffer);
-          }
-        }
-      } catch (err) {
-        console.error('Failed to load PDF in reader', err);
-      } finally {
-        if (active) setIsLoadingPdf(false);
       }
+
+      // 2. If book came from a Telegram catalog channel, fetch the original PDF from /api/telegram/download
+      if (!blob && book.telegramChannel && book.telegramMessageId) {
+        setLoadingMessage('Downloading book PDF from catalog...');
+        try {
+          const res = await fetch(
+            `/api/telegram/download?channel=${encodeURIComponent(book.telegramChannel)}&messageId=${book.telegramMessageId}`
+          );
+          if (res.ok) {
+            const tgBlob = await res.blob();
+            if (tgBlob && tgBlob.size > 100) {
+              blob = tgBlob;
+              await storePdfBlob(blobKey, tgBlob).catch(() => {});
+            }
+          }
+        } catch {
+          // ignore telegram download error
+        }
+      }
+
+      if (blob && blob.size > 100) {
+        const buffer = await blob.arrayBuffer();
+        setArrayBuffer(buffer);
+        setMissingCloudPdf(false);
+      } else {
+        setArrayBuffer(null);
+        setMissingCloudPdf(true);
+      }
+    } catch (err) {
+      console.error('Failed to load PDF in reader', err);
+      setMissingCloudPdf(true);
+    } finally {
+      setIsLoadingPdf(false);
     }
+  }, [book]);
 
-    loadPdf();
+  useEffect(() => {
+    loadPdfFromLocalOrCloud();
+  }, [loadPdfFromLocalOrCloud]);
 
-    return () => {
-      active = false;
-    };
-  }, [book.id, book.pdfBlobKey, book.telegramChannel, book.telegramMessageId]);
+  const handleAttachLocalPdf = async (file: File) => {
+    if (!file) return;
+    setIsLoadingPdf(true);
+    setMissingCloudPdf(false);
+    setLoadingMessage('Saving PDF & syncing to Cloud for all devices...');
+    try {
+      const blobKey = book.pdfBlobKey || book.id;
+      await storePdfBlob(blobKey, file);
+      if (book.id !== blobKey) {
+        await storePdfBlob(book.id, file);
+      }
+      const buffer = await file.arrayBuffer();
+      setArrayBuffer(buffer);
+      uploadBookPdfToCloud(book, undefined, true).catch(() => {});
+    } catch (err) {
+      console.error('Failed to attach PDF file:', err);
+      setMissingCloudPdf(true);
+    } finally {
+      setIsLoadingPdf(false);
+    }
+  };
 
   const handleSoundToggle = (soundType: 'rain' | 'fireplace' | 'library') => {
     if (activeSound === soundType) {
@@ -344,10 +387,56 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
 
       {/* Real PDF Canvas Viewer */}
       <div className="flex-1 flex overflow-hidden">
+        <input
+          ref={attachFileInputRef}
+          type="file"
+          accept=".pdf,application/pdf"
+          className="hidden"
+          onChange={e => e.target.files?.[0] && handleAttachLocalPdf(e.target.files[0])}
+        />
+
         {isLoadingPdf ? (
-          <div className="flex-1 flex flex-col items-center justify-center gap-2 text-xs opacity-70">
-            <BookOpen className="w-8 h-8 animate-pulse text-[#1DB954]" />
-            <span>Loading PDF pages...</span>
+          <div className="flex-1 flex flex-col items-center justify-center gap-3 text-xs px-6 text-center">
+            <BookOpen className="w-9 h-9 animate-pulse text-[#1DB954]" />
+            <span className="font-semibold text-sm">{loadingMessage}</span>
+            <span className="opacity-60 text-[11px] max-w-xs">
+              Syncing your book file so you can read seamlessly across PC, iPad, and phone.
+            </span>
+          </div>
+        ) : missingCloudPdf || !arrayBuffer ? (
+          <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
+            <div className="max-w-md w-full rounded-2xl border border-white/15 bg-black/40 backdrop-blur-md p-6 flex flex-col items-center gap-4 shadow-2xl">
+              <div className="w-12 h-12 rounded-full bg-[#1DB954]/15 text-[#1DB954] flex items-center justify-center">
+                <CloudDownload className="w-6 h-6" />
+              </div>
+              <div className="space-y-1.5">
+                <h3 className="text-base font-bold text-white">
+                  Book File Waiting for Cloud Upload
+                </h3>
+                <p className="text-xs text-white/70 leading-relaxed">
+                  <strong>{book.title}</strong> is in your library, but its PDF file hasn&apos;t finished uploading from the device where you imported it yet.
+                </p>
+                <p className="text-[11px] text-white/50 leading-relaxed">
+                  Keep the app open for a few seconds on your PC (where you imported the book) so it finishes uploading to the cloud, then tap <strong>Retry Cloud Download</strong> below — or select the PDF file directly on this device.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1 w-full">
+                <button
+                  onClick={() => loadPdfFromLocalOrCloud()}
+                  className="px-4 py-2 rounded-full bg-[#1DB954] hover:bg-[#1ed760] text-black font-semibold text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Retry Cloud Download</span>
+                </button>
+                <button
+                  onClick={() => attachFileInputRef.current?.click()}
+                  className="px-4 py-2 rounded-full bg-white/10 hover:bg-white/20 text-white font-semibold text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Select PDF on This Device</span>
+                </button>
+              </div>
+            </div>
           </div>
         ) : (
           <RealPdfViewer
