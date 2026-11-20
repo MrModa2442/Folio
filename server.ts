@@ -8,21 +8,7 @@ import telegramHandler, { normalizeTelegramChannel } from './api/telegram.js';
 import ocrHandler from './api/ocr.js';
 import dictionaryHandler from './api/dictionary.js';
 import chaptersHandler from './api/chapters.js';
-import cloudsqlHandler, {
-  deleteCloudPdfBuffer,
-  loadCloudPdfBuffer,
-  saveCloudPdfBuffer,
-  resolveUserFromRequest,
-} from './api/cloudsql.js';
-import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
-import { isSqlConfigured } from './src/db/index.ts';
-import {
-  getUserLibraryFromSql,
-  syncUserLibraryToSql,
-  saveVocabularyToSql,
-  saveBookPdfChunkToSql,
-  loadBookPdfBufferFromSql,
-} from './src/db/users.ts';
+import cloudsqlHandler from './api/cloudsql.js';
 
 export { normalizeTelegramChannel };
 
@@ -30,21 +16,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
-
-let sqlCooldownUntil = 0;
-
-function canAttemptSql(): boolean {
-  return isSqlConfigured() && Date.now() >= sqlCooldownUntil;
-}
-
-async function withSqlTimeout<T>(promise: Promise<T>, ms = 2500): Promise<T> {
-  return await Promise.race([
-    promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('SQL operation timed out')), ms)
-    ),
-  ]);
-}
 
 async function startServer() {
   const app = express();
@@ -71,158 +42,9 @@ async function startServer() {
     return chaptersHandler(req, res);
   });
 
-  // Cloud PDF upload/download endpoint for cross-device PDF sync (Disk Cache + PostgreSQL Chunk Storage)
-  app.all('/api/cloudsql/pdf', async (req, res) => {
-    const resolvedUser = resolveUserFromRequest(req);
-    if (resolvedUser && req.method === 'POST' && canAttemptSql()) {
-      try {
-        const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
-        const bookKey = String(body.bookKey || '').trim();
-        const title = String(body.title || '').trim();
-        const pdfBase64 = String(body.pdfBase64 || '').trim().replace(/^data:application\/pdf;base64,/, '');
-        const chunkIndex = Math.max(0, Number(body.chunkIndex) || 0);
-        const totalChunks = Math.max(1, Number(body.totalChunks) || 1);
-        if (bookKey && pdfBase64) {
-          await withSqlTimeout(
-            saveBookPdfChunkToSql(
-              resolvedUser.uid,
-              resolvedUser.email,
-              bookKey,
-              title,
-              chunkIndex,
-              totalChunks,
-              pdfBase64
-            ),
-            4000
-          ).catch(() => {});
-        }
-      } catch {
-        // continue to local cloud store handler
-      }
-    }
-
-    if (resolvedUser && req.method === 'GET') {
-      const userKey = (resolvedUser.email || resolvedUser.uid).trim().toLowerCase();
-      const bookKey = String(req.query?.bookKey || '').trim();
-      const title = String(req.query?.title || '').trim();
-      let buf = loadCloudPdfBuffer(userKey, bookKey, title);
-      if (!buf && canAttemptSql() && (bookKey || title)) {
-        try {
-          buf = await withSqlTimeout(
-            loadBookPdfBufferFromSql(resolvedUser.uid, resolvedUser.email, bookKey, title),
-            4000
-          );
-          if (buf && buf.byteLength > 100) {
-            saveCloudPdfBuffer(userKey, bookKey || title, buf, title);
-          }
-        } catch {
-          // fallback below
-        }
-      }
-      if (buf && buf.byteLength > 100) {
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Length', String(buf.byteLength));
-        return res.status(200).send(buf);
-      }
-    }
-
+  // Unified Cloud Sync & Chunked PDF PostgreSQL endpoint (identical in dev and Vercel production)
+  app.use('/api/cloudsql', (req, res) => {
     return cloudsqlHandler(req, res);
-  });
-
-  // Authenticated Cloud SQL (PostgreSQL) endpoints with instant fallback store
-  app.get('/api/cloudsql/library', requireAuth, async (req: AuthRequest, res) => {
-    if (!canAttemptSql()) {
-      return cloudsqlHandler(req, res);
-    }
-    try {
-      const uid = req.user?.uid || '';
-      const email = req.user?.email || 'reader@folio.app';
-      const displayName = req.user?.name || email.split('@')[0] || 'Reader';
-      const userKey = (email || uid).trim().toLowerCase();
-      const data = await withSqlTimeout(getUserLibraryFromSql(uid, email, displayName), 2500);
-      data.books = data.books.map(b => ({
-        ...b,
-        hasCloudPdf: Boolean(
-          b.hasCloudPdf || loadCloudPdfBuffer(userKey, b.bookKey, b.title) !== null
-        ),
-      }));
-      res.json(data);
-    } catch (error) {
-      sqlCooldownUntil = Date.now() + 60_000;
-      console.warn('Cloud SQL library fallback to local cloud store:', error);
-      return cloudsqlHandler(req, res);
-    }
-  });
-
-  app.post('/api/cloudsql/sync', requireAuth, async (req: AuthRequest, res) => {
-    const uid = req.user?.uid || '';
-    const email = req.user?.email || 'reader@folio.app';
-    const deletedBookKeys = Array.isArray(req.body?.deletedBookKeys)
-      ? req.body.deletedBookKeys.map(String)
-      : [];
-    const userKey = (email || uid).trim().toLowerCase();
-    for (const dk of deletedBookKeys) {
-      deleteCloudPdfBuffer(userKey, dk);
-    }
-
-    if (!canAttemptSql()) {
-      return cloudsqlHandler(req, res);
-    }
-
-    try {
-      const displayName =
-        String(req.body?.displayName || req.user?.name || email.split('@')[0] || 'Reader');
-      const booksInput = Array.isArray(req.body?.books) ? req.body.books : [];
-      const notesInput = Array.isArray(req.body?.notes) ? req.body.notes : [];
-      const readdedBookKeys = Array.isArray(req.body?.readdedBookKeys)
-        ? req.body.readdedBookKeys.map(String)
-        : [];
-
-      const data = await withSqlTimeout(
-        syncUserLibraryToSql(
-          uid,
-          email,
-          displayName,
-          booksInput,
-          notesInput,
-          deletedBookKeys,
-          readdedBookKeys
-        ),
-        2500
-      );
-      res.json(data);
-    } catch (error) {
-      sqlCooldownUntil = Date.now() + 60_000;
-      console.warn('Cloud SQL sync fallback to local cloud store:', error);
-      return cloudsqlHandler(req, res);
-    }
-  });
-
-  app.post('/api/cloudsql/vocabulary', requireAuth, async (req: AuthRequest, res) => {
-    if (!canAttemptSql()) {
-      return cloudsqlHandler(req, res);
-    }
-    try {
-      const uid = req.user?.uid || '';
-      const email = req.user?.email || 'reader@folio.app';
-      const saved = await withSqlTimeout(
-        saveVocabularyToSql(uid, email, {
-          word: String(req.body?.word || ''),
-          partOfSpeech: String(req.body?.partOfSpeech || ''),
-          persianMeaning: String(req.body?.persianMeaning || ''),
-          englishMeaning: String(req.body?.englishMeaning || ''),
-          contextExplanation: String(req.body?.contextExplanation || ''),
-          bookTitle: String(req.body?.bookTitle || ''),
-          page: Number(req.body?.page) || 1,
-        }),
-        2500
-      );
-      res.json({ entry: saved });
-    } catch (error) {
-      sqlCooldownUntil = Date.now() + 60_000;
-      console.warn('Cloud SQL vocabulary fallback to local cloud store:', error);
-      return cloudsqlHandler(req, res);
-    }
   });
 
   // Mount Vite dev server or production static files

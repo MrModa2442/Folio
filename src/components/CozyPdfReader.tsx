@@ -56,6 +56,11 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
         blob = await getPdfBlob(book.id);
       }
 
+      if (blob && blob.size > 100) {
+        // Ensure this local book's PDF is also pushed to the Cloud so other devices (iPad/phone) can open it
+        uploadBookPdfToCloud(book, undefined, false).catch(() => {});
+      }
+
       // 1. If book was synced from another device (e.g. PC -> iPad), download PDF from Cloud Sync store with automatic retries
       if (!blob) {
         for (let attempt = 1; attempt <= 3; attempt++) {
@@ -64,7 +69,9 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
               ? 'Downloading book PDF from Cloud...'
               : `Waiting for Cloud PDF sync (attempt ${attempt}/3)...`
           );
-          const cloudBlob = await downloadBookPdfFromCloud(book);
+          const cloudBlob = await downloadBookPdfFromCloud(book, pct => {
+            setLoadingMessage(`Downloading book PDF from Cloud (${pct}%)...`);
+          });
           if (cloudBlob && cloudBlob.size > 100) {
             blob = cloudBlob;
             await storePdfBlob(blobKey, cloudBlob).catch(() => {});

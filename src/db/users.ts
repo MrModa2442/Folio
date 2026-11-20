@@ -1,4 +1,4 @@
-import { db } from './index.ts';
+import { db, getDb, ensureSqlSchemaInitialized } from './index.ts';
 import { users, sqlBooks, sqlNotes, sqlVocabulary } from './schema.ts';
 import { and, desc, eq } from 'drizzle-orm';
 
@@ -6,7 +6,9 @@ export async function getOrCreateUser(uid: string, email: string, displayName = 
   const normalizedEmail = (email || 'reader@folio.app').trim().toLowerCase();
   const effectiveUid = normalizedEmail ? `email_${normalizedEmail.replace(/[^a-z0-9]/g, '_')}` : uid;
   try {
-    const result = await db
+    await ensureSqlSchemaInitialized();
+    const activeDb = getDb() || db;
+    const result = await activeDb
       .insert(users)
       .values({
         uid: effectiveUid,

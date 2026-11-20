@@ -14,6 +14,7 @@ import {
   Info,
   HardDrive,
   ShieldCheck,
+  Database,
 } from 'lucide-react';
 import { User } from 'firebase/auth';
 import { AppTheme, Book, Booklist } from '../types/library';
@@ -24,6 +25,10 @@ import {
   syncBooksWithCloudSql,
   fetchCloudSqlLibrary,
   syncBookToFirestore,
+  uploadAllLocalBookPdfsToCloud,
+  getCustomDatabaseUrl,
+  setCustomDatabaseUrl,
+  testCloudDatabaseUrl,
   CloudSqlSyncResponse,
 } from '../services/cloudSync';
 
@@ -95,6 +100,8 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
   const [cloudData, setCloudData] = useState<CloudSqlSyncResponse | null>(null);
   const [isInfoOpen, setIsInfoOpen] = useState(false);
   const [isInfoPinned, setIsInfoPinned] = useState(false);
+  const [showDbSetup, setShowDbSetup] = useState(false);
+  const [dbUrlInput, setDbUrlInput] = useState(() => getCustomDatabaseUrl());
   const [googleEmailInput, setGoogleEmailInput] = useState(() => {
     try {
       return localStorage.getItem('folio_last_google_email') || '';
@@ -154,7 +161,7 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
     setIsCloudWorking(true);
     const safetyTimer = window.setTimeout(() => {
       if (!cancelled) setIsCloudWorking(false);
-    }, 4500);
+    }, 12000);
 
     syncBooksWithCloudSql(books)
       .then(res => {
@@ -340,12 +347,13 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
   const handleCloudSyncNow = async () => {
     if (!currentUser) return;
     setErrorMessage(null);
-    setStatusMessage(null);
+    setStatusMessage('Syncing library & uploading local book PDFs to Cloud...');
     setIsCloudWorking(true);
     try {
       for (const b of books) {
         await syncBookToFirestore(currentUser, b).catch(() => {});
       }
+      await uploadAllLocalBookPdfsToCloud(books, msg => setStatusMessage(msg));
       const sqlSynced = await syncBooksWithCloudSql(books);
       setCloudData(sqlSynced);
 
@@ -374,14 +382,53 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
         });
       }
 
+      const pdfReadyCount = sqlSynced.books.filter(b => b.hasCloudPdf).length;
+      if (sqlSynced.sqlError) {
+        setErrorMessage(`PostgreSQL error: ${sqlSynced.sqlError}`);
+      }
       setStatusMessage(
-        `Library verified & synced (${sqlSynced.books.length} ${
+        `Library & PDFs synced (${sqlSynced.books.length} ${
           sqlSynced.books.length === 1 ? 'book' : 'books'
-        }, ${sqlSynced.notes.length} pinned ${sqlSynced.notes.length === 1 ? 'note' : 'notes'})!`
+        }, ${pdfReadyCount} PDF ${pdfReadyCount === 1 ? 'file' : 'files'} stored in ${
+          sqlSynced.storageMode === 'postgres' ? 'PostgreSQL' : 'temporary memory'
+        })!`
       );
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Cloud sync failed.');
     } finally {
+      setIsCloudWorking(false);
+    }
+  };
+
+  const handleSaveCustomDbUrl = async () => {
+    setErrorMessage(null);
+    setStatusMessage('Testing PostgreSQL connection & creating tables...');
+    setIsCloudWorking(true);
+    try {
+      const cleaned = dbUrlInput.trim();
+      setCustomDatabaseUrl(cleaned);
+      if (!cleaned) {
+        setShowDbSetup(false);
+        setStatusMessage('Cleared custom Database URL (using Vercel DATABASE_URL if set).');
+        setIsCloudWorking(false);
+        return;
+      }
+      const testRes = await testCloudDatabaseUrl(cleaned);
+      if (!testRes.ok) {
+        setErrorMessage(testRes.error || 'Could not connect to PostgreSQL.');
+        setStatusMessage(null);
+        setIsCloudWorking(false);
+        return;
+      }
+      setShowDbSetup(false);
+      setStatusMessage(testRes.message || 'Connected to PostgreSQL! Uploading library & PDFs...');
+      if (currentUser) {
+        await handleCloudSyncNow();
+      } else {
+        setIsCloudWorking(false);
+      }
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to test PostgreSQL.');
       setIsCloudWorking(false);
     }
   };
@@ -788,16 +835,16 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
                         <div className={`text-[10px] ${mutedText}`}>Synced Books</div>
                       </div>
                       <div className={`p-2.5 rounded-lg border ${innerCard}`}>
+                        <div className="text-sm font-bold text-emerald-500">
+                          {cloudData.books.filter(b => b.hasCloudPdf).length}/{cloudData.books.length}
+                        </div>
+                        <div className={`text-[10px] ${mutedText}`}>PDFs in Cloud</div>
+                      </div>
+                      <div className={`p-2.5 rounded-lg border ${innerCard}`}>
                         <div className="text-sm font-bold text-amber-500">
                           {cloudData.notes.length}
                         </div>
                         <div className={`text-[10px] ${mutedText}`}>Pinned Notes</div>
-                      </div>
-                      <div className={`p-2.5 rounded-lg border ${innerCard}`}>
-                        <div className="text-sm font-bold text-sky-500">
-                          {cloudData.vocabulary.length}
-                        </div>
-                        <div className={`text-[10px] ${mutedText}`}>Saved Words</div>
                       </div>
                     </div>
                   )}
@@ -810,9 +857,72 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${isCloudWorking ? 'animate-spin' : ''}`} />
                     <span>
-                      {isCloudWorking ? 'Auto-Syncing with Cloud...' : 'Verify & Refresh Cloud Now'}
+                      {isCloudWorking
+                        ? 'Syncing Library & Uploading PDFs...'
+                        : 'Upload Local PDFs & Refresh Cloud Now'}
                     </span>
                   </button>
+
+                  {/* Permanent Cloud Database Setup (for Vercel multi-device PDF persistence) */}
+                  <div className={`rounded-xl border p-3 text-xs space-y-2 ${innerCard}`}>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Database
+                          className={`w-3.5 h-3.5 shrink-0 ${
+                            cloudData?.storageMode === 'postgres'
+                              ? 'text-emerald-500'
+                              : 'text-amber-500'
+                          }`}
+                        />
+                        <span className="font-semibold truncate">
+                          {cloudData?.storageMode === 'postgres'
+                            ? 'Permanent PostgreSQL Database Connected'
+                            : 'Serverless Memory Mode (Connect Postgres for Permanent PDFs)'}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowDbSetup(prev => !prev)}
+                        className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[11px] font-semibold shrink-0"
+                      >
+                        {showDbSetup ? 'Hide' : 'Configure DB'}
+                      </button>
+                    </div>
+
+                    {cloudData?.sqlError && (
+                      <div className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-2.5 py-1.5 break-words">
+                        DB Error: {cloudData.sqlError}
+                      </div>
+                    )}
+
+                    {showDbSetup && (
+                      <div className="space-y-2 pt-1 border-t border-white/10">
+                        <p className={`text-[11px] leading-relaxed ${mutedText}`}>
+                          Paste your <strong>Neon.tech</strong> or <strong>Supabase</strong>{' '}
+                          PostgreSQL connection string (<code>postgresql://...</code>) below (or set{' '}
+                          <code>DATABASE_URL</code> in Vercel Environment Variables) and click{' '}
+                          <strong>Test &amp; Save</strong>:
+                        </p>
+                        <div className="flex gap-1.5">
+                          <input
+                            type="text"
+                            value={dbUrlInput}
+                            onChange={e => setDbUrlInput(e.target.value)}
+                            placeholder="postgresql://user:pass@ep-xyz.neon.tech/neondb?sslmode=require"
+                            className={`flex-1 border rounded-lg px-2.5 py-1.5 text-[11px] font-mono focus:outline-none ${inputField}`}
+                          />
+                          <button
+                            type="button"
+                            disabled={isCloudWorking}
+                            onClick={handleSaveCustomDbUrl}
+                            className={`px-3 py-1.5 rounded-lg text-[11px] font-bold shrink-0 disabled:opacity-50 ${primaryBtn}`}
+                          >
+                            Test &amp; Save
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
 

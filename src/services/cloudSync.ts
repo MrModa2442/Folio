@@ -245,12 +245,42 @@ function notifyAuthListeners(): void {
   });
 }
 
+const STORAGE_CUSTOM_DB_URL_KEY = 'folio_custom_db_url_v1';
+
+export function getCustomDatabaseUrl(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    return (localStorage.getItem(STORAGE_CUSTOM_DB_URL_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+export function setCustomDatabaseUrl(url: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const clean = url.trim();
+    if (!clean) {
+      localStorage.removeItem(STORAGE_CUSTOM_DB_URL_KEY);
+    } else {
+      localStorage.setItem(STORAGE_CUSTOM_DB_URL_KEY, clean);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
 export function getActiveCloudUser(): User | null {
   return auth.currentUser || loadFallbackCloudUser();
 }
 
 export async function getCloudAuthHeaders(): Promise<Record<string, string>> {
   const headers: Record<string, string> = {};
+  const customDbUrl = getCustomDatabaseUrl();
+  if (customDbUrl) {
+    headers['x-folio-db-url'] = customDbUrl;
+  }
+
   if (auth.currentUser) {
     try {
       const idToken = await auth.currentUser.getIdToken();
@@ -662,6 +692,38 @@ export interface CloudSqlSyncResponse {
     createdAt: string;
   }>;
   deletedBookKeys?: string[];
+  storageMode?: 'postgres' | 'ephemeral-tmp';
+  sqlError?: string;
+}
+
+export async function testCloudDatabaseUrl(
+  databaseUrl?: string
+): Promise<{ ok: boolean; storageMode?: string; message?: string; error?: string }> {
+  try {
+    const authHeaders = await getCloudAuthHeaders();
+    const res = await fetch('/api/cloudsql/test-db', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders,
+      },
+      body: JSON.stringify({
+        databaseUrl: (databaseUrl ?? getCustomDatabaseUrl()).trim(),
+      }),
+    });
+    const data = await res.json();
+    return {
+      ok: Boolean(res.ok && data?.ok),
+      storageMode: data?.storageMode,
+      message: data?.message,
+      error: data?.error,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Network error testing PostgreSQL connection.',
+    };
+  }
 }
 
 const uploadedPdfBookKeys = new Set<string>();
@@ -701,8 +763,8 @@ export async function uploadBookPdfToCloud(
     const buffer = await blob.arrayBuffer();
     const authHeaders = await getCloudAuthHeaders();
 
-    // Split into 1.2 MB raw chunks (~1.6 MB base64 each) so it never exceeds serverless 4.5 MB body limits
-    const CHUNK_BYTE_SIZE = Math.floor(1.2 * 1024 * 1024);
+    // Split into 1.5 MB raw chunks (~2.0 MB base64 JSON) so EVERY request stays well below Vercel's 4.5 MB limit
+    const CHUNK_BYTE_SIZE = Math.floor(1.5 * 1024 * 1024);
     const totalChunks = Math.max(1, Math.ceil(buffer.byteLength / CHUNK_BYTE_SIZE));
 
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
@@ -743,7 +805,41 @@ export async function uploadBookPdfToCloud(
   return false;
 }
 
-export async function downloadBookPdfFromCloud(book: Book): Promise<Blob | null> {
+export async function uploadAllLocalBookPdfsToCloud(
+  books: Book[],
+  onStatus?: (status: string) => void
+): Promise<number> {
+  const currentUser = getActiveCloudUser();
+  if (!currentUser) return 0;
+  let uploadedCount = 0;
+  const activeBooks = books.filter(b => !isBookDeletedLocally(b.id, b.title));
+  for (const b of activeBooks) {
+    let blob = await getPdfBlob(b.pdfBlobKey || b.id);
+    if (!blob && b.id && b.pdfBlobKey !== b.id) {
+      blob = await getPdfBlob(b.id);
+    }
+    if (!blob || blob.size < 100) continue;
+    if (onStatus) {
+      onStatus(`Uploading PDF for "${b.title}" (0%)...`);
+    }
+    const ok = await uploadBookPdfToCloud(
+      b,
+      pct => {
+        if (onStatus) {
+          onStatus(`Uploading PDF for "${b.title}" (${pct}%)...`);
+        }
+      },
+      true
+    );
+    if (ok) uploadedCount++;
+  }
+  return uploadedCount;
+}
+
+export async function downloadBookPdfFromCloud(
+  book: Book,
+  onProgress?: (percent: number) => void
+): Promise<Blob | null> {
   const currentUser = getActiveCloudUser();
   if (!currentUser) return null;
   if (isBookDeletedLocally(book.id, book.title)) return null;
@@ -760,19 +856,63 @@ export async function downloadBookPdfFromCloud(book: Book): Promise<Blob | null>
   try {
     const authHeaders = await getCloudAuthHeaders();
     const titleParam = encodeURIComponent(book.title || '');
+
     for (const key of candidateKeys) {
-      const res = await fetch(
-        `/api/cloudsql/pdf?bookKey=${encodeURIComponent(key)}&title=${titleParam}`,
+      // 1. Ask server for chunk metadata (avoids Vercel's 4.5 MB single-response body limit!)
+      const metaRes = await fetch(
+        `/api/cloudsql/pdf?bookKey=${encodeURIComponent(key)}&title=${titleParam}&mode=meta`,
         {
           headers: {
             ...authHeaders,
           },
         }
       );
-      if (res.ok) {
-        const blob = await res.blob();
-        if (blob && blob.size > 100) {
-          return blob;
+
+      if (!metaRes.ok) {
+        continue;
+      }
+
+      const meta = (await metaRes.json()) as {
+        found?: boolean;
+        matchedBookKey?: string;
+        totalChunks?: number;
+      };
+      if (!meta?.found || !meta.totalChunks || meta.totalChunks < 1) {
+        continue;
+      }
+
+      const resolvedKey = meta.matchedBookKey || key;
+      const totalChunks = meta.totalChunks;
+      const chunkBuffers: ArrayBuffer[] = [];
+
+      for (let i = 0; i < totalChunks; i++) {
+        const partRes = await fetch(
+          `/api/cloudsql/pdf?bookKey=${encodeURIComponent(resolvedKey)}&title=${titleParam}&chunkIndex=${i}`,
+          {
+            headers: {
+              ...authHeaders,
+            },
+          }
+        );
+        if (!partRes.ok) {
+          chunkBuffers.length = 0;
+          break;
+        }
+        const buf = await partRes.arrayBuffer();
+        if (buf.byteLength === 0) {
+          chunkBuffers.length = 0;
+          break;
+        }
+        chunkBuffers.push(buf);
+        if (onProgress) {
+          onProgress(Math.round(((i + 1) / totalChunks) * 100));
+        }
+      }
+
+      if (chunkBuffers.length === totalChunks) {
+        const fullBlob = new Blob(chunkBuffers, { type: 'application/pdf' });
+        if (fullBlob.size > 100) {
+          return fullBlob;
         }
       }
     }
@@ -1011,7 +1151,7 @@ export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSync
   );
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 7000);
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
   let res: Response;
   try {
     res = await fetch('/api/cloudsql/sync', {
@@ -1074,7 +1214,7 @@ export async function fetchCloudSqlLibrary(): Promise<CloudSqlSyncResponse> {
   }
   const authHeaders = await getCloudAuthHeaders();
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 7000);
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
   let res: Response;
   try {
     res = await fetch('/api/cloudsql/library', {
