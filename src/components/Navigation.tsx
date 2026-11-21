@@ -1,6 +1,5 @@
 import React from 'react';
 import { AppTheme, Book, Booklist, UiSectionPreferences, DEFAULT_UI_PREFERENCES } from '../types/library';
-import { PWAInstallButton } from './PWAInstallButton';
 import { Plus, Moon, Sun, Coffee } from 'lucide-react';
 
 interface NavigationProps {
@@ -22,9 +21,6 @@ export const Navigation: React.FC<NavigationProps> = ({
   currentTab,
   onSelectTab,
   onOpenImport,
-  books,
-  booklists,
-  onRestoreLibrary,
   theme,
   onChangeTheme,
   uiPreferences = DEFAULT_UI_PREFERENCES,
@@ -96,7 +92,7 @@ export const Navigation: React.FC<NavigationProps> = ({
         )}
       </nav>
 
-      {/* Zone 3: Theme Switcher, Offline iPad App & Import PDF */}
+      {/* Zone 3: Theme Switcher & Import PDF */}
       <div className="flex items-center gap-2 shrink-0">
         {/* Minimal Theme Switcher */}
         <div
@@ -141,14 +137,6 @@ export const Navigation: React.FC<NavigationProps> = ({
             <Coffee className="w-3.5 h-3.5" />
           </button>
         </div>
-
-        {/* Mandatory In-App Offline / iPad PWA Install & Vault Button */}
-        <PWAInstallButton
-          books={books}
-          booklists={booklists}
-          onRestoreLibrary={onRestoreLibrary}
-          theme={theme}
-        />
 
         {/* Primary CTA */}
         <button

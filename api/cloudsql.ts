@@ -28,8 +28,10 @@ export interface StoredCloudBook {
   telegramMessageId?: number;
   bookmarks?: PageBookmark[];
   highlights?: Record<number, PageHighlightStroke[]>;
+  annotationsUpdatedAt?: number;
   hasCloudPdf?: boolean;
   pageOffset?: number;
+  pageAnchors?: Array<{ pdfPage: number; bookPage: number }>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   chapters?: any[];
   chaptersLocked?: boolean;
@@ -356,6 +358,67 @@ async function pgGetOrCreateUser(
   };
 }
 
+function cleanHighlightsRecord(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  raw: any
+): Record<number, PageHighlightStroke[]> {
+  const cleaned: Record<number, PageHighlightStroke[]> = {};
+  if (!raw || typeof raw !== 'object') return cleaned;
+  for (const [k, strokes] of Object.entries(raw)) {
+    if (Array.isArray(strokes) && strokes.length > 0) {
+      cleaned[Number(k)] = strokes as PageHighlightStroke[];
+    }
+  }
+  return cleaned;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function resolveBookAnnotations(b: any, prevMeta: Record<string, any> = {}): {
+  bookmarks: PageBookmark[];
+  highlights: Record<number, PageHighlightStroke[]>;
+  annotationsUpdatedAt?: number;
+} {
+  const incomingBookmarks: PageBookmark[] = Array.isArray(b.bookmarks)
+    ? b.bookmarks.filter((bm: PageBookmark) => bm && typeof bm.page === 'number')
+    : [];
+  const prevBookmarks: PageBookmark[] = Array.isArray(prevMeta.bookmarks)
+    ? prevMeta.bookmarks.filter((bm: PageBookmark) => bm && typeof bm.page === 'number')
+    : [];
+  const incomingHighlights = cleanHighlightsRecord(b.highlights);
+  const prevHighlights = cleanHighlightsRecord(prevMeta.highlights);
+
+  const incomingTs = Number(b.annotationsUpdatedAt) || 0;
+  const prevTs = Number(prevMeta.annotationsUpdatedAt) || 0;
+
+  if (incomingTs > 0 && incomingTs >= prevTs) {
+    // Authoritative update/deletion from client — do NOT resurrect deleted notes or highlights!
+    return {
+      bookmarks: [...incomingBookmarks].sort((a, c) => a.page - c.page),
+      highlights: incomingHighlights,
+      annotationsUpdatedAt: incomingTs,
+    };
+  }
+
+  if (prevTs > incomingTs) {
+    // Cloud already holds newer edits/deletions from another device
+    return {
+      bookmarks: [...prevBookmarks].sort((a, c) => a.page - c.page),
+      highlights: prevHighlights,
+      annotationsUpdatedAt: prevTs,
+    };
+  }
+
+  // Legacy fallback when neither side has annotationsUpdatedAt yet
+  const bmMap = new Map<number, PageBookmark>();
+  for (const bm of prevBookmarks) bmMap.set(bm.page, bm);
+  for (const bm of incomingBookmarks) bmMap.set(bm.page, bm);
+  return {
+    bookmarks: Array.from(bmMap.values()).sort((a, c) => a.page - c.page),
+    highlights: { ...prevHighlights, ...incomingHighlights },
+    annotationsUpdatedAt: undefined,
+  };
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function packBookMetadata(b: any, prevMeta: Record<string, any> = {}, isDeleted = false): string {
   if (isDeleted) {
@@ -366,21 +429,7 @@ function packBookMetadata(b: any, prevMeta: Record<string, any> = {}, isDeleted 
     });
   }
 
-  const incomingBookmarks: PageBookmark[] = Array.isArray(b.bookmarks) ? b.bookmarks : [];
-  const prevBookmarks: PageBookmark[] = Array.isArray(prevMeta.bookmarks) ? prevMeta.bookmarks : [];
-  const bmMap = new Map<number, PageBookmark>();
-  for (const bm of prevBookmarks) {
-    if (bm && typeof bm.page === 'number') bmMap.set(bm.page, bm);
-  }
-  for (const bm of incomingBookmarks) {
-    if (bm && typeof bm.page === 'number') bmMap.set(bm.page, bm);
-  }
-  const mergedBookmarks = Array.from(bmMap.values()).sort((a, c) => a.page - c.page);
-
-  const mergedHighlights = {
-    ...(prevMeta.highlights || {}),
-    ...(b.highlights && typeof b.highlights === 'object' ? b.highlights : {}),
-  };
+  const resolvedAnn = resolveBookAnnotations(b, prevMeta);
 
   return JSON.stringify({
     status:
@@ -398,14 +447,21 @@ function packBookMetadata(b: any, prevMeta: Record<string, any> = {}, isDeleted 
     coverImage: b.coverImage || prevMeta.coverImage,
     telegramChannel: b.telegramChannel || prevMeta.telegramChannel,
     telegramMessageId: b.telegramMessageId || prevMeta.telegramMessageId,
-    bookmarks: mergedBookmarks,
-    highlights: mergedHighlights,
+    bookmarks: resolvedAnn.bookmarks,
+    highlights: resolvedAnn.highlights,
+    annotationsUpdatedAt: resolvedAnn.annotationsUpdatedAt,
     hasCloudPdf: Boolean(b.hasCloudPdf || prevMeta.hasCloudPdf),
     pageOffset:
       typeof b.pageOffset === 'number'
         ? b.pageOffset
         : typeof prevMeta.pageOffset === 'number'
         ? prevMeta.pageOffset
+        : undefined,
+    pageAnchors:
+      Array.isArray(b.pageAnchors)
+        ? b.pageAnchors
+        : Array.isArray(prevMeta.pageAnchors)
+        ? prevMeta.pageAnchors
         : undefined,
     chapters: Array.isArray(b.chapters) && b.chapters.length > 0 ? b.chapters : prevMeta.chapters,
     chaptersLocked:
@@ -447,9 +503,12 @@ function unpackPgBookRow(row: any): StoredCloudBook & { deleted: boolean } {
     telegramChannel: meta.telegramChannel,
     telegramMessageId: meta.telegramMessageId,
     bookmarks: Array.isArray(meta.bookmarks) ? meta.bookmarks : [],
-    highlights: meta.highlights && typeof meta.highlights === 'object' ? meta.highlights : {},
+    highlights: cleanHighlightsRecord(meta.highlights),
+    annotationsUpdatedAt:
+      typeof meta.annotationsUpdatedAt === 'number' ? meta.annotationsUpdatedAt : undefined,
     hasCloudPdf: Boolean(meta.hasCloudPdf),
     pageOffset: typeof meta.pageOffset === 'number' ? meta.pageOffset : undefined,
+    pageAnchors: Array.isArray(meta.pageAnchors) ? meta.pageAnchors : undefined,
     chapters: Array.isArray(meta.chapters) ? meta.chapters : undefined,
     chaptersLocked: typeof meta.chaptersLocked === 'boolean' ? meta.chaptersLocked : undefined,
     updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString(),
@@ -717,7 +776,8 @@ async function pgSyncLibrary(
     }
   }
 
-  // Upsert active books
+  // Upsert active books and track books with authoritative annotation updates so deleted notes are purged from sql_notes
+  const authoritativeNoteBookKeys = new Set<string>();
   for (const b of booksInput.slice(0, 150)) {
     const bookKey = String(b.bookKey || b.title || '').trim();
     const title = String(b.title || 'Untitled').slice(0, 200);
@@ -731,7 +791,19 @@ async function pgSyncLibrary(
 
     if (existing) {
       const prev = unpackPgBookRow(existing);
-      const packed = packBookMetadata(b, prev.deleted ? {} : prev, false);
+      const prevMetaObj = prev.deleted ? {} : prev;
+      const resolvedAnn = resolveBookAnnotations(b, prevMetaObj);
+      const incomingTs = Number(b.annotationsUpdatedAt) || 0;
+      const prevTs = Number(prev.annotationsUpdatedAt) || 0;
+      if (incomingTs > 0 && incomingTs >= prevTs) {
+        authoritativeNoteBookKeys.add(bookKey);
+        authoritativeNoteBookKeys.add(existing.book_key);
+      }
+
+      const packed = packBookMetadata(b, prevMetaObj, false);
+      const nextBookmarkCount = resolvedAnn.bookmarks.length;
+      const nextHighlightCount = Object.keys(resolvedAnn.highlights).length;
+
       await pool.query(
         `UPDATE sql_books
          SET title = $1, author = $2, category = $3, current_page = $4, total_pages = $5,
@@ -743,12 +815,16 @@ async function pgSyncLibrary(
           packed,
           prev.deleted ? Number(b.currentPage) || 1 : Math.max(Number(existing.current_page) || 1, Number(b.currentPage) || 1),
           prev.deleted ? Number(b.totalPages) || 1 : Math.max(Number(existing.total_pages) || 1, Number(b.totalPages) || 1),
-          prev.deleted ? Number(b.bookmarkCount) || 0 : Math.max(Number(existing.bookmark_count) || 0, Number(b.bookmarkCount) || 0),
-          prev.deleted ? Number(b.highlightCount) || 0 : Math.max(Number(existing.highlight_count) || 0, Number(b.highlightCount) || 0),
+          nextBookmarkCount,
+          nextHighlightCount,
           existing.id,
         ]
       );
     } else {
+      const resolvedAnn = resolveBookAnnotations(b, {});
+      if ((Number(b.annotationsUpdatedAt) || 0) > 0) {
+        authoritativeNoteBookKeys.add(bookKey);
+      }
       const packed = packBookMetadata(b, {}, false);
       await pool.query(
         `INSERT INTO sql_books (user_id, book_key, title, author, category, current_page, total_pages, bookmark_count, highlight_count)
@@ -761,11 +837,19 @@ async function pgSyncLibrary(
           packed,
           Math.max(1, Number(b.currentPage) || 1),
           Math.max(1, Number(b.totalPages) || 1),
-          Math.max(0, Number(b.bookmarkCount) || 0),
-          Math.max(0, Number(b.highlightCount) || 0),
+          resolvedAnn.bookmarks.length,
+          Object.keys(resolvedAnn.highlights).length,
         ]
       );
     }
+  }
+
+  // Purge stale sql_notes rows for books with authoritative annotation updates so deleted notes NEVER resurrect
+  for (const bk of authoritativeNoteBookKeys) {
+    await pool.query(`DELETE FROM sql_notes WHERE user_id = $1 AND book_key = $2`, [
+      userRecord.id,
+      bk,
+    ]);
   }
 
   // Merge notes
@@ -1622,6 +1706,7 @@ export default async function handler(req: any, res: any) {
     }
 
     let nextBookId = existingRecord.books.length + 1;
+    const fallbackAuthoritativeBookKeys = new Set<string>();
     for (const b of booksInput.slice(0, 200)) {
       const bookKey = String(b.bookKey || b.title || `book_${nextBookId}`);
       const bookTitle = String(b.title || '');
@@ -1631,21 +1716,12 @@ export default async function handler(req: any, res: any) {
       }
 
       const prev = bookMap.get(bookKey);
-      const incomingBookmarks: PageBookmark[] = Array.isArray(b.bookmarks) ? b.bookmarks : [];
-      const prevBookmarks: PageBookmark[] = Array.isArray(prev?.bookmarks) ? prev.bookmarks : [];
-      const mergedBookmarksMap = new Map<number, PageBookmark>();
-      for (const bm of prevBookmarks) {
-        if (bm && typeof bm.page === 'number') mergedBookmarksMap.set(bm.page, bm);
+      const resolvedAnn = resolveBookAnnotations(b, prev || {});
+      const incomingTs = Number(b.annotationsUpdatedAt) || 0;
+      const prevTs = Number(prev?.annotationsUpdatedAt) || 0;
+      if (incomingTs > 0 && incomingTs >= prevTs) {
+        fallbackAuthoritativeBookKeys.add(bookKey.toLowerCase());
       }
-      for (const bm of incomingBookmarks) {
-        if (bm && typeof bm.page === 'number') mergedBookmarksMap.set(bm.page, bm);
-      }
-      const mergedBookmarks = Array.from(mergedBookmarksMap.values()).sort((a, c) => a.page - c.page);
-
-      const mergedHighlights: Record<number, PageHighlightStroke[]> = {
-        ...(prev?.highlights || {}),
-        ...(b.highlights && typeof b.highlights === 'object' ? b.highlights : {}),
-      };
 
       const hasPdfInCloud = Boolean(
         prev?.hasCloudPdf || loadCloudPdfBuffer(userKey, bookKey, bookTitle) !== null
@@ -1659,12 +1735,8 @@ export default async function handler(req: any, res: any) {
         category: String(b.category || prev?.category || 'reading'),
         currentPage: Math.max(prev?.currentPage || 1, Number(b.currentPage) || 1),
         totalPages: Math.max(prev?.totalPages || 1, Number(b.totalPages) || 1),
-        bookmarkCount: Math.max(mergedBookmarks.length, Number(b.bookmarkCount) || 0),
-        highlightCount: Math.max(
-          Object.keys(mergedHighlights).filter(k => (mergedHighlights[Number(k)] || []).length > 0)
-            .length,
-          Number(b.highlightCount) || 0
-        ),
+        bookmarkCount: resolvedAnn.bookmarks.length,
+        highlightCount: Object.keys(resolvedAnn.highlights).length,
         fileName: String(b.fileName || prev?.fileName || `${b.title || 'book'}.pdf`),
         fileSize: Number(b.fileSize) || prev?.fileSize || 0,
         spineColor: String(b.spineColor || prev?.spineColor || '#4A3525'),
@@ -1673,14 +1745,21 @@ export default async function handler(req: any, res: any) {
         coverImage: b.coverImage || prev?.coverImage || undefined,
         telegramChannel: b.telegramChannel || prev?.telegramChannel || undefined,
         telegramMessageId: Number(b.telegramMessageId) || prev?.telegramMessageId || undefined,
-        bookmarks: mergedBookmarks,
-        highlights: mergedHighlights,
+        bookmarks: resolvedAnn.bookmarks,
+        highlights: resolvedAnn.highlights,
+        annotationsUpdatedAt: resolvedAnn.annotationsUpdatedAt,
         hasCloudPdf: hasPdfInCloud,
         pageOffset:
           typeof b.pageOffset === 'number'
             ? b.pageOffset
             : typeof prev?.pageOffset === 'number'
             ? prev.pageOffset
+            : undefined,
+        pageAnchors:
+          Array.isArray(b.pageAnchors)
+            ? b.pageAnchors
+            : Array.isArray(prev?.pageAnchors)
+            ? prev.pageAnchors
             : undefined,
         chapters: Array.isArray(b.chapters) && b.chapters.length > 0 ? b.chapters : prev?.chapters,
         chaptersLocked:
@@ -1695,6 +1774,7 @@ export default async function handler(req: any, res: any) {
     const noteMap = new Map<string, StoredCloudNote>();
     for (const n of existingRecord.notes) {
       if (isBookKeyDeleted(n.bookKey, n.bookTitle)) continue;
+      if (fallbackAuthoritativeBookKeys.has(String(n.bookKey || '').toLowerCase())) continue;
       noteMap.set(n.noteKey, n);
     }
     let nextNoteId = existingRecord.notes.length + 1;

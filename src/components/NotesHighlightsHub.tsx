@@ -409,6 +409,7 @@ export const NotesHighlightsHub: React.FC<NotesHighlightsHubProps> = ({
     onUpdateBook({
       ...book,
       bookmarks: updatedBookmarks,
+      annotationsUpdatedAt: Date.now(),
     });
     setEditingPinKey(null);
     setEditingNoteDraft('');
@@ -419,6 +420,7 @@ export const NotesHighlightsHub: React.FC<NotesHighlightsHubProps> = ({
     onUpdateBook({
       ...book,
       bookmarks: updatedBookmarks,
+      annotationsUpdatedAt: Date.now(),
     });
   };
 
@@ -428,6 +430,7 @@ export const NotesHighlightsHub: React.FC<NotesHighlightsHubProps> = ({
     onUpdateBook({
       ...book,
       highlights: nextHighlights,
+      annotationsUpdatedAt: Date.now(),
     });
   };
 
@@ -730,7 +733,9 @@ export const NotesHighlightsHub: React.FC<NotesHighlightsHubProps> = ({
                           }
                           className="px-3.5 py-1.5 rounded-full text-[11px] font-bold bg-[#1DB954] text-black hover:bg-[#1ed760] flex items-center gap-1 transition-colors"
                         >
-                          <span>Open Highlighted Page</span>
+                          <span>
+                            {highlightEntries.length > 0 ? 'Open Highlighted Page' : 'Open Pinned Page'}
+                          </span>
                           <ExternalLink className="w-3 h-3" />
                         </button>
                         {highlightEntries.length === 1 && (

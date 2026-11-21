@@ -12,6 +12,11 @@ export interface BookChapter {
   printedEndPage?: number;
 }
 
+export interface BookPageAnchor {
+  pdfPage: number;
+  bookPage: number;
+}
+
 export interface Book {
   id: string;
   title: string;
@@ -34,7 +39,9 @@ export interface Book {
   coverImage?: string;
   bookmarks?: PageBookmark[];
   highlights?: Record<number, PageHighlightStroke[]>;
+  annotationsUpdatedAt?: number;
   pageOffset?: number;
+  pageAnchors?: BookPageAnchor[];
   chapters?: BookChapter[];
   chaptersLocked?: boolean;
 }

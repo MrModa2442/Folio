@@ -86,7 +86,8 @@ function computeLibrarySyncSignature(booksList: Book[]): string {
       const hlSig = Object.entries(b.highlights || {})
         .map(([pg, arr]) => `${pg}:${Array.isArray(arr) ? arr.length : 0}`)
         .join(',');
-      return `${b.id}|${b.title}|${b.currentPage}/${b.pageCount}|${b.pageOffset ?? ''}|${bmSig}|${hlSig}`;
+      const anchorsSig = (b.pageAnchors || []).map(a => `${a.pdfPage}>${a.bookPage}`).join(',');
+      return `${b.id}|${b.title}|${b.currentPage}/${b.pageCount}|${b.pageOffset ?? ''}|${anchorsSig}|${b.annotationsUpdatedAt ?? ''}|${bmSig}|${hlSig}`;
     })
     .join(';;');
   const deletedPart = getDeletedBookKeys().sort().join(',');

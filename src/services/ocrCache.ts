@@ -1,6 +1,6 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { createWorker, Worker as TesseractWorker } from 'tesseract.js';
-import { Book } from '../types/library';
+import { Book, BookPageAnchor } from '../types/library';
 import { getPdfBlob } from './db';
 
 if (typeof window !== 'undefined') {
@@ -15,6 +15,7 @@ const CHAPTERS_UPDATED_EVENT = 'folio-chapters-updated';
 const PAGE_OFFSET_UPDATED_EVENT = 'folio-page-offset-updated';
 const CHAPTERS_STORAGE_PREFIX = 'folio_book_chapters_v4_';
 const PAGE_OFFSET_STORAGE_PREFIX = 'folio_page_offset_v3_';
+const PAGE_ANCHORS_STORAGE_PREFIX = 'folio_page_anchors_v1_';
 
 export interface StoredBookOcr {
   docKey: string;
@@ -47,6 +48,7 @@ export interface ChaptersUpdateEventDetail {
 export interface PageOffsetUpdateEventDetail {
   docKey: string;
   pageOffset: number;
+  pageAnchors?: BookPageAnchor[];
 }
 
 export function normalizeDigitsToAsciiClient(str: string): string {
@@ -54,6 +56,156 @@ export function normalizeDigitsToAsciiClient(str: string): string {
     .replace(/([۱-۹١-٩0-9])[.٫•·∙⋅](?=\s|$)/g, '$10')
     .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06f0))
     .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660));
+}
+
+export function normalizePageAnchors(anchors: BookPageAnchor[]): BookPageAnchor[] {
+  if (!Array.isArray(anchors) || anchors.length === 0) return [];
+  const byPdf = new Map<number, BookPageAnchor>();
+  for (const a of anchors) {
+    const pdfPage = Math.round(Number(a?.pdfPage));
+    const bookPage = Math.round(Number(a?.bookPage));
+    if (Number.isFinite(pdfPage) && Number.isFinite(bookPage) && pdfPage >= 1 && bookPage >= 1) {
+      byPdf.set(pdfPage, { pdfPage, bookPage });
+    }
+  }
+  return Array.from(byPdf.values()).sort((a, b) => a.pdfPage - b.pdfPage);
+}
+
+/**
+ * Converts a physical 1-based PDF page into the printed Book Page number
+ * using piecewise anchors (supports front matter, negative offsets, and mid-book censored gaps).
+ */
+export function pdfPageToBookPage(
+  pdfPage: number,
+  anchors: BookPageAnchor[],
+  fallbackOffset = 0
+): number {
+  const normalized = normalizePageAnchors(anchors);
+  if (normalized.length === 0) {
+    return pdfPage - Math.round(fallbackOffset || 0);
+  }
+  let active = normalized[0];
+  for (const anchor of normalized) {
+    if (anchor.pdfPage <= pdfPage) {
+      active = anchor;
+    } else {
+      break;
+    }
+  }
+  return active.bookPage + (pdfPage - active.pdfPage);
+}
+
+/**
+ * Converts a target printed Book Page number (e.g. 200) back into the exact physical PDF page
+ * using piecewise anchors. If the requested page was removed/censored between two anchors,
+ * jumps to the closest surviving page at the gap boundary and flags `wasCensoredGap: true`.
+ */
+export function bookPageToPdfPage(
+  targetBookPage: number,
+  totalPdfPages: number,
+  anchors: BookPageAnchor[],
+  fallbackOffset = 0
+): { pdfPage: number; wasCensoredGap?: boolean } {
+  const safeTotal = Math.max(1, totalPdfPages);
+  const normalized = normalizePageAnchors(anchors);
+  if (normalized.length === 0) {
+    const offset = Math.round(fallbackOffset || 0);
+    return { pdfPage: Math.max(1, Math.min(safeTotal, targetBookPage + offset)) };
+  }
+
+  // 1. Check for an exact match inside any anchor segment
+  for (let i = 0; i < normalized.length; i++) {
+    const anchor = normalized[i];
+    const segStart = i === 0 ? 1 : anchor.pdfPage;
+    const segEnd = i + 1 < normalized.length ? normalized[i + 1].pdfPage - 1 : safeTotal;
+    const candPdf = anchor.pdfPage + (targetBookPage - anchor.bookPage);
+    if (candPdf >= segStart && candPdf <= segEnd) {
+      return { pdfPage: candPdf };
+    }
+  }
+
+  // 2. If target fell inside a censored/missing page gap between segments, pick closest boundary
+  let bestPdf = 1;
+  let bestDist = Infinity;
+  let insideGap = false;
+
+  for (let i = 0; i < normalized.length; i++) {
+    const anchor = normalized[i];
+    const segStart = i === 0 ? 1 : anchor.pdfPage;
+    const segEnd = i + 1 < normalized.length ? normalized[i + 1].pdfPage - 1 : safeTotal;
+    const startBook = anchor.bookPage + (segStart - anchor.pdfPage);
+    const endBook = anchor.bookPage + (segEnd - anchor.pdfPage);
+
+    const dStart = Math.abs(targetBookPage - startBook);
+    if (dStart < bestDist) {
+      bestDist = dStart;
+      bestPdf = segStart;
+    }
+    const dEnd = Math.abs(targetBookPage - endBook);
+    if (dEnd < bestDist) {
+      bestDist = dEnd;
+      bestPdf = segEnd;
+    }
+
+    if (i + 1 < normalized.length) {
+      const nextAnchor = normalized[i + 1];
+      if (targetBookPage > endBook && targetBookPage < nextAnchor.bookPage) {
+        insideGap = true;
+      }
+    }
+  }
+
+  return {
+    pdfPage: Math.max(1, Math.min(safeTotal, bestPdf)),
+    wasCensoredGap: insideGap,
+  };
+}
+
+export function loadCachedBookPageAnchors(docKey: string): BookPageAnchor[] {
+  if (!docKey || typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(`${PAGE_ANCHORS_STORAGE_PREFIX}${docKey}`);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return normalizePageAnchors(parsed);
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+export function saveCachedBookPageAnchors(docKey: string, anchors: BookPageAnchor[]): void {
+  if (!docKey || typeof window === 'undefined') return;
+  try {
+    const normalized = normalizePageAnchors(anchors);
+    if (normalized.length === 0) {
+      localStorage.removeItem(`${PAGE_ANCHORS_STORAGE_PREFIX}${docKey}`);
+      localStorage.removeItem(`${PAGE_OFFSET_STORAGE_PREFIX}${docKey}`);
+      window.dispatchEvent(
+        new CustomEvent<PageOffsetUpdateEventDetail>(PAGE_OFFSET_UPDATED_EVENT, {
+          detail: { docKey, pageOffset: 0, pageAnchors: [] },
+        })
+      );
+      return;
+    }
+    const primaryOffset = normalized[0].pdfPage - normalized[0].bookPage;
+    localStorage.setItem(`${PAGE_ANCHORS_STORAGE_PREFIX}${docKey}`, JSON.stringify(normalized));
+    localStorage.setItem(`${PAGE_OFFSET_STORAGE_PREFIX}${docKey}`, String(primaryOffset));
+    window.dispatchEvent(
+      new CustomEvent<PageOffsetUpdateEventDetail>(PAGE_OFFSET_UPDATED_EVENT, {
+        detail: { docKey, pageOffset: primaryOffset, pageAnchors: normalized },
+      })
+    );
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function clearCachedBookPageAnchors(docKey: string): void {
+  saveCachedBookPageAnchors(docKey, []);
 }
 
 export function loadCachedBookPageOffset(docKey: string): number | null {
@@ -87,9 +239,10 @@ export function clearCachedBookPageOffset(docKey: string): void {
   if (!docKey || typeof window === 'undefined') return;
   try {
     localStorage.removeItem(`${PAGE_OFFSET_STORAGE_PREFIX}${docKey}`);
+    localStorage.removeItem(`${PAGE_ANCHORS_STORAGE_PREFIX}${docKey}`);
     window.dispatchEvent(
       new CustomEvent<PageOffsetUpdateEventDetail>(PAGE_OFFSET_UPDATED_EVENT, {
-        detail: { docKey, pageOffset: 0 },
+        detail: { docKey, pageOffset: 0, pageAnchors: [] },
       })
     );
   } catch {
@@ -230,7 +383,10 @@ function extractCandidateNumbersFromEdgeLinesClient(
   if (lines.length > 2) edgeIndices.add(lines.length - 2);
 
   const results: Array<{ printedPage: number; weight: number }> = [];
-  const maxReasonableOffset = Math.min(45, Math.max(15, Math.floor(totalPages * 0.25)));
+  const maxPositiveOffset = Math.min(80, Math.max(25, Math.floor(totalPages * 0.35)));
+  // Allow large negative offsets too (when censored/untranslated pages were removed from the PDF!)
+  const maxNegativeOffset = Math.min(400, Math.max(60, Math.floor(totalPages * 0.6)));
+  const maxPrintedPage = totalPages + maxNegativeOffset;
 
   for (const idx of edgeIndices) {
     const rawLine = lines[idx] || '';
@@ -247,7 +403,7 @@ function extractCandidateNumbersFromEdgeLinesClient(
     if (standaloneMatch) {
       const n = parseInt(standaloneMatch[1], 10);
       const offset = pdfPage - n;
-      if (n >= 1 && n <= totalPages && offset >= -2 && offset <= maxReasonableOffset) {
+      if (n >= 1 && n <= maxPrintedPage && offset >= -maxNegativeOffset && offset <= maxPositiveOffset) {
         results.push({ printedPage: n, weight: 4 + baseBonus });
         continue;
       }
@@ -263,9 +419,9 @@ function extractCandidateNumbersFromEdgeLinesClient(
       const offset = pdfPage - n;
       if (
         n >= 1 &&
-        n <= totalPages &&
-        offset >= -2 &&
-        offset <= maxReasonableOffset &&
+        n <= maxPrintedPage &&
+        offset >= -maxNegativeOffset &&
+        offset <= maxPositiveOffset &&
         rest.length <= 65 &&
         !/[.…_ـ]{3,}/.test(line)
       ) {
@@ -279,9 +435,9 @@ function extractCandidateNumbersFromEdgeLinesClient(
       const offset = pdfPage - n;
       if (
         n >= 1 &&
-        n <= totalPages &&
-        offset >= -2 &&
-        offset <= maxReasonableOffset &&
+        n <= maxPrintedPage &&
+        offset >= -maxNegativeOffset &&
+        offset <= maxPositiveOffset &&
         rest.length <= 65 &&
         !/[.…_ـ]{3,}/.test(line)
       ) {
@@ -812,8 +968,16 @@ export async function detectPrintedPageNumberFromCorners(
   pageNum: number,
   totalPages: number
 ): Promise<number | null> {
-  if (pageNum < 2 || pageNum > totalPages) return null;
-  const maxReasonableOffset = Math.min(45, Math.max(15, Math.floor(totalPages * 0.25)));
+  if (pageNum < 1 || pageNum > totalPages) return null;
+  const maxPositiveOffset = Math.min(80, Math.max(25, Math.floor(totalPages * 0.35)));
+  const maxNegativeOffset = Math.min(400, Math.max(60, Math.floor(totalPages * 0.6)));
+  const maxPrintedPage = totalPages + maxNegativeOffset;
+
+  const isPlausibleNumber = (n: number): boolean => {
+    if (!Number.isFinite(n) || n < 1 || n > maxPrintedPage) return false;
+    const offset = pageNum - n;
+    return offset >= -maxNegativeOffset && offset <= maxPositiveOffset;
+  };
 
   // 1. Fast check: Native PDF text items in the 4 corners (top-right, top-left, bottom-right, bottom-left)
   try {
@@ -826,7 +990,7 @@ export async function detectPrintedPageNumberFromCorners(
     for (const rawIt of content.items) {
       const it = rawIt as { str?: string; transform?: number[] };
       const rawStr = (it.str || '').trim();
-      if (!rawStr || rawStr.length > 18) continue;
+      if (!rawStr || rawStr.length > 24) continue;
       const tx = it.transform ? it.transform[4] : 0;
       const ty = it.transform ? it.transform[5] : 0;
       const pt = vp.convertToViewportPoint(tx, ty);
@@ -841,8 +1005,7 @@ export async function detectPrintedPageNumberFromCorners(
       const m = clean.match(/^(?:[-–—~•*[\]()\s]|صفحه|ص\.?|page|p\.?)*(\d{1,4})(?:[-–—~•*[\]()\s])*$/i);
       if (m) {
         const n = parseInt(m[1], 10);
-        const offset = pageNum - n;
-        if (n >= 1 && n <= totalPages && offset >= -2 && offset <= maxReasonableOffset) {
+        if (isPlausibleNumber(n)) {
           return n;
         }
       }
@@ -855,14 +1018,9 @@ export async function detectPrintedPageNumberFromCorners(
   const cornerCrops = await extractCornerNumberCropsFromPage(pdfDoc, pageNum);
   if (cornerCrops.length === 0) return null;
 
-  // Check instant geometric sub-blob recognition first (e.g. '۱۰' = 10, '۱۱' = 11, '۱' = 1)
   for (const crop of cornerCrops) {
-    if (crop.geometricNumber !== null) {
-      const n = crop.geometricNumber;
-      const offset = pageNum - n;
-      if (n >= 1 && n <= totalPages && offset >= -2 && offset <= maxReasonableOffset) {
-        return n;
-      }
+    if (crop.geometricNumber !== null && isPlausibleNumber(crop.geometricNumber)) {
+      return crop.geometricNumber;
     }
   }
 
@@ -881,14 +1039,12 @@ export async function detectPrintedPageNumberFromCorners(
 
       if (n >= 1 && n <= 9 && crop.hasTrailingZeroDot) {
         const withZero = n * 10;
-        const offsetWithZero = pageNum - withZero;
-        if (offsetWithZero >= -2 && offsetWithZero <= maxReasonableOffset) {
+        if (isPlausibleNumber(withZero)) {
           n = withZero;
         }
       }
 
-      const offset = pageNum - n;
-      if (n >= 1 && n <= totalPages && offset >= -2 && offset <= maxReasonableOffset) {
+      if (isPlausibleNumber(n)) {
         return n;
       }
     }
@@ -897,6 +1053,103 @@ export async function detectPrintedPageNumberFromCorners(
   }
 
   return null;
+}
+
+/**
+ * Multi-point corner analyzer for books with front matter OR censored/missing pages in the middle.
+ * Samples distributed pages across the PDF (plus currentPage), reads their printed corner numbers,
+ * filters out OCR outliers, and constructs piecewise BookPageAnchor points automatically.
+ */
+export async function analyzeBookPageNumbers(
+  docKey: string,
+  totalPages: number,
+  pdfDoc: pdfjsLib.PDFDocumentProxy,
+  currentPage: number,
+  onProgress?: (scanned: number, total: number) => void
+): Promise<{
+  anchors: BookPageAnchor[];
+  matchedSamples: Array<{ pdfPage: number; bookPage: number }>;
+}> {
+  const sampleSet = new Set<number>();
+  if (currentPage >= 1 && currentPage <= totalPages) {
+    sampleSet.add(currentPage);
+    if (currentPage + 1 <= totalPages) sampleSet.add(currentPage + 1);
+  }
+  const ratios = [0.08, 0.16, 0.28, 0.42, 0.56, 0.72, 0.86];
+  for (const r of ratios) {
+    const p = Math.max(2, Math.min(totalPages - 1, Math.round(totalPages * r)));
+    sampleSet.add(p);
+  }
+  if (totalPages >= 15) sampleSet.add(15);
+
+  const samplePages = Array.from(sampleSet)
+    .filter(p => p >= 1 && p <= totalPages)
+    .sort((a, b) => a - b)
+    .slice(0, 9);
+
+  const rawObs: Array<{ pdfPage: number; bookPage: number }> = [];
+  for (let i = 0; i < samplePages.length; i++) {
+    const p = samplePages[i];
+    if (onProgress) onProgress(i + 1, samplePages.length);
+    const detected = await detectPrintedPageNumberFromCorners(pdfDoc, p, totalPages);
+    if (detected !== null && detected >= 1) {
+      rawObs.push({ pdfPage: p, bookPage: detected });
+    }
+  }
+
+  if (rawObs.length === 0) {
+    return { anchors: [], matchedSamples: [] };
+  }
+
+  // Filter monotonic increasing observations consistent with real book numbering (bookPage grows >= pdfPage delta - 1)
+  // Find longest/strongest valid chain of observations
+  const n = rawObs.length;
+  const dpLen = new Array<number>(n).fill(1);
+  const prevIdx = new Array<number>(n).fill(-1);
+
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < i; j++) {
+      const pdfDiff = rawObs[i].pdfPage - rawObs[j].pdfPage;
+      const bookDiff = rawObs[i].bookPage - rawObs[j].bookPage;
+      // Printed page difference should be at least pdfDiff (or equal when no pages censored; slightly larger if pages were censored!)
+      // Allow tiny -2 tolerance for roman/restarted numbering noise
+      if (bookDiff >= pdfDiff - 2 && bookDiff <= pdfDiff + Math.max(80, Math.floor(totalPages * 0.4))) {
+        if (dpLen[j] + 1 > dpLen[i]) {
+          dpLen[i] = dpLen[j] + 1;
+          prevIdx[i] = j;
+        }
+      }
+    }
+  }
+
+  let bestEnd = 0;
+  for (let i = 1; i < n; i++) {
+    if (dpLen[i] >= dpLen[bestEnd]) bestEnd = i;
+  }
+
+  const chain: Array<{ pdfPage: number; bookPage: number }> = [];
+  for (let cur = bestEnd; cur !== -1; cur = prevIdx[cur]) {
+    chain.push(rawObs[cur]);
+  }
+  chain.reverse();
+
+  // Collapse consecutive points with the exact same offset (`pdfPage - bookPage`) into a single clean anchor,
+  // while keeping distinct anchors whenever the offset jumps (e.g. censored/missing pages in the middle!).
+  const anchors: BookPageAnchor[] = [];
+  let lastOffset: number | null = null;
+  for (const pt of chain) {
+    const off = pt.pdfPage - pt.bookPage;
+    if (lastOffset === null || off !== lastOffset) {
+      anchors.push({ pdfPage: pt.pdfPage, bookPage: pt.bookPage });
+      lastOffset = off;
+    }
+  }
+
+  const normalized = normalizePageAnchors(anchors);
+  if (normalized.length > 0) {
+    saveCachedBookPageAnchors(docKey, normalized);
+  }
+  return { anchors: normalized, matchedSamples: chain };
 }
 
 async function extractNativePageLines(

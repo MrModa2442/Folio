@@ -665,8 +665,10 @@ export interface CloudSqlSyncResponse {
     telegramMessageId?: number;
     bookmarks?: PageBookmark[];
     highlights?: Record<number, PageHighlightStroke[]>;
+    annotationsUpdatedAt?: number;
     hasCloudPdf?: boolean;
     pageOffset?: number;
+    pageAnchors?: Array<{ pdfPage: number; bookPage: number }>;
     chapters?: BookChapter[];
     chaptersLocked?: boolean;
     updatedAt: string;
@@ -1008,17 +1010,35 @@ export function mergeCloudLibraryIntoLocalBooks(
 
     const cbKeyLower = (cb.bookKey || '').toLowerCase();
     const cbTitleLower = (cb.title || '').trim().toLowerCase();
+    const cloudAnnTs = typeof cb.annotationsUpdatedAt === 'number' ? cb.annotationsUpdatedAt : 0;
 
-    // Combine bookmarks from cb.bookmarks and cloudData.notes
+    const cleanHighlights = (
+      raw?: Record<number, PageHighlightStroke[]>
+    ): Record<number, PageHighlightStroke[]> => {
+      const out: Record<number, PageHighlightStroke[]> = {};
+      if (!raw || typeof raw !== 'object') return out;
+      for (const [k, strokes] of Object.entries(raw)) {
+        if (Array.isArray(strokes) && strokes.length > 0) {
+          out[Number(k)] = strokes;
+        }
+      }
+      return out;
+    };
+
+    // Only combine legacy sql_notes when cloud book does not yet have an authoritative annotationsUpdatedAt timestamp
     const bmByPage = new Map<number, PageBookmark>();
-    for (const nBm of notesByBookKey.get(cbKeyLower) || []) {
-      bmByPage.set(nBm.page, nBm);
+    if (cloudAnnTs === 0) {
+      for (const nBm of notesByBookKey.get(cbKeyLower) || []) {
+        bmByPage.set(nBm.page, nBm);
+      }
     }
     for (const cBm of cb.bookmarks || []) {
       if (cBm && typeof cBm.page === 'number') {
         bmByPage.set(cBm.page, cBm);
       }
     }
+    const cloudBookmarks = Array.from(bmByPage.values()).sort((a, b) => a.page - b.page);
+    const cloudHighlights = cleanHighlights(cb.highlights);
 
     const existingIdx = result.findIndex((lb, idx) => {
       if (matchedLocalIndices.has(idx)) return false;
@@ -1035,21 +1055,43 @@ export function mergeCloudLibraryIntoLocalBooks(
     if (existingIdx >= 0) {
       matchedLocalIndices.add(existingIdx);
       const lb = result[existingIdx];
+      const localAnnTs = typeof lb.annotationsUpdatedAt === 'number' ? lb.annotationsUpdatedAt : 0;
+      const localBookmarks = [...(lb.bookmarks || [])].sort((a, b) => a.page - b.page);
+      const localHighlights = cleanHighlights(lb.highlights);
 
-      for (const localBm of lb.bookmarks || []) {
-        if (localBm && typeof localBm.page === 'number') {
-          const existingCloudBm = bmByPage.get(localBm.page);
+      let resolvedBookmarks: PageBookmark[];
+      let resolvedHighlights: Record<number, PageHighlightStroke[]>;
+      let resolvedAnnTs: number | undefined;
+
+      if (localAnnTs > cloudAnnTs) {
+        // Local device has newer edits/deletions — NEVER let older cloud data resurrect deleted notes or highlights!
+        resolvedBookmarks = localBookmarks;
+        resolvedHighlights = localHighlights;
+        resolvedAnnTs = localAnnTs;
+      } else if (cloudAnnTs > localAnnTs) {
+        // Cloud has newer edits/deletions from another device — adopt them cleanly!
+        resolvedBookmarks = cloudBookmarks;
+        resolvedHighlights = cloudHighlights;
+        resolvedAnnTs = cloudAnnTs;
+      } else if (localAnnTs > 0) {
+        // Same timestamp — already synchronized
+        resolvedBookmarks = localBookmarks;
+        resolvedHighlights = localHighlights;
+        resolvedAnnTs = localAnnTs;
+      } else {
+        // Legacy un-timestamped books on both sides: safe union once
+        const unionMap = new Map<number, PageBookmark>();
+        for (const cBm of cloudBookmarks) unionMap.set(cBm.page, cBm);
+        for (const localBm of localBookmarks) {
+          const existingCloudBm = unionMap.get(localBm.page);
           if (!existingCloudBm || (localBm.note && !existingCloudBm.note)) {
-            bmByPage.set(localBm.page, localBm);
+            unionMap.set(localBm.page, localBm);
           }
         }
+        resolvedBookmarks = Array.from(unionMap.values()).sort((a, b) => a.page - b.page);
+        resolvedHighlights = { ...cloudHighlights, ...localHighlights };
+        resolvedAnnTs = undefined;
       }
-      const mergedBookmarks = Array.from(bmByPage.values()).sort((a, b) => a.page - b.page);
-
-      const mergedHighlights: Record<number, PageHighlightStroke[]> = {
-        ...(cb.highlights || {}),
-        ...(lb.highlights || {}),
-      };
 
       const mergedTotalPages = Math.max(lb.pageCount || 1, cb.totalPages || 1);
       const mergedCurrentPage = Math.max(lb.currentPage || 1, cb.currentPage || 1);
@@ -1065,13 +1107,20 @@ export function mergeCloudLibraryIntoLocalBooks(
         coverImage: lb.coverImage || cb.coverImage,
         telegramChannel: lb.telegramChannel || cb.telegramChannel,
         telegramMessageId: lb.telegramMessageId || cb.telegramMessageId,
-        bookmarks: mergedBookmarks,
-        highlights: mergedHighlights,
+        bookmarks: resolvedBookmarks,
+        highlights: resolvedHighlights,
+        annotationsUpdatedAt: resolvedAnnTs,
         pageOffset:
           typeof lb.pageOffset === 'number'
             ? lb.pageOffset
             : typeof cb.pageOffset === 'number'
             ? cb.pageOffset
+            : undefined,
+        pageAnchors:
+          Array.isArray(lb.pageAnchors) && lb.pageAnchors.length > 0
+            ? lb.pageAnchors
+            : Array.isArray(cb.pageAnchors) && cb.pageAnchors.length > 0
+            ? cb.pageAnchors
             : undefined,
         chapters:
           Array.isArray(lb.chapters) && lb.chapters.length > 0 ? lb.chapters : cb.chapters,
@@ -1082,7 +1131,6 @@ export function mergeCloudLibraryIntoLocalBooks(
       ensureCloudPdfHydratedLocally(mergedBook).catch(() => {});
     } else {
       // Book was synced from another device (e.g., imported on iPad and opened on PC) — add it to library!
-      const mergedBookmarks = Array.from(bmByPage.values()).sort((a, b) => a.page - b.page);
       const totalPages = Math.max(1, cb.totalPages || 1);
       const currentPage = Math.max(1, cb.currentPage || 1);
       const dateStr = (cb.updatedAt || new Date().toISOString()).split('T')[0];
@@ -1105,9 +1153,11 @@ export function mergeCloudLibraryIntoLocalBooks(
         pdfBlobKey: cb.bookKey,
         telegramChannel: cb.telegramChannel,
         telegramMessageId: cb.telegramMessageId,
-        bookmarks: mergedBookmarks,
-        highlights: cb.highlights || {},
+        bookmarks: cloudBookmarks,
+        highlights: cloudHighlights,
+        annotationsUpdatedAt: cloudAnnTs || undefined,
         pageOffset: cb.pageOffset,
+        pageAnchors: Array.isArray(cb.pageAnchors) ? cb.pageAnchors : undefined,
         chapters: cb.chapters,
         chaptersLocked: cb.chaptersLocked,
       };
@@ -1151,7 +1201,9 @@ export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSync
     telegramMessageId: b.telegramMessageId,
     bookmarks: b.bookmarks || [],
     highlights: b.highlights || {},
+    annotationsUpdatedAt: b.annotationsUpdatedAt,
     pageOffset: b.pageOffset,
+    pageAnchors: b.pageAnchors,
     chapters: b.chapters,
     chaptersLocked: b.chaptersLocked,
   }));

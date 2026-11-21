@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { createWorker, Worker as TesseractWorker } from 'tesseract.js';
-import { PageBookmark, PageHighlightStroke } from '../types/library';
+import { PageBookmark, PageHighlightStroke, BookPageAnchor } from '../types/library';
 import {
   loadCachedOcrPages,
   saveCachedOcrPages,
@@ -13,7 +13,14 @@ import {
   loadCachedBookPageOffset,
   saveCachedBookPageOffset,
   clearCachedBookPageOffset,
+  loadCachedBookPageAnchors,
+  saveCachedBookPageAnchors,
+  clearCachedBookPageAnchors,
+  normalizePageAnchors,
+  pdfPageToBookPage,
+  bookPageToPdfPage,
   detectAndCacheBookPageOffset,
+  analyzeBookPageNumbers,
   subscribeToPageOffsetUpdates,
   normalizeDigitsToAsciiClient,
 } from '../services/ocrCache';
@@ -147,6 +154,9 @@ interface RealPdfViewerProps {
   onRemoveBookmark?: (bookmarkId: string) => void;
   highlights?: Record<number, PageHighlightStroke[]>;
   onUpdatePageHighlights?: (page: number, strokes: PageHighlightStroke[]) => void;
+  initialPageOffset?: number;
+  initialPageAnchors?: BookPageAnchor[];
+  onPageCalibrationChange?: (anchors: BookPageAnchor[], primaryOffset: number) => void;
 }
 
 const HIGHLIGHT_COLORS = [
@@ -185,6 +195,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   onRemoveBookmark,
   highlights = {},
   onUpdatePageHighlights,
+  initialPageOffset,
+  initialPageAnchors,
+  onPageCalibrationChange,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -252,9 +265,15 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const [isAiRecognizingChapters, setIsAiRecognizingChapters] = useState<boolean>(false);
   const [hasCheckedChaptersOnce, setHasCheckedChaptersOnce] = useState<boolean>(false);
 
-  // Printed Book Page Number Calibration (pageOffset = pdfPage - printedBookPage, e.g. 15 - 10 = 5)
-  const [pageOffset, setPageOffset] = useState<number>(0);
+  // Printed Book Page Number Calibration (supports positive/negative offsets AND multiple anchors for censored/missing page gaps)
+  const [pageOffset, setPageOffset] = useState<number>(initialPageOffset ?? 0);
+  const [pageAnchors, setPageAnchors] = useState<BookPageAnchor[]>(() =>
+    normalizePageAnchors(initialPageAnchors || [])
+  );
   const [isCalibratingPageOffset, setIsCalibratingPageOffset] = useState<boolean>(false);
+  const [autoAnalyzeProgress, setAutoAnalyzeProgress] = useState<string | null>(null);
+  const [pageCalibrationFeedback, setPageCalibrationFeedback] = useState<string | null>(null);
+  const [pageJumpNotice, setPageJumpNotice] = useState<string | null>(null);
   const [isPageSyncPopoverOpen, setIsPageSyncPopoverOpen] = useState<boolean>(false);
   const [manualPrintedPageInput, setManualPrintedPageInput] = useState<string>('');
 
@@ -271,28 +290,55 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
   const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
   const rawPageDimensionsRef = useRef<{ width: number; height: number } | null>(null);
   const pointerStartRef = useRef<{ x: number; y: number; time: number } | null>(null);
+  const onPageCalibrationChangeRef = useRef(onPageCalibrationChange);
+  onPageCalibrationChangeRef.current = onPageCalibrationChange;
 
   const currentBookmark = bookmarks.find(b => b.page === currentPage);
   const currentPageStrokes = highlights[currentPage] || [];
   const docCacheKey = bookId || (arrayBuffer ? `pdf_bytes_${arrayBuffer.byteLength}` : 'default_pdf');
 
-  // Helper to convert any physical PDF page number (1..totalPages) to the Book's Printed Page Number
-  const effectiveOffset = Math.max(0, pageOffset);
-  const totalBookPages = Math.max(1, totalPages - effectiveOffset);
-  const isFrontMatterPage = effectiveOffset > 0 && currentPage <= effectiveOffset;
-  const currentBookPage = currentPage > effectiveOffset ? currentPage - effectiveOffset : currentPage;
+  // Piecewise mapping between physical PDF pages (1..totalPages) and printed Book Pages
+  // Works for front-matter offsets, negative offsets (censored/missing pages), printed numbers > totalPages, AND mid-book censored gaps!
+  const currentMappedBookPage = pdfPageToBookPage(currentPage, pageAnchors, pageOffset);
+  const isFrontMatterPage = currentMappedBookPage <= 0;
+  const currentBookPage = isFrontMatterPage ? currentPage : currentMappedBookPage;
+  const totalBookPages = Math.max(1, pdfPageToBookPage(totalPages, pageAnchors, pageOffset));
+  const firstBookPdfPage = bookPageToPdfPage(1, totalPages, pageAnchors, pageOffset).pdfPage;
+  const hasFrontMatterPages = firstBookPdfPage > 1;
+  const isPageNumberCalibrated = pageAnchors.length > 0 || pageOffset !== 0;
+
+  const persistPageCalibration = useCallback(
+    (nextAnchors: BookPageAnchor[]) => {
+      const normalized = normalizePageAnchors(nextAnchors);
+      const nextPrimaryOffset =
+        normalized.length > 0 ? normalized[0].pdfPage - normalized[0].bookPage : 0;
+      setPageAnchors(normalized);
+      setPageOffset(nextPrimaryOffset);
+      if (normalized.length > 0) {
+        saveCachedBookPageAnchors(docCacheKey, normalized);
+      } else {
+        clearCachedBookPageAnchors(docCacheKey);
+        clearCachedBookPageOffset(docCacheKey);
+      }
+      if (onPageCalibrationChangeRef.current) {
+        onPageCalibrationChangeRef.current(normalized, nextPrimaryOffset);
+      }
+    },
+    [docCacheKey]
+  );
 
   const formatBookPageNumber = useCallback(
     (pdfPage: number): string => {
-      if (effectiveOffset > 0 && pdfPage <= effectiveOffset) {
+      const mapped = pdfPageToBookPage(pdfPage, pageAnchors, pageOffset);
+      if (mapped <= 0) {
         return `Intro ${pdfPage}`;
       }
-      return String(pdfPage - effectiveOffset);
+      return String(mapped);
     },
-    [effectiveOffset]
+    [pageAnchors, pageOffset]
   );
 
-  // Keep the toolbar page input box synchronized with the Printed Book Page Number (e.g. 1 when on PDF page 5, or 10 when on PDF page 15)
+  // Keep the toolbar page input box synchronized with the Printed Book Page Number
   useEffect(() => {
     if (isFrontMatterPage) {
       setPageInput(`Intro ${currentPage}`);
@@ -301,7 +347,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       setPageInput(String(currentBookPage));
       setManualPrintedPageInput(String(currentBookPage));
     }
-  }, [currentBookPage, currentPage, isFrontMatterPage, effectiveOffset]);
+  }, [currentBookPage, currentPage, isFrontMatterPage, pageAnchors, pageOffset]);
 
   // Load PDF Document + Cached AI OCR pages & AI Chapters from IndexedDB/localStorage
   useEffect(() => {
@@ -326,11 +372,22 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       pageTextCacheRef.current.clear();
     });
 
-    const cachedOffset = loadCachedBookPageOffset(docCacheKey);
-    if (cachedOffset !== null) {
-      setPageOffset(cachedOffset);
+    const cachedAnchors = loadCachedBookPageAnchors(docCacheKey);
+    const propAnchors = normalizePageAnchors(initialPageAnchors || []);
+    const resolvedAnchors = cachedAnchors.length > 0 ? cachedAnchors : propAnchors;
+    if (resolvedAnchors.length > 0) {
+      setPageAnchors(resolvedAnchors);
+      setPageOffset(resolvedAnchors[0].pdfPage - resolvedAnchors[0].bookPage);
     } else {
-      setPageOffset(0);
+      setPageAnchors([]);
+      const cachedOffset = loadCachedBookPageOffset(docCacheKey);
+      if (cachedOffset !== null) {
+        setPageOffset(cachedOffset);
+      } else if (typeof initialPageOffset === 'number' && Number.isFinite(initialPageOffset)) {
+        setPageOffset(initialPageOffset);
+      } else {
+        setPageOffset(0);
+      }
     }
 
     const cachedAiChapters = loadCachedBookChapters(docCacheKey);
@@ -363,6 +420,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     const unsubOffset = subscribeToPageOffsetUpdates(detail => {
       if (!isMounted || detail.docKey !== docCacheKey) return;
       setPageOffset(detail.pageOffset);
+      if (Array.isArray(detail.pageAnchors)) {
+        setPageAnchors(normalizePageAnchors(detail.pageAnchors));
+      }
       setIsCalibratingPageOffset(false);
     });
 
@@ -388,9 +448,20 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         setIsLoadingDoc(false);
 
         // 1. Defer one-time page-offset calibration so it NEVER competes with rendering the first page
-        if (loadCachedBookPageOffset(docCacheKey) === null) {
+        if (
+          loadCachedBookPageAnchors(docCacheKey).length === 0 &&
+          loadCachedBookPageOffset(docCacheKey) === null &&
+          propAnchors.length === 0 &&
+          !(typeof initialPageOffset === 'number' && initialPageOffset !== 0)
+        ) {
           window.setTimeout(() => {
-            if (!isMounted || loadCachedBookPageOffset(docCacheKey) !== null) return;
+            if (
+              !isMounted ||
+              loadCachedBookPageAnchors(docCacheKey).length > 0 ||
+              loadCachedBookPageOffset(docCacheKey) !== null
+            ) {
+              return;
+            }
             setIsCalibratingPageOffset(true);
             detectAndCacheBookPageOffset(
               docCacheKey,
@@ -771,24 +842,50 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     [pdfDoc, totalPages, onPageChange]
   );
 
-  // Navigate by Printed Book Page Number (supports Persian ۱۰, Arabic ١٠, and English 10 digits)
+  // Navigate by Printed Book Page Number (supports Persian ۲۰۰, Arabic ٢٠٠, English 200, and multi-anchor censored gaps)
   const goToBookPageInput = useCallback(
     (rawInput: string) => {
       const normalized = normalizeDigitsToAsciiClient(rawInput || '').trim();
+      const introMatch = normalized.match(/^intro\s*(\d+)$/i);
+      if (introMatch) {
+        const introPdf = parseInt(introMatch[1], 10);
+        if (Number.isFinite(introPdf) && introPdf >= 1) {
+          goToPage(Math.max(1, Math.min(totalPages, introPdf)));
+          return;
+        }
+      }
+
       const parsed = parseInt(normalized.replace(/[^\d-]/g, ''), 10);
       if (!Number.isFinite(parsed)) {
-        setPageInput(String(currentBookPage));
+        setPageInput(isFrontMatterPage ? `Intro ${currentPage}` : String(currentBookPage));
         return;
       }
       if (parsed <= 0) {
-        // Allow jumping to front-matter pages if 0 or negative
-        goToPage(Math.max(1, Math.min(totalPages, effectiveOffset + parsed)));
+        const targetIntroPdf = Math.max(1, Math.min(totalPages, firstBookPdfPage + parsed - 1));
+        goToPage(targetIntroPdf);
         return;
       }
-      const targetPdfPage = Math.max(1, Math.min(totalPages, parsed + effectiveOffset));
-      goToPage(targetPdfPage);
+
+      const resolved = bookPageToPdfPage(parsed, totalPages, pageAnchors, pageOffset);
+      goToPage(resolved.pdfPage);
+      if (resolved.wasCensoredGap) {
+        const landedBookPage = pdfPageToBookPage(resolved.pdfPage, pageAnchors, pageOffset);
+        setPageJumpNotice(
+          `Book p.${parsed} is in a missing/censored gap — jumped to nearest page (Book p.${landedBookPage})`
+        );
+        window.setTimeout(() => setPageJumpNotice(null), 4200);
+      }
     },
-    [currentBookPage, effectiveOffset, goToPage, totalPages]
+    [
+      currentBookPage,
+      currentPage,
+      firstBookPdfPage,
+      goToPage,
+      isFrontMatterPage,
+      pageAnchors,
+      pageOffset,
+      totalPages,
+    ]
   );
 
   const handlePrevPage = useCallback(() => {
@@ -1775,18 +1872,13 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     }
   };
 
-  const highlightedPageNumbers = Object.keys(highlights)
-    .map(Number)
-    .filter(p => (highlights[p] || []).length > 0)
-    .sort((a, b) => a - b);
-
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden select-none relative">
       {/* Primary Reader Toolbar */}
       <div className="min-h-10 px-3 sm:px-4 py-1.5 border-b border-white/10 flex flex-wrap items-center justify-between gap-2 bg-black/40 shrink-0 text-xs">
         {/* Left: Page Switcher (Matched to Printed Book Page Numbers) */}
         <div className="flex items-center gap-1 relative">
-          {effectiveOffset > 0 && (
+          {hasFrontMatterPages && (
             <button
               onClick={() => goToPage(1)}
               disabled={currentPage <= 1}
@@ -1802,8 +1894,8 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
           )}
 
           <button
-            onClick={() => goToPage(1 + effectiveOffset)}
-            disabled={currentPage === 1 + effectiveOffset}
+            onClick={() => goToPage(firstBookPdfPage)}
+            disabled={currentPage === firstBookPdfPage}
             className="hidden sm:inline-flex px-1.5 py-0.5 rounded text-[11px] opacity-70 hover:opacity-100 hover:bg-white/10 disabled:opacity-30 transition-colors"
             title="Book Page 1"
           >
@@ -1830,9 +1922,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             {isFrontMatterPage && (
               <button
                 type="button"
-                onClick={() => goToPage(1 + effectiveOffset)}
+                onClick={() => goToPage(firstBookPdfPage)}
                 className="px-1.5 py-0.5 rounded bg-[#1DB954]/20 hover:bg-[#1DB954]/30 text-[#1DB954] border border-[#1DB954]/40 text-[10px] font-sans font-semibold transition-colors"
-                title={`Jump to Book Page 1 (starts on PDF page ${effectiveOffset + 1})`}
+                title={`Jump to Book Page 1 (starts on PDF page ${firstBookPdfPage})`}
               >
                 Page 1 →
               </button>
@@ -1843,14 +1935,16 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
               value={pageInput}
               onChange={e => setPageInput(e.target.value)}
               onBlur={() => goToBookPageInput(pageInput)}
-              title="Book Page Number (matches the page number written in the book itself)"
+              title="Book Page Number — enter any printed page number (e.g. 200) to jump directly to that page of the book"
               className="w-14 text-center py-0.5 rounded border border-white/20 bg-white text-black text-xs font-semibold focus:outline-hidden focus:ring-1 focus:ring-[#1DB954]"
             />
             <span
               className="opacity-60 text-xs"
               title={
-                effectiveOffset > 0
-                  ? `${totalBookPages} numbered book pages (${totalPages} total PDF pages including ${effectiveOffset} intro pages)`
+                isPageNumberCalibrated
+                  ? `Book ends at printed p.${totalBookPages} (PDF has ${totalPages} pages${
+                      pageAnchors.length > 1 ? ` across ${pageAnchors.length} calibrated sections` : ''
+                    })`
                   : `${totalBookPages} pages`
               }
             >
@@ -1877,39 +1971,48 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             {totalBookPages}
           </button>
 
-          {/* Book Page Number Calibration Badge & 1-Click Manual Match Popover */}
+          {/* Book Page Number Calibration Badge & Multi-Point Manual / Auto Match Popover */}
           <button
             type="button"
             onClick={() => {
-              setManualPrintedPageInput(String(currentBookPage));
+              setManualPrintedPageInput(isFrontMatterPage ? '' : String(currentBookPage));
+              setPageCalibrationFeedback(null);
               setIsPageSyncPopoverOpen(v => !v);
             }}
             className={`ml-1 px-2 py-0.5 rounded-full text-[10px] font-semibold flex items-center gap-1 transition-colors border ${
-              effectiveOffset > 0
+              isPageNumberCalibrated
                 ? 'bg-[#1DB954]/15 border-[#1DB954]/40 text-[#1DB954] hover:bg-[#1DB954]/25'
                 : isCalibratingPageOffset
                 ? 'bg-amber-400/15 border-amber-400/40 text-amber-300'
                 : 'bg-white/10 border-white/15 text-white/80 hover:bg-white/20 hover:text-white'
             }`}
-            title="Match PDF page number to the exact page number written on this page of the book"
+            title="Match PDF page numbers to the exact page numbers printed inside the book (supports intro pages & censored/missing page gaps)"
           >
             {isCalibratingPageOffset ? (
               <>
                 <Loader2 className="w-2.5 h-2.5 animate-spin" />
-                <span className="hidden lg:inline">Syncing #</span>
+                <span className="hidden lg:inline">{autoAnalyzeProgress || 'Analyzing #'}</span>
               </>
-            ) : effectiveOffset > 0 ? (
+            ) : isPageNumberCalibrated ? (
               <>
                 <Check className="w-2.5 h-2.5" />
-                <span className="hidden lg:inline">Book # Synced</span>
+                <span className="hidden lg:inline">
+                  {pageAnchors.length > 1 ? `Matched (${pageAnchors.length} pts)` : 'Book # Matched'}
+                </span>
               </>
             ) : (
               <span>Match Book #</span>
             )}
           </button>
 
+          {pageJumpNotice && (
+            <div className="absolute left-0 top-9 z-40 px-3 py-1.5 rounded-lg bg-amber-950/95 border border-amber-500/40 text-amber-200 text-[11px] shadow-xl max-w-xs">
+              {pageJumpNotice}
+            </div>
+          )}
+
           {isPageSyncPopoverOpen && (
-            <div className="absolute left-0 top-9 z-40 w-72 bg-[#181818] text-white border border-[#383838] rounded-xl shadow-2xl p-3 space-y-2.5">
+            <div className="absolute left-0 top-9 z-40 w-80 bg-[#181818] text-white border border-[#383838] rounded-xl shadow-2xl p-3.5 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-[#1DB954]">
                   Match Printed Book Page #
@@ -1923,74 +2026,174 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                 </button>
               </div>
               <p className="text-[11px] text-[#B3B3B3] leading-relaxed">
-                Look at the page number written on this page of the book (e.g. <span className="text-white font-mono">10</span> or <span className="text-white font-mono">۱۰</span>) and enter it below so every page in this book matches:
+                Look at the page number printed on this page (even if pages were censored/missing and the book number is higher than the PDF count) and enter it below. The app will count <span className="text-white font-mono">+1</span> from here to the end.
               </p>
+
               <form
                 onSubmit={e => {
                   e.preventDefault();
                   const norm = normalizeDigitsToAsciiClient(manualPrintedPageInput || '').trim();
-                  const printedNum = parseInt(norm, 10);
-                  if (Number.isFinite(printedNum) && printedNum >= 1 && printedNum <= totalPages) {
-                    const newOffset = currentPage - printedNum;
-                    saveCachedBookPageOffset(docCacheKey, newOffset);
-                    setPageOffset(newOffset);
-                    setIsPageSyncPopoverOpen(false);
+                  const printedNum = parseInt(norm.replace(/[^\d]/g, ''), 10);
+                  if (!Number.isFinite(printedNum) || printedNum < 1 || printedNum > 50000) {
+                    setPageCalibrationFeedback('Enter a valid positive page number (e.g. 1, 50, 200).');
+                    return;
+                  }
+                  // If an earlier anchor already exists at a different PDF page, add this as a new anchor from here onward (preserves earlier pages before a censored gap!)
+                  const hasOtherAnchor = pageAnchors.some(a => a.pdfPage !== currentPage);
+                  if (hasOtherAnchor) {
+                    const updated = [
+                      ...pageAnchors.filter(a => a.pdfPage !== currentPage),
+                      { pdfPage: currentPage, bookPage: printedNum },
+                    ];
+                    persistPageCalibration(updated);
+                    setPageCalibrationFeedback(
+                      `Added anchor: PDF p.${currentPage} → Book p.${printedNum} (counted +1 from here onward).`
+                    );
+                  } else {
+                    persistPageCalibration([{ pdfPage: currentPage, bookPage: printedNum }]);
+                    setPageCalibrationFeedback(
+                      `Matched! PDF p.${currentPage} → Book p.${printedNum} across whole book.`
+                    );
                   }
                 }}
-                className="flex items-center gap-1.5"
+                className="space-y-2"
               >
-                <input
-                  type="text"
-                  dir="auto"
-                  value={manualPrintedPageInput}
-                  onChange={e => setManualPrintedPageInput(e.target.value)}
-                  placeholder="e.g. 10 or ۱۰"
-                  className="w-24 text-center py-1.5 px-2 rounded-lg bg-[#242424] border border-[#383838] text-white font-mono text-xs font-bold focus:outline-hidden focus:border-[#1DB954]"
-                  autoFocus
-                />
-                <button
-                  type="submit"
-                  className="flex-1 py-1.5 px-3 rounded-lg bg-[#1DB954] text-black font-bold text-xs hover:bg-[#1ed760]"
-                >
-                  Match Page #
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    dir="auto"
+                    value={manualPrintedPageInput}
+                    onChange={e => setManualPrintedPageInput(e.target.value)}
+                    placeholder="e.g. 200 or ۲۰۰"
+                    className="w-24 text-center py-1.5 px-2 rounded-lg bg-[#242424] border border-[#383838] text-white font-mono text-xs font-bold focus:outline-hidden focus:border-[#1DB954]"
+                    autoFocus
+                  />
+                  <button
+                    type="submit"
+                    className="flex-1 py-1.5 px-3 rounded-lg bg-[#1DB954] text-black font-bold text-xs hover:bg-[#1ed760] transition-colors"
+                  >
+                    {pageAnchors.some(a => a.pdfPage !== currentPage)
+                      ? 'Match From Here Onward'
+                      : 'Match & Count +1'}
+                  </button>
+                </div>
+
+                {pageAnchors.some(a => a.pdfPage !== currentPage) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const norm = normalizeDigitsToAsciiClient(manualPrintedPageInput || '').trim();
+                      const printedNum = parseInt(norm.replace(/[^\d]/g, ''), 10);
+                      if (!Number.isFinite(printedNum) || printedNum < 1 || printedNum > 50000) {
+                        setPageCalibrationFeedback('Enter a valid positive page number first.');
+                        return;
+                      }
+                      persistPageCalibration([{ pdfPage: currentPage, bookPage: printedNum }]);
+                      setPageCalibrationFeedback(
+                        `Shifted whole book: PDF p.${currentPage} → Book p.${printedNum}.`
+                      );
+                    }}
+                    className="w-full py-1 px-2.5 rounded-lg bg-white/10 hover:bg-white/15 text-[11px] text-white/85 font-medium transition-colors"
+                  >
+                    Or replace all anchors & shift whole book
+                  </button>
+                )}
               </form>
-              <div className="flex items-center justify-between pt-1 border-t border-white/10 text-[10px] text-[#B3B3B3]">
-                <span>
-                  PDF p.{currentPage} → Book p.{currentBookPage}
+
+              {pageCalibrationFeedback && (
+                <div className="text-[11px] px-2.5 py-1.5 rounded-lg bg-[#1DB954]/15 border border-[#1DB954]/30 text-[#1DB954]">
+                  {pageCalibrationFeedback}
+                </div>
+              )}
+
+              {/* Active calibration anchor points (for books with censored/missing gaps) */}
+              {pageAnchors.length > 0 && (
+                <div className="space-y-1 pt-1 border-t border-white/10">
+                  <div className="text-[10px] uppercase tracking-wider text-white/50 font-semibold">
+                    Active Page Anchors ({pageAnchors.length})
+                  </div>
+                  <div className="max-h-24 overflow-y-auto space-y-1">
+                    {pageAnchors.map(anchor => (
+                      <div
+                        key={anchor.pdfPage}
+                        className="flex items-center justify-between text-[11px] bg-white/5 px-2 py-1 rounded-md font-mono"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => goToPage(anchor.pdfPage)}
+                          className="text-left hover:text-[#1DB954] transition-colors"
+                          title="Jump to this anchor page"
+                        >
+                          PDF p.{anchor.pdfPage} → Book p.{anchor.bookPage}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            persistPageCalibration(
+                              pageAnchors.filter(a => a.pdfPage !== anchor.pdfPage)
+                            );
+                          }}
+                          className="text-white/40 hover:text-rose-400 p-0.5"
+                          title="Remove this anchor"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between pt-2 border-t border-white/10 text-[10px] text-[#B3B3B3]">
+                <span className="font-mono">
+                  Now: PDF p.{currentPage} → {isFrontMatterPage ? `Intro ${currentPage}` : `Book p.${currentBookPage}`}
                 </span>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2.5">
                   {pdfDoc && (
                     <button
                       type="button"
-                      onClick={() => {
+                      disabled={isCalibratingPageOffset}
+                      onClick={async () => {
                         setIsCalibratingPageOffset(true);
-                        detectAndCacheBookPageOffset(
-                          docCacheKey,
-                          bookTitle || 'Book',
-                          totalPages,
-                          pdfDoc,
-                          currentPage,
-                          true
-                        )
-                          .then(detected => {
-                            setPageOffset(detected);
-                            setIsPageSyncPopoverOpen(false);
-                          })
-                          .finally(() => setIsCalibratingPageOffset(false));
+                        setPageCalibrationFeedback(null);
+                        setAutoAnalyzeProgress('Scanning 1/9...');
+                        try {
+                          const result = await analyzeBookPageNumbers(
+                            docCacheKey,
+                            totalPages,
+                            pdfDoc,
+                            currentPage,
+                            (done, total) => setAutoAnalyzeProgress(`Scanning ${done}/${total}...`)
+                          );
+                          if (result.anchors.length > 0) {
+                            persistPageCalibration(result.anchors);
+                            setPageCalibrationFeedback(
+                              result.anchors.length > 1
+                                ? `Auto-matched ${result.matchedSamples.length} pages across ${result.anchors.length} sections (censored gap detected!).`
+                                : `Auto-matched ${result.matchedSamples.length} pages (PDF p.${result.anchors[0].pdfPage} → Book p.${result.anchors[0].bookPage}).`
+                            );
+                          } else {
+                            setPageCalibrationFeedback(
+                              'Could not read corner numbers automatically on this scan — type the number printed on this page above.'
+                            );
+                          }
+                        } finally {
+                          setIsCalibratingPageOffset(false);
+                          setAutoAnalyzeProgress(null);
+                        }
                       }}
-                      className="text-amber-300 hover:underline"
+                      className="text-amber-300 hover:underline font-semibold disabled:opacity-50"
+                      title="Scan page corners across the PDF to automatically match book page numbers (including censored gaps)"
                     >
-                      Auto-Detect
+                      {isCalibratingPageOffset ? autoAnalyzeProgress || 'Scanning...' : 'Auto-Analyze'}
                     </button>
                   )}
-                  {effectiveOffset !== 0 && (
+                  {isPageNumberCalibrated && (
                     <button
                       type="button"
                       onClick={() => {
-                        clearCachedBookPageOffset(docCacheKey);
-                        setPageOffset(0);
-                        setIsPageSyncPopoverOpen(false);
+                        persistPageCalibration([]);
+                        setPageCalibrationFeedback('Page numbers reset to raw PDF order.');
                       }}
                       className="text-rose-400 hover:underline"
                     >
@@ -2082,9 +2285,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                 ? 'bg-white text-black'
                 : 'bg-white/10 hover:bg-white/20 text-white'
             }`}
-            title="View all pinned pages, pen writings & highlights"
+            title="View your explicitly pinned pages & notes"
           >
-            <span>Pins ({bookmarks.length + highlightedPageNumbers.length})</span>
+            <span>Pins ({bookmarks.length})</span>
           </button>
 
           {/* Apple Pencil / Finger Highlighter Toggle */}
@@ -2937,13 +3140,13 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
                 // If extracted from printed Table of Contents (isBookPageNumber), start/end are already Printed Book Pages
                 const startBookPage = ch.isBookPageNumber
                   ? Math.max(1, Math.min(totalBookPages, rawStart))
-                  : Math.max(1, rawStart - effectiveOffset);
+                  : Math.max(1, pdfPageToBookPage(rawStart, pageAnchors, pageOffset));
                 const endBookPage = ch.isBookPageNumber
                   ? Math.max(startBookPage, Math.min(totalBookPages, rawEnd))
-                  : Math.max(startBookPage, rawEnd - effectiveOffset);
+                  : Math.max(startBookPage, pdfPageToBookPage(rawEnd, pageAnchors, pageOffset));
 
                 const targetPdfPage = ch.isBookPageNumber
-                  ? Math.max(1, Math.min(totalPages, startBookPage + effectiveOffset))
+                  ? bookPageToPdfPage(startBookPage, totalPages, pageAnchors, pageOffset).pdfPage
                   : Math.max(1, Math.min(totalPages, rawStart));
 
                 const isCurrentSection =
@@ -3069,68 +3272,42 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
             </form>
           )}
 
-          {/* Bookmarks List */}
+          {/* Explicitly Pinned Pages List (completely separate from highlights & pen writing) */}
           <div className="space-y-1.5">
-            {bookmarks.length === 0 && highlightedPageNumbers.length === 0 ? (
+            {bookmarks.length === 0 ? (
               <p className="text-[11px] text-[#B3B3B3] text-center py-3">
-                No pinned or annotated pages yet. Tap &ldquo;Pin Page&rdquo;, &ldquo;Highlight&rdquo;, or &ldquo;Pen&rdquo; while reading.
+                No pinned pages yet. Tap &ldquo;Pin Page&rdquo; or add a note above to explicitly pin a page.
               </p>
             ) : (
-              <>
-                {bookmarks.map(bm => (
-                  <div
-                    key={bm.id}
-                    onClick={() => goToPage(bm.page)}
-                    className={`p-2.5 rounded-lg cursor-pointer flex items-start justify-between gap-2 transition-colors ${
-                      currentPage === bm.page ? 'bg-amber-400/20 border border-amber-400/40' : 'bg-[#242424] hover:bg-[#2E2E2E]'
-                    }`}
-                  >
-                    <div className="min-w-0">
-                      <span className="font-mono text-[11px] font-bold text-amber-300">
-                        Page {formatBookPageNumber(bm.page)}
-                      </span>
-                      {bm.note && <p className="text-xs text-white/90 mt-0.5 break-words">{bm.note}</p>}
-                    </div>
-                    {onRemoveBookmark && (
-                      <button
-                        type="button"
-                        onClick={e => {
-                          e.stopPropagation();
-                          onRemoveBookmark(bm.id);
-                        }}
-                        className="p-1 rounded text-rose-400 hover:bg-rose-500/20"
-                        title="Remove bookmark"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    )}
+              bookmarks.map(bm => (
+                <div
+                  key={bm.id}
+                  onClick={() => goToPage(bm.page)}
+                  className={`p-2.5 rounded-lg cursor-pointer flex items-start justify-between gap-2 transition-colors ${
+                    currentPage === bm.page ? 'bg-amber-400/20 border border-amber-400/40' : 'bg-[#242424] hover:bg-[#2E2E2E]'
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <span className="font-mono text-[11px] font-bold text-amber-300">
+                      Page {formatBookPageNumber(bm.page)}
+                    </span>
+                    {bm.note && <p className="text-xs text-white/90 mt-0.5 break-words">{bm.note}</p>}
                   </div>
-                ))}
-
-                {highlightedPageNumbers.length > 0 && (
-                  <div className="pt-2 border-t border-white/10">
-                    <p className="text-[10px] uppercase tracking-wider text-[#B3B3B3] mb-1.5">
-                      Highlighted &amp; Pen-Annotated Pages
-                    </p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {highlightedPageNumbers.map(pageNum => (
-                        <button
-                          key={pageNum}
-                          type="button"
-                          onClick={() => goToPage(pageNum)}
-                          className={`px-2.5 py-1 rounded-full text-xs font-mono font-semibold ${
-                            currentPage === pageNum
-                              ? 'bg-yellow-400 text-black'
-                              : 'bg-yellow-400/15 text-yellow-300 hover:bg-yellow-400/25'
-                          }`}
-                        >
-                          p. {formatBookPageNumber(pageNum)}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </>
+                  {onRemoveBookmark && (
+                    <button
+                      type="button"
+                      onClick={e => {
+                        e.stopPropagation();
+                        onRemoveBookmark(bm.id);
+                      }}
+                      className="p-1 rounded text-rose-400 hover:bg-rose-500/20"
+                      title="Remove pin & note"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              ))
             )}
           </div>
         </div>

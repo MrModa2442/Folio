@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Book, PageBookmark, PageHighlightStroke } from '../types/library';
+import { Book, BookPageAnchor, PageBookmark, PageHighlightStroke } from '../types/library';
 import { getPdfBlob, storePdfBlob } from '../services/db';
 import { downloadBookPdfFromCloud, uploadBookPdfToCloud } from '../services/cloudSync';
 import { setReaderActiveForOcr } from '../services/ocrCache';
@@ -197,62 +197,94 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
     [onUpdateBook]
   );
 
-  const handleToggleBookmark = (page: number, note = '') => {
-    const currentBookmarks = book.bookmarks || [];
-    const existing = currentBookmarks.find(b => b.page === page);
-    let nextBookmarks: PageBookmark[];
-    if (existing && !note) {
-      nextBookmarks = currentBookmarks.filter(b => b.page !== page);
-    } else if (existing && note) {
-      nextBookmarks = currentBookmarks.map(b => (b.page === page ? { ...b, note } : b));
-    } else {
-      nextBookmarks = [
-        ...currentBookmarks,
-        {
-          id: 'bm_' + Date.now().toString(36),
-          page,
-          note,
-          createdAt: new Date().toISOString(),
-        },
-      ].sort((a, b) => a.page - b.page);
-    }
+  const handleToggleBookmark = useCallback(
+    (page: number, note = '') => {
+      const latestBook = bookRef.current;
+      const currentBookmarks = latestBook.bookmarks || [];
+      const existing = currentBookmarks.find(b => b.page === page);
+      let nextBookmarks: PageBookmark[];
+      if (existing && !note) {
+        nextBookmarks = currentBookmarks.filter(b => b.page !== page);
+      } else if (existing && note) {
+        nextBookmarks = currentBookmarks.map(b => (b.page === page ? { ...b, note } : b));
+      } else {
+        nextBookmarks = [
+          ...currentBookmarks,
+          {
+            id: 'bm_' + Date.now().toString(36),
+            page,
+            note,
+            createdAt: new Date().toISOString(),
+          },
+        ].sort((a, b) => a.page - b.page);
+      }
 
-    onUpdateBook({
-      ...book,
-      bookmarks: nextBookmarks,
-    });
-  };
+      onUpdateBook({
+        ...latestBook,
+        bookmarks: nextBookmarks,
+        annotationsUpdatedAt: Date.now(),
+      });
+    },
+    [onUpdateBook]
+  );
 
-  const handleUpdateBookmarkNote = (bookmarkId: string, note: string) => {
-    const nextBookmarks = (book.bookmarks || []).map(b =>
-      b.id === bookmarkId ? { ...b, note } : b
-    );
-    onUpdateBook({
-      ...book,
-      bookmarks: nextBookmarks,
-    });
-  };
+  const handleUpdateBookmarkNote = useCallback(
+    (bookmarkId: string, note: string) => {
+      const latestBook = bookRef.current;
+      const nextBookmarks = (latestBook.bookmarks || []).map(b =>
+        b.id === bookmarkId ? { ...b, note } : b
+      );
+      onUpdateBook({
+        ...latestBook,
+        bookmarks: nextBookmarks,
+        annotationsUpdatedAt: Date.now(),
+      });
+    },
+    [onUpdateBook]
+  );
 
-  const handleRemoveBookmark = (bookmarkId: string) => {
-    const nextBookmarks = (book.bookmarks || []).filter(b => b.id !== bookmarkId);
-    onUpdateBook({
-      ...book,
-      bookmarks: nextBookmarks,
-    });
-  };
+  const handleRemoveBookmark = useCallback(
+    (bookmarkId: string) => {
+      const latestBook = bookRef.current;
+      const nextBookmarks = (latestBook.bookmarks || []).filter(b => b.id !== bookmarkId);
+      onUpdateBook({
+        ...latestBook,
+        bookmarks: nextBookmarks,
+        annotationsUpdatedAt: Date.now(),
+      });
+    },
+    [onUpdateBook]
+  );
 
-  const handleUpdatePageHighlights = (page: number, strokes: PageHighlightStroke[]) => {
-    const nextHighlights = { ...(book.highlights || {}) };
-    if (strokes.length === 0) {
-      delete nextHighlights[page];
-    } else {
-      nextHighlights[page] = strokes;
-    }
-    onUpdateBook({
-      ...book,
-      highlights: nextHighlights,
-    });
-  };
+  const handleUpdatePageHighlights = useCallback(
+    (page: number, strokes: PageHighlightStroke[]) => {
+      const latestBook = bookRef.current;
+      const nextHighlights = { ...(latestBook.highlights || {}) };
+      if (!strokes || strokes.length === 0) {
+        delete nextHighlights[page];
+      } else {
+        nextHighlights[page] = strokes;
+      }
+      onUpdateBook({
+        ...latestBook,
+        highlights: nextHighlights,
+        annotationsUpdatedAt: Date.now(),
+      });
+    },
+    [onUpdateBook]
+  );
+
+  const handlePageCalibrationChange = useCallback(
+    (anchors: BookPageAnchor[], primaryOffset: number) => {
+      const latestBook = bookRef.current;
+      onUpdateBook({
+        ...latestBook,
+        pageAnchors: anchors,
+        pageOffset: primaryOffset,
+      });
+    },
+    [onUpdateBook]
+  );
 
   const getContainerBg = () => {
     switch (theme) {
@@ -487,6 +519,9 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
             onRemoveBookmark={handleRemoveBookmark}
             highlights={book.highlights || {}}
             onUpdatePageHighlights={handleUpdatePageHighlights}
+            initialPageOffset={book.pageOffset}
+            initialPageAnchors={book.pageAnchors}
+            onPageCalibrationChange={handlePageCalibrationChange}
           />
         )}
       </div>
