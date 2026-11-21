@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Book, PageBookmark, PageHighlightStroke } from '../types/library';
 import { getPdfBlob, storePdfBlob } from '../services/db';
 import { downloadBookPdfFromCloud, uploadBookPdfToCloud } from '../services/cloudSync';
+import { setReaderActiveForOcr } from '../services/ocrCache';
 import { ambientSound } from '../services/ambientAudio';
 import { RealPdfViewer } from './RealPdfViewer';
 import {
@@ -44,54 +45,66 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
   const [confirmRemove, setConfirmRemove] = useState<boolean>(false);
   const attachFileInputRef = useRef<HTMLInputElement>(null);
 
+  // Keep latest book metadata in a ref so page turns, bookmarks, highlights, or background cloud sync
+  // NEVER re-trigger loadPdfFromLocalOrCloud or unmount RealPdfViewer!
+  const bookRef = useRef<Book>(book);
+  bookRef.current = book;
+
+  const bookId = book.id;
+  const bookPdfBlobKey = book.pdfBlobKey;
+
+  // Pause background library OCR indexing while the user is actively reading
+  useEffect(() => {
+    setReaderActiveForOcr(true);
+    return () => {
+      setReaderActiveForOcr(false);
+    };
+  }, []);
+
   const loadPdfFromLocalOrCloud = useCallback(async () => {
+    const activeBook = bookRef.current;
     setIsLoadingPdf(true);
     setMissingCloudPdf(false);
-    setLoadingMessage('Checking local library...');
+    setLoadingMessage('Opening local book...');
 
     try {
-      const blobKey = book.pdfBlobKey || book.id;
+      const blobKey = bookPdfBlobKey || bookId;
       let blob = blobKey ? await getPdfBlob(blobKey) : null;
-      if (!blob && book.id && book.id !== blobKey) {
-        blob = await getPdfBlob(book.id);
+      if (!blob && bookId && bookId !== blobKey) {
+        blob = await getPdfBlob(bookId);
       }
 
-      if (blob && blob.size > 100) {
-        // Ensure this local book's PDF is also pushed to the Cloud so other devices (iPad/phone) can open it
-        uploadBookPdfToCloud(book, undefined, false).catch(() => {});
-      }
-
-      // 1. If book was synced from another device (e.g. PC -> iPad), download PDF from Cloud Sync store with automatic retries
+      // 1. If book was synced from another device (e.g. PC -> iPad) and not yet cached in IndexedDB, download from Cloud once
       if (!blob) {
-        for (let attempt = 1; attempt <= 3; attempt++) {
+        for (let attempt = 1; attempt <= 2; attempt++) {
           setLoadingMessage(
             attempt === 1
               ? 'Downloading book PDF from Cloud...'
-              : `Waiting for Cloud PDF sync (attempt ${attempt}/3)...`
+              : 'Retrying Cloud PDF download (2/2)...'
           );
-          const cloudBlob = await downloadBookPdfFromCloud(book, pct => {
+          const cloudBlob = await downloadBookPdfFromCloud(activeBook, pct => {
             setLoadingMessage(`Downloading book PDF from Cloud (${pct}%)...`);
           });
           if (cloudBlob && cloudBlob.size > 100) {
             blob = cloudBlob;
             await storePdfBlob(blobKey, cloudBlob).catch(() => {});
-            if (book.id !== blobKey) {
-              await storePdfBlob(book.id, cloudBlob).catch(() => {});
+            if (bookId !== blobKey) {
+              await storePdfBlob(bookId, cloudBlob).catch(() => {});
             }
             break;
           }
-          if (attempt < 3) {
-            await new Promise(resolve => setTimeout(resolve, 1400));
+          if (attempt < 2) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
           }
         }
       }
 
       // 2. If book came from a Telegram catalog channel, fetch the original PDF from /api/telegram/download
-      if (!blob && book.telegramChannel && book.telegramMessageId) {
+      if (!blob && activeBook.telegramChannel && activeBook.telegramMessageId) {
         setLoadingMessage('Downloading book PDF from catalog...');
         try {
           const res = await fetch(
-            `/api/telegram/download?channel=${encodeURIComponent(book.telegramChannel)}&messageId=${book.telegramMessageId}`
+            `/api/telegram/download?channel=${encodeURIComponent(activeBook.telegramChannel)}&messageId=${activeBook.telegramMessageId}`
           );
           if (res.ok) {
             const tgBlob = await res.blob();
@@ -105,8 +118,12 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
         }
       }
 
+      // Guard against stale async completion if user switched to a different book
+      if (bookRef.current.id !== bookId) return;
+
       if (blob && blob.size > 100) {
         const buffer = await blob.arrayBuffer();
+        if (bookRef.current.id !== bookId) return;
         setArrayBuffer(buffer);
         setMissingCloudPdf(false);
       } else {
@@ -115,13 +132,19 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
       }
     } catch (err) {
       console.error('Failed to load PDF in reader', err);
-      setMissingCloudPdf(true);
+      if (bookRef.current.id === bookId) {
+        setMissingCloudPdf(true);
+      }
     } finally {
-      setIsLoadingPdf(false);
+      if (bookRef.current.id === bookId) {
+        setIsLoadingPdf(false);
+      }
     }
-  }, [book]);
+  }, [bookId, bookPdfBlobKey]);
 
   useEffect(() => {
+    setCurrentPage(bookRef.current.currentPage || 1);
+    setTotalPages(bookRef.current.pageCount || 1);
     loadPdfFromLocalOrCloud();
   }, [loadPdfFromLocalOrCloud]);
 
@@ -157,18 +180,22 @@ export const CozyPdfReader: React.FC<CozyPdfReaderProps> = ({
     }
   };
 
-  const handlePageChange = (page: number, total: number) => {
-    setCurrentPage(page);
-    setTotalPages(total);
-    const isCompleted = page >= total;
-    onUpdateBook({
-      ...book,
-      currentPage: page,
-      pageCount: total,
-      status: isCompleted ? 'completed' : 'reading',
-      lastRead: new Date().toISOString().split('T')[0],
-    });
-  };
+  const handlePageChange = useCallback(
+    (page: number, total: number) => {
+      setCurrentPage(page);
+      setTotalPages(total);
+      const isCompleted = page >= total;
+      const latestBook = bookRef.current;
+      onUpdateBook({
+        ...latestBook,
+        currentPage: page,
+        pageCount: total,
+        status: isCompleted ? 'completed' : 'reading',
+        lastRead: new Date().toISOString().split('T')[0],
+      });
+    },
+    [onUpdateBook]
+  );
 
   const handleToggleBookmark = (page: number, note = '') => {
     const currentBookmarks = book.bookmarks || [];

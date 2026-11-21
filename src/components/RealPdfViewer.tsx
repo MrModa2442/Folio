@@ -14,7 +14,6 @@ import {
   saveCachedBookPageOffset,
   clearCachedBookPageOffset,
   detectAndCacheBookPageOffset,
-  detectPrintedPageNumberFromCorners,
   subscribeToPageOffsetUpdates,
   normalizeDigitsToAsciiClient,
 } from '../services/ocrCache';
@@ -388,23 +387,26 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         setCurrentPage(start);
         setIsLoadingDoc(false);
 
-        // 1. Immediately calibrate the printed book page number offset (so PDF page 15 matches Book page 10)
+        // 1. Defer one-time page-offset calibration so it NEVER competes with rendering the first page
         if (loadCachedBookPageOffset(docCacheKey) === null) {
-          setIsCalibratingPageOffset(true);
-          detectAndCacheBookPageOffset(
-            docCacheKey,
-            bookTitle || 'Book',
-            doc.numPages,
-            doc,
-            start
-          )
-            .then(detected => {
-              if (!isMounted) return;
-              setPageOffset(detected);
-            })
-            .finally(() => {
-              if (isMounted) setIsCalibratingPageOffset(false);
-            });
+          window.setTimeout(() => {
+            if (!isMounted || loadCachedBookPageOffset(docCacheKey) !== null) return;
+            setIsCalibratingPageOffset(true);
+            detectAndCacheBookPageOffset(
+              docCacheKey,
+              bookTitle || 'Book',
+              doc.numPages,
+              doc,
+              start
+            )
+              .then(detected => {
+                if (!isMounted) return;
+                setPageOffset(detected);
+              })
+              .finally(() => {
+                if (isMounted) setIsCalibratingPageOffset(false);
+              });
+          }, 3000);
         }
 
         // Load any chapters that the user previously asked AI to analyze for this book
@@ -439,44 +441,6 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       }
     };
   }, [arrayBuffer, docCacheKey, bookTitle]);
-
-  // Fast 4-corner page number check (top-right, top-left, bottom-right, bottom-left) when viewing a page
-  useEffect(() => {
-    if (!pdfDoc || currentPage < 3 || isCalibratingPageOffset) return;
-    const cached = loadCachedBookPageOffset(docCacheKey);
-    if (cached !== null && cached !== 0) return;
-
-    let cancelled = false;
-    setIsCalibratingPageOffset(true);
-    detectPrintedPageNumberFromCorners(pdfDoc, currentPage, totalPages)
-      .then(printedNum => {
-        if (cancelled) return;
-        if (printedNum !== null) {
-          const detectedOffset = currentPage - printedNum;
-          saveCachedBookPageOffset(docCacheKey, detectedOffset);
-          setPageOffset(detectedOffset);
-          return;
-        }
-        if (cached === null && currentPage >= 5) {
-          return detectAndCacheBookPageOffset(
-            docCacheKey,
-            bookTitle || 'Book',
-            totalPages,
-            pdfDoc,
-            currentPage
-          ).then(detected => {
-            if (!cancelled) setPageOffset(detected);
-          });
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setIsCalibratingPageOffset(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [pdfDoc, currentPage, docCacheKey, bookTitle, totalPages, isCalibratingPageOffset]);
 
   // Draw highlighter strokes AND active search match boxes on the transparent overlay canvas
   const drawHighlightOverlay = useCallback(
@@ -626,6 +590,9 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
     ]
   );
 
+  const drawHighlightOverlayRef = useRef(drawHighlightOverlay);
+  drawHighlightOverlayRef.current = drawHighlightOverlay;
+
   // Render Page onto Canvas (with optional Auto-Crop White Margins)
   const renderCurrentPage = useCallback(async () => {
     if (!pdfDoc || !canvasRef.current) return;
@@ -746,8 +713,18 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
         canvas.style.height = `${Math.floor(viewport.height / pixelRatio)}px`;
       }
 
-      drawHighlightOverlay(null);
+      drawHighlightOverlayRef.current(null);
       setIsPageRendering(false);
+
+      // Quietly pre-warm PDF.js internal cache for adjacent pages so turning pages is instant
+      window.setTimeout(() => {
+        if (currentPage < pdfDoc.numPages) {
+          pdfDoc.getPage(currentPage + 1).catch(() => {});
+        }
+        if (currentPage > 1) {
+          pdfDoc.getPage(currentPage - 1).catch(() => {});
+        }
+      }, 120);
     } catch (err: unknown) {
       const isCancelled = (err as { name?: string })?.name === 'RenderingCancelledException';
       if (!isCancelled) {
@@ -756,7 +733,7 @@ export const RealPdfViewer: React.FC<RealPdfViewerProps> = ({
       }
       setIsPageRendering(false);
     }
-  }, [pdfDoc, currentPage, scale, rotation, trimMargins, drawHighlightOverlay]);
+  }, [pdfDoc, currentPage, scale, rotation, trimMargins]);
 
   useEffect(() => {
     renderCurrentPage();

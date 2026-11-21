@@ -1315,16 +1315,26 @@ export async function recognizeAndCacheBookChapters(
   return [];
 }
 
+let isReaderActiveForOcr = false;
+
+export function setReaderActiveForOcr(active: boolean): void {
+  isReaderActiveForOcr = active;
+  if (!active && backgroundQueue.length > 0 && !isBackgroundWorkerRunning) {
+    runBackgroundQueueLoop().catch(() => {});
+  }
+}
+
 async function processSingleBookInBackground(book: Book): Promise<void> {
   const docKey = book.id;
-  if (!docKey || completedBookIds.has(docKey)) return;
+  if (!docKey || completedBookIds.has(docKey) || isReaderActiveForOcr) return;
 
   try {
     const blobKey = book.pdfBlobKey || book.id;
     const blob = await getPdfBlob(blobKey);
-    if (!blob) return;
+    if (!blob || isReaderActiveForOcr) return;
 
     const arrayBuffer = await blob.arrayBuffer();
+    if (isReaderActiveForOcr) return;
     const dataCopy = new Uint8Array(arrayBuffer.slice(0));
     const loadingTask = pdfjsLib.getDocument({
       data: dataCopy,
@@ -1340,25 +1350,10 @@ async function processSingleBookInBackground(book: Book): Promise<void> {
     const total = pdfDoc.numPages;
     const existingCache = await loadCachedOcrPages(docKey);
 
-    // Immediately calibrate the book's printed page number offset first!
-    await detectAndCacheBookPageOffset(docKey, book.title, total, pdfDoc, book.currentPage || 1);
-
-    // Prioritize the opening 15 pages first, then order remaining pages starting from book.currentPage outward
-    const frontPageCount = Math.min(15, total);
-    const orderedPagesSet = new Set<number>();
-    for (let p = 1; p <= frontPageCount; p++) {
-      orderedPagesSet.add(p);
+    const orderedPages: number[] = [];
+    for (let p = 1; p <= total; p++) {
+      orderedPages.push(p);
     }
-
-    const startPage = Math.max(1, Math.min(total, book.currentPage || 1));
-    for (let offset = 0; offset < total; offset++) {
-      const forward = startPage + offset;
-      if (forward >= 1 && forward <= total) orderedPagesSet.add(forward);
-      const backward = startPage - offset;
-      if (offset > 0 && backward >= 1 && backward <= total) orderedPagesSet.add(backward);
-    }
-
-    const orderedPages = Array.from(orderedPagesSet);
     const pagesToReview = orderedPages.filter(
       p => !existingCache[p] || existingCache[p].length === 0
     );
@@ -1369,97 +1364,30 @@ async function processSingleBookInBackground(book: Book): Promise<void> {
       return;
     }
 
-    // Step 1: Quickly check if pages have rich native digital text; collect image pages that need AI/OCR review
-    const pagesNeedingVisualOcr: number[] = [];
+    // Fast native digital text indexing only in background (never hog CPU/PDF worker with automatic Tesseract WASM while browsing/reading)
     const nativeBatch: Array<{ page: number; lines: string[] }> = [];
-
     for (const pNum of pagesToReview) {
+      if (isReaderActiveForOcr) {
+        // Re-queue for later when user closes reader
+        await loadingTask.destroy().catch(() => {});
+        return;
+      }
       const nativeLines = await extractNativePageLines(pdfDoc, pNum);
       const charCount = nativeLines.join('').length;
       if (nativeLines.length >= 2 && charCount >= 25) {
         nativeBatch.push({ page: pNum, lines: nativeLines });
-        if (nativeBatch.length >= 15) {
+        if (nativeBatch.length >= 20) {
           await saveCachedOcrPages(docKey, nativeBatch.splice(0, nativeBatch.length), total);
         }
-      } else {
-        pagesNeedingVisualOcr.push(pNum);
+      }
+      // Yield briefly to keep UI silky smooth
+      if (pNum % 10 === 0) {
+        await new Promise(r => setTimeout(r, 30));
       }
     }
 
     if (nativeBatch.length > 0) {
       await saveCachedOcrPages(docKey, nativeBatch, total);
-    }
-
-    // Step 2: Review remaining pages with Server Gemini AI (/api/ocr) or Built-In Browser OCR fallback
-    let useLocalBrowserOcr = false;
-    const batchSize = 3;
-
-    for (let i = 0; i < pagesNeedingVisualOcr.length; i += batchSize) {
-      const latestCache = await loadCachedOcrPages(docKey);
-      const batchNums = pagesNeedingVisualOcr
-        .slice(i, i + batchSize)
-        .filter(p => !latestCache[p] || latestCache[p].length === 0);
-
-      if (batchNums.length === 0) continue;
-
-      const renderedPages: Array<{ page: number; imageBase64: string; mimeType: string }> = [];
-      for (const pNum of batchNums) {
-        const b64 = await renderPdfPageToJpegDataUrl(pdfDoc, pNum);
-        if (b64) {
-          renderedPages.push({ page: pNum, imageBase64: b64, mimeType: 'image/jpeg' });
-        }
-      }
-
-      if (renderedPages.length === 0) continue;
-
-      let pageResults: Array<{ page: number; lines: string[] }> = [];
-
-      if (!useLocalBrowserOcr) {
-        try {
-          const response = await fetch('/api/ocr', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pages: renderedPages }),
-          });
-          if (response.ok) {
-            const data = (await response.json()) as {
-              results?: Array<{ page: number; lines: string[] }>;
-              useClientOcr?: boolean;
-            };
-            if (data.useClientOcr) {
-              useLocalBrowserOcr = true;
-            } else {
-              pageResults = (data.results || []).filter(
-                r => Array.isArray(r.lines) && r.lines.length > 0
-              );
-            }
-          } else {
-            useLocalBrowserOcr = true;
-          }
-        } catch {
-          useLocalBrowserOcr = true;
-        }
-      }
-
-      if (useLocalBrowserOcr) {
-        const worker = await getSharedTesseractWorker();
-        for (const rp of renderedPages) {
-          const rec = await worker.recognize(rp.imageBase64);
-          const lines = (rec?.data?.text || '')
-            .split(/\r?\n/)
-            .map(l => l.trim())
-            .filter(Boolean);
-          if (lines.length > 0) {
-            pageResults.push({ page: rp.page, lines });
-          }
-        }
-      }
-
-      if (pageResults.length > 0) {
-        await saveCachedOcrPages(docKey, pageResults, total);
-      }
-
-      await new Promise(r => setTimeout(r, 120));
     }
 
     completedBookIds.add(docKey);
@@ -1470,13 +1398,17 @@ async function processSingleBookInBackground(book: Book): Promise<void> {
 }
 
 async function runBackgroundQueueLoop(): Promise<void> {
-  if (isBackgroundWorkerRunning) return;
+  if (isBackgroundWorkerRunning || isReaderActiveForOcr) return;
   isBackgroundWorkerRunning = true;
   try {
-    while (backgroundQueue.length > 0) {
+    while (backgroundQueue.length > 0 && !isReaderActiveForOcr) {
       const nextBook = backgroundQueue.shift();
       if (!nextBook) continue;
       await processSingleBookInBackground(nextBook);
+      if (isReaderActiveForOcr) {
+        backgroundQueue.unshift(nextBook);
+        break;
+      }
       queuedBookIds.delete(nextBook.id);
     }
   } finally {
@@ -1505,7 +1437,9 @@ export function enqueueBookForBackgroundScan(book: Book, prioritize = true): voi
   } else {
     backgroundQueue.push(book);
   }
-  runBackgroundQueueLoop().catch(() => {});
+  if (!isReaderActiveForOcr) {
+    runBackgroundQueueLoop().catch(() => {});
+  }
 }
 
 export function enqueueLibraryForBackgroundScan(books: Book[]): void {

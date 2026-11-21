@@ -320,6 +320,7 @@ export default function App() {
   }, [runAutomaticCloudSync]);
 
   // Automatic debounced cloud push whenever books or deletions change while signed in
+  // (4s debounce so rapid page turns never spam cloud sync requests)
   useEffect(() => {
     if (!currentUser) return;
     const currentSig = computeLibrarySyncSignature(books);
@@ -327,7 +328,7 @@ export default function App() {
 
     const timer = window.setTimeout(() => {
       runAutomaticCloudSync(currentUser, booksRef.current).catch(() => {});
-    }, 900);
+    }, 4000);
 
     return () => {
       window.clearTimeout(timer);
@@ -390,10 +391,15 @@ export default function App() {
     }
   }, [uiPreferences, currentTab, selectedStatus, selectedListId]);
 
+  const bookIdsKey = books.map(b => b.id).join('|');
+
   useEffect(() => {
     localStorage.setItem(STORAGE_BOOKS_KEY, JSON.stringify(books));
-    enqueueLibraryForBackgroundScan(books);
   }, [books]);
+
+  useEffect(() => {
+    enqueueLibraryForBackgroundScan(booksRef.current);
+  }, [bookIdsKey]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_BOOKLISTS_KEY, JSON.stringify(booklists));

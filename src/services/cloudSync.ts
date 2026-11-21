@@ -727,6 +727,7 @@ export async function testCloudDatabaseUrl(
 }
 
 const uploadedPdfBookKeys = new Set<string>();
+const inFlightPdfUploads = new Set<string>();
 const hydratingPdfBookKeys = new Set<string>();
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -751,6 +752,8 @@ export async function uploadBookPdfToCloud(
 
   const bookKey = sanitizeFirestoreId(book.id || book.title);
   if (!force && uploadedPdfBookKeys.has(bookKey)) return true;
+  if (inFlightPdfUploads.has(bookKey)) return false;
+  inFlightPdfUploads.add(bookKey);
 
   try {
     let blob = await getPdfBlob(book.pdfBlobKey || book.id);
@@ -801,6 +804,8 @@ export async function uploadBookPdfToCloud(
     return true;
   } catch {
     // ignore background upload errors
+  } finally {
+    inFlightPdfUploads.delete(bookKey);
   }
   return false;
 }
@@ -883,34 +888,45 @@ export async function downloadBookPdfFromCloud(
 
       const resolvedKey = meta.matchedBookKey || key;
       const totalChunks = meta.totalChunks;
-      const chunkBuffers: ArrayBuffer[] = [];
+      const chunkBuffers: Array<ArrayBuffer | null> = new Array(totalChunks).fill(null);
+      let completedChunks = 0;
+      let failed = false;
+      let nextChunkIdx = 0;
 
-      for (let i = 0; i < totalChunks; i++) {
-        const partRes = await fetch(
-          `/api/cloudsql/pdf?bookKey=${encodeURIComponent(resolvedKey)}&title=${titleParam}&chunkIndex=${i}`,
-          {
-            headers: {
-              ...authHeaders,
-            },
+      const workerCount = Math.min(3, totalChunks);
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (!failed) {
+          const idx = nextChunkIdx++;
+          if (idx >= totalChunks) break;
+          const partRes = await fetch(
+            `/api/cloudsql/pdf?bookKey=${encodeURIComponent(resolvedKey)}&title=${titleParam}&chunkIndex=${idx}`,
+            {
+              headers: {
+                ...authHeaders,
+              },
+            }
+          );
+          if (!partRes.ok) {
+            failed = true;
+            return;
           }
-        );
-        if (!partRes.ok) {
-          chunkBuffers.length = 0;
-          break;
+          const buf = await partRes.arrayBuffer();
+          if (buf.byteLength === 0) {
+            failed = true;
+            return;
+          }
+          chunkBuffers[idx] = buf;
+          completedChunks++;
+          if (onProgress) {
+            onProgress(Math.round((completedChunks / totalChunks) * 100));
+          }
         }
-        const buf = await partRes.arrayBuffer();
-        if (buf.byteLength === 0) {
-          chunkBuffers.length = 0;
-          break;
-        }
-        chunkBuffers.push(buf);
-        if (onProgress) {
-          onProgress(Math.round(((i + 1) / totalChunks) * 100));
-        }
-      }
+      });
 
-      if (chunkBuffers.length === totalChunks) {
-        const fullBlob = new Blob(chunkBuffers, { type: 'application/pdf' });
+      await Promise.all(workers);
+
+      if (!failed && chunkBuffers.every(b => b !== null)) {
+        const fullBlob = new Blob(chunkBuffers as ArrayBuffer[], { type: 'application/pdf' });
         if (fullBlob.size > 100) {
           return fullBlob;
         }
@@ -1201,7 +1217,11 @@ export async function syncBooksWithCloudSql(books: Book[]): Promise<CloudSqlSync
     const titleLower = (b.title || '').trim().toLowerCase();
     const cloudHasIt =
       cloudPdfStatusByKey.get(safeKey) || cloudPdfStatusByKey.get(titleLower) || false;
-    uploadBookPdfToCloud(b, undefined, !cloudHasIt).catch(() => {});
+    if (cloudHasIt) {
+      uploadedPdfBookKeys.add(sanitizeFirestoreId(b.id || b.title));
+      continue;
+    }
+    uploadBookPdfToCloud(b, undefined, true).catch(() => {});
   }
 
   return data;
